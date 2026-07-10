@@ -1,6 +1,6 @@
 {
   "name": "@liziy/session-queue",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "pi extension: linear session queue with file-change rollback, snapshot GC, dirty check, and Session Tree auto-sync (i18n: zh/en)",
   "keywords": [
     "pi-extension",

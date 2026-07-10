@@ -2,8 +2,14 @@
  * minimax-local — MiniMax 自定义 Provider 扩展（完整适配 MiniMax 官方参数）
  * =============================================================================
  * 让 pi 直接调用 MiniMax API（https://api.minimaxi.com/v1/chat/completions），
- * 无需经过中间层代理，完整支持 MiniMax 官方三项参数：可配置高倍率 priority、思考、思考拆分。
+ * 无需经过中间层代理，完整支持 MiniMax 官方采样参数：可配置高倍率 priority、
+ * 思考、思考拆分、max_completion_tokens、temperature、top_p。
  *
+ * v1.1.0 新增：完整适配 MiniMax 官方三项采样参数（可由 /minimax 命令调整）：
+ *              - max_completion_tokens（生成内容长度上限，MiniMax-M3 推荐 131072、上限 524288；
+ *                其他模型推荐 65536、上限 204800）
+ *              - temperature（温度系数，范围 [0, 2]，默认 1）
+ *              - top_p（核采样参数，范围 [0, 1]，MiniMax-M3 默认 0.95，M2.x 系列默认 0.9）
  * v1.0.4 修复：中断后孤立的 assistant(tool_calls) 会被剥离（避免 2013 协议错误）
  *                  场景：用户中断了工具调用，assistant 带了 tool_calls 但没有 toolResult 返回，
  *                  原版会带着 tool_calls 发出去 → MiniMax 报 2013。新版后处理剥离孤立 tool_calls。
@@ -12,7 +18,9 @@
  * v1.0.1 修复：中断后坬立的 tool 消息会被丢弃（避免 2013 协议错误）
  *
  * 特性：
- * - 完整适配 MiniMax 官方三项参数（pi 原生不支持）：service_tier（高倍率）、thinking（思考）、reasoning_split（思考拆分）
+ * - 完整适配 MiniMax 官方采样参数（pi 原生不支持）：
+ *     service_tier（高倍率）、thinking（思考）、reasoning_split（思考拆分）、
+ *     max_completion_tokens、temperature、top_p
  * - 可配置高倍率：service_tier 支持 priority（1.5× 价格，跳过排队）和 standard 运行时切换（/minimax 命令）
  * - 注册 MiniMax-M3（文本+图片）和 MiniMax-M2.7-highspeed（纯文本）两个模型
  * - 支持 stream（流式响应）
@@ -21,10 +29,13 @@
  * - 支持多模态（图片理解）
  * - 自动计算 token 费用
  *
- * 可通过 /minimax 命令修改三项运行时配置：
- *   thinking         auto | adaptive | disabled
- *   service_tier     standard | priority
- *   reasoning_split  true | false
+ * 可通过 /minimax 命令修改六项运行时配置：
+ *   思考模式        auto | adaptive | disabled
+ *   服务层级        standard | priority
+ *   思考拆分        true | false
+ *   温度（temperature）     0.0-2.0（默认 1）
+ *   核采样（top_p）         0.0-1.0（默认按模型 M3:0.95 / M2:0.9）
+ *   最大输出（max_tokens）  自动 | 数字（生成上限，null = 用模型默认）
  *
  * 配置持久化到 ~/.pi/agent/extensions/minimax-local/config.json。
  *
@@ -71,12 +82,21 @@ interface MiniMaxConfig {
 	reasoningSplit: boolean;
 	/** "auto" 表示根据模型 + reasoningEffort 自动决定；否则覆盖自动逻辑 */
 	thinkingOverride: ThinkingType | "auto";
+	/** 采样温度，范围 [0, 2]，默认 1 */
+	temperature: number;
+	/** 核采样参数，范围 [0, 1]，MiniMax-M3 默认 0.95，M2.x 系列默认 0.9 */
+	topP: number;
+	/** 生成内容长度上限；null 表示使用 model.maxTokens。MiniMax-M3 推荐 131072、上限 524288；其他模型推荐 65536、上限 204800 */
+	maxCompletionTokens: number | null;
 }
 
 const DEFAULT_CONFIG: MiniMaxConfig = {
 	serviceTier: "priority",
 	reasoningSplit: true,
 	thinkingOverride: "auto",
+	temperature: 1,
+	topP: 0.95,
+	maxCompletionTokens: null,
 };
 
 const CONFIG_FILE = join(homedir(), ".pi", "agent", "extensions", "minimax-local", "config.json");
@@ -89,12 +109,31 @@ async function loadConfig(): Promise<void> {
 		const raw = await readFile(CONFIG_FILE, "utf8");
 		const parsed = JSON.parse(raw);
 		config = {
-			serviceTier: parsed.serviceTier === "standard" || parsed.serviceTier === "priority" ? parsed.serviceTier : DEFAULT_CONFIG.serviceTier,
+			serviceTier:
+				parsed.serviceTier === "standard" || parsed.serviceTier === "priority"
+					? parsed.serviceTier
+					: DEFAULT_CONFIG.serviceTier,
 			reasoningSplit: typeof parsed.reasoningSplit === "boolean" ? parsed.reasoningSplit : DEFAULT_CONFIG.reasoningSplit,
 			thinkingOverride:
-				parsed.thinkingOverride === "auto" || parsed.thinkingOverride === "adaptive" || parsed.thinkingOverride === "disabled"
+				parsed.thinkingOverride === "auto" ||
+				parsed.thinkingOverride === "adaptive" ||
+				parsed.thinkingOverride === "disabled"
 					? parsed.thinkingOverride
 					: DEFAULT_CONFIG.thinkingOverride,
+			// 新增：temperature 范围 [0, 2]
+			temperature:
+				typeof parsed.temperature === "number" && !isNaN(parsed.temperature) && parsed.temperature >= 0 && parsed.temperature <= 2
+					? parsed.temperature
+					: DEFAULT_CONFIG.temperature,
+			// 新增：top_p 范围 [0, 1]
+			topP: typeof parsed.topP === "number" && !isNaN(parsed.topP) && parsed.topP >= 0 && parsed.topP <= 1 ? parsed.topP : DEFAULT_CONFIG.topP,
+			// 新增：maxCompletionTokens >= 1 或 null
+			maxCompletionTokens:
+				parsed.maxCompletionTokens === null
+					? null
+					: typeof parsed.maxCompletionTokens === "number" && parsed.maxCompletionTokens >= 1
+						? parsed.maxCompletionTokens
+						: DEFAULT_CONFIG.maxCompletionTokens,
 		};
 	} catch {
 		// 文件不存在或解析失败，保留默认值
@@ -117,6 +156,37 @@ async function saveConfig(): Promise<void> {
 // =============================================================================
 
 const isM2Series = (modelId: string) => modelId.startsWith("MiniMax-M2");
+
+/** 计算字符串的终端显示宽度（CJK 汉字=2，其他=1） */
+function visualWidth(s: string): number {
+	let w = 0;
+	for (const ch of s) {
+		// CJK 表意文字、全角标点、半角假名等统一按 2 宽
+		if (/[㐀-鿿　-〿＀-￯]/.test(ch)) {
+			w += 2;
+		} else {
+			w += 1;
+		}
+	}
+	return w;
+}
+
+/** 按视觉宽度右侧补齐空格（用于表格对齐） */
+function padVisualEnd(s: string, target: number): string {
+	const w = visualWidth(s);
+	if (w >= target) return s;
+	return s + " ".repeat(target - w);
+}
+
+/** 模型官方推荐的 top_p 默认值 */
+function defaultTopPForModel(modelId: string): number {
+	return isM2Series(modelId) ? 0.9 : 0.95;
+}
+
+/** 模型 max_completion_tokens 上限 */
+function getMaxTokensLimit(modelId: string): number {
+	return isM2Series(modelId) ? 204800 : 524288;
+}
 
 // =============================================================================
 // 消息转换：pi 内部消息 → OpenAI 格式
@@ -366,7 +436,17 @@ function streamMiniMaxChat(
 				reasoning_split: config.reasoningSplit,
 				stream: true,
 				stream_options: { include_usage: true },
-				max_completion_tokens: options?.maxTokens ?? model.maxTokens,
+				// 采样参数：始终以 config 为准（用户通过 /minimax 调整）
+				temperature: config.temperature,
+				top_p: config.topP,
+				// max_completion_tokens：优先级 config > options > model.maxTokens，并限制在模型上限内
+				max_completion_tokens: Math.max(
+					1,
+					Math.min(
+						config.maxCompletionTokens ?? options?.maxTokens ?? model.maxTokens,
+						getMaxTokensLimit(model.id),
+					),
+				),
 			};
 			if (thinkingType) {
 				body.thinking = { type: thinkingType };
@@ -658,12 +738,22 @@ function formatConfig(currentModel?: { id: string } | null): string {
 	const tierText = config.serviceTier === "priority" ? "priority（高优先级）" : "standard（标准排队）";
 	const splitText = config.reasoningSplit ? "true（拆分到独立字段）" : "false（混合在 content 中）";
 
+	// 新增 3 项展示
+	const modelId = currentModel?.id ?? "MiniMax-M3";
+	const modelLimit = getMaxTokensLimit(modelId);
+	const recommendedTopP = defaultTopPForModel(modelId);
+	const maxTokensDisplay =
+		config.maxCompletionTokens === null ? `自动（模型上限 ${modelLimit}）` : `${config.maxCompletionTokens}（上限 ${modelLimit}）`;
+
 	return [
 		"━━━━━━ MiniMax 当前配置 ━━━━━━",
 		"",
-		`思考模式      ${thinkingText}`,
-		`服务层级      ${tierText}`,
-		`思考拆分      ${splitText}`,
+		padVisualEnd("思考模式（thinking）", 27) + thinkingText,
+		padVisualEnd("服务层级（service_tier）", 27) + tierText,
+		padVisualEnd("思考拆分（reasoning_split）", 27) + splitText,
+		padVisualEnd("温度（temperature）", 27) + `${config.temperature}（范围 0-2）`,
+		padVisualEnd("核采样（top_p）", 27) + `${config.topP}（推荐 ${recommendedTopP}，范围 0-1）`,
+		padVisualEnd("最大输出（max_tokens）", 27) + maxTokensDisplay,
 		"",
 		"输入 /minimax 进入菜单修改。",
 	].join("\n");
@@ -691,9 +781,12 @@ function registerMinimaxCommand(pi: ExtensionAPI) {
 			};
 
 			const mainMenu = [
-				`思考模式      当前：${config.thinkingOverride}`,
-				`服务层级      当前：${config.serviceTier}`,
-				`思考拆分      当前：${config.reasoningSplit ? "拆分到独立字段" : "混合在 content 中"}`,
+				padVisualEnd("思考模式（thinking）", 27) + `当前：${config.thinkingOverride}`,
+				padVisualEnd("服务层级（service_tier）", 27) + `当前：${config.serviceTier}`,
+				padVisualEnd("思考拆分（reasoning_split）", 27) + `当前：${config.reasoningSplit ? "拆分到独立字段" : "混合在 content 中"}`,
+				padVisualEnd("温度（temperature）", 27) + `当前：${config.temperature}（范围 0-2）`,
+				padVisualEnd("核采样（top_p）", 27) + `当前：${config.topP}（范围 0-1）`,
+				padVisualEnd("最大输出（max_tokens）", 27) + `当前：${config.maxCompletionTokens ?? "自动（用模型默认）"}`,
 				"恢复默认设置",
 				"取消",
 			];
@@ -702,57 +795,127 @@ function registerMinimaxCommand(pi: ExtensionAPI) {
 			if (!action || action === "取消") return;
 
 			if (action === "恢复默认设置") {
-				config.serviceTier = DEFAULT_CONFIG.serviceTier;
-				config.reasoningSplit = DEFAULT_CONFIG.reasoningSplit;
-				config.thinkingOverride = DEFAULT_CONFIG.thinkingOverride;
+				config = { ...DEFAULT_CONFIG };
 				await saveConfig();
 				ctx.ui.notify("已恢复默认设置。\n\n" + formatConfig(currentModel), "info");
 				return;
 			}
 
-			if (action.startsWith("思考模式")) {
+			if (action.startsWith("思考模式（thinking）")) {
 				const values = [
 					`auto      （根据模型自动决定）`,
 					`adaptive  （强制开启）`,
 					`disabled  （强制关闭，M3生效）`,
 					"取消",
 				];
-				const choice = await ctx.ui.select("选择思考模式", values);
+				const choice = await ctx.ui.select("选择思考模式（thinking）", values);
 				if (!choice || choice === "取消") return;
 				const newValue = choice.split(/\s+/)[0];
 				config.thinkingOverride = newValue as ThinkingType | "auto";
 				await saveConfig();
-				ctx.ui.notify(`已设置为：${thinkingDesc(newValue)}\n\n` + formatConfig(currentModel), "info");
+				ctx.ui.notify(`思考模式（thinking） = ${thinkingDesc(newValue)}\n\n` + formatConfig(currentModel), "info");
 				return;
 			}
 
-			if (action.startsWith("服务层级")) {
+			if (action.startsWith("服务层级（service_tier）")) {
 				const values = [
 					`priority  （高优先级，1.5×价格）`,
 					`standard  （标准排队）`,
 					"取消",
 				];
-				const choice = await ctx.ui.select("选择服务层级", values);
+				const choice = await ctx.ui.select("选择服务层级（service_tier）", values);
 				if (!choice || choice === "取消") return;
 				const newValue = choice.split(/\s+/)[0];
 				config.serviceTier = newValue as ServiceTier;
 				await saveConfig();
-				ctx.ui.notify(`已设置为：${tierDesc(newValue)}\n\n` + formatConfig(currentModel), "info");
+				ctx.ui.notify(`服务层级（service_tier） = ${tierDesc(newValue)}\n\n` + formatConfig(currentModel), "info");
 				return;
 			}
 
-			if (action.startsWith("思考拆分")) {
+			if (action.startsWith("思考拆分（reasoning_split）")) {
 				const values = [
 					`true   （拆分到 reasoning_content 字段）`,
 					`false  （保留在 content 字段中）`,
 					"取消",
 				];
-				const choice = await ctx.ui.select("选择思考拆分方式", values);
+				const choice = await ctx.ui.select("选择思考拆分方式（reasoning_split）", values);
 				if (!choice || choice === "取消") return;
 				const newValue = choice.split(/\s+/)[0];
 				config.reasoningSplit = newValue === "true";
 				await saveConfig();
-				ctx.ui.notify(`已设置为：${config.reasoningSplit ? "拆分到 reasoning_content" : "保留在 content 中"}\n\n` + formatConfig(currentModel), "info");
+				ctx.ui.notify(`思考拆分（reasoning_split） = ${config.reasoningSplit ? "拆分到 reasoning_content" : "保留在 content 中"}\n\n` + formatConfig(currentModel), "info");
+				return;
+			}
+
+			// 新增：温度子菜单
+			if (action.startsWith("温度（temperature）")) {
+				const values = [
+					`0.0  （完全确定）`,
+					`0.5  （较确定）`,
+					`0.7  （MiniMax 官方推荐低值）`,
+					`1.0  （默认，平衡）`,
+					`1.3  （MiniMax 官方推荐高值）`,
+					`1.5  （较随机）`,
+					`2.0  （完全随机）`,
+					"取消",
+				];
+				const choice = await ctx.ui.select("选择温度（temperature）", values);
+				if (!choice || choice === "取消") return;
+				const newValue = parseFloat(choice.split(/\s+/)[0]);
+				if (!isNaN(newValue) && newValue >= 0 && newValue <= 2) {
+					config.temperature = newValue;
+					await saveConfig();
+					ctx.ui.notify(`温度（temperature） = ${config.temperature}\n\n` + formatConfig(currentModel), "info");
+				}
+				return;
+			}
+
+			// 新增：核采样子菜单
+			if (action.startsWith("核采样（top_p）")) {
+				const m2 = currentModel ? isM2Series(currentModel.id) : false;
+				const recommended = m2 ? 0.9 : 0.95;
+				const values = [
+					`0.5  （聚焦）`,
+					`0.7  （较聚焦）`,
+					`${recommended}  （当前模型官方推荐）`,
+					`1.0  （全概率采样）`,
+					"取消",
+				];
+				const choice = await ctx.ui.select("选择核采样（top_p）", values);
+				if (!choice || choice === "取消") return;
+				const newValue = parseFloat(choice.split(/\s+/)[0]);
+				if (!isNaN(newValue) && newValue >= 0 && newValue <= 1) {
+					config.topP = newValue;
+					await saveConfig();
+					ctx.ui.notify(`核采样（top_p） = ${config.topP}\n\n` + formatConfig(currentModel), "info");
+				}
+				return;
+			}
+
+			// 新增：最大输出子菜单
+			if (action.startsWith("最大输出（max_tokens）")) {
+				const m2 = currentModel ? isM2Series(currentModel.id) : false;
+				const modelDefault = m2 ? 65536 : 131072;
+				const modelLimit = getMaxTokensLimit(currentModel?.id ?? "MiniMax-M3");
+				const values = [
+					`自动   （使用模型默认 ${modelDefault}）`,
+					`${modelDefault}    （MiniMax 官方推荐）`,
+					`${modelLimit}    （模型上限）`,
+					"取消",
+				];
+				const choice = await ctx.ui.select("选择最大输出（max_tokens）", values);
+				if (!choice || choice === "取消") return;
+				if (choice.startsWith("自动")) {
+					config.maxCompletionTokens = null;
+				} else {
+					const n = parseInt(choice.split(/\s+/)[0], 10);
+					if (!isNaN(n) && n >= 1) {
+						config.maxCompletionTokens = Math.min(n, modelLimit);
+					}
+				}
+				await saveConfig();
+				const display = config.maxCompletionTokens === null ? `自动（上限 ${modelLimit}）` : `${config.maxCompletionTokens}（上限 ${modelLimit}）`;
+				ctx.ui.notify(`最大输出（max_tokens） = ${display}\n\n` + formatConfig(currentModel), "info");
 				return;
 			}
 		},
