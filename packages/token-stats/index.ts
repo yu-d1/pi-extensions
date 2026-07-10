@@ -759,7 +759,13 @@ const BUILTIN_PLANS: TokenPlan[] = [
     },
     format: (data: any) => {
       const models = data.model_remains || [];
-      const m = models.find((x: any) => x.model_name?.includes("M2")) || models[0];
+      // MiniMax 官方接口 2026-07 起 model_name 改为 general / video 等语义化命名，
+      // 不再是 MiniMax-M2 / MiniMax-M3。
+      // 优先取 "general"（通用文本/编码套餐），否则取第一项
+      const m =
+        models.find((x: any) => x.model_name === "general") ||
+        models.find((x: any) => x.model_name?.includes("M2")) ||
+        models[0];
       if (!m) return { modelPrefix: "", display: "无数据", color: "err" as const };
       const intervalRemaining = m.current_interval_remaining_percent ?? 0;
       const weeklyRemaining = m.current_weekly_remaining_percent ?? 0;
@@ -1679,8 +1685,9 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             await refreshQuota(ctx);
             requestFooterRender?.();
           }, (tokenConfig?.ttl || 60) * 1000);
-          if (quotaState?.color === "err" || quotaState?.color === "muted") {
-            // P5 修复：显示具体错误原因
+          if (quotaState?.error) {
+            // 仅当 quotaState 带有 error 字段时（key 缺失 / API 错误 / 网络错误 / 无数据）才提示"查询失败"
+            // 不能用 color === "err" 判断，因为 5h 剩余 < 20% 的正常状态也会用 err 颜色（仅用于 footer 高亮）
             const errMsg = formatQuotaError(quotaState);
             ctx.ui.notify(`${plan.name} 配额查询失败：${errMsg}`, "info");
           } else {
