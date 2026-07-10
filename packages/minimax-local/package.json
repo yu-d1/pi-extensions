@@ -1,0 +1,42 @@
+{
+  "name": "@liziy/minimax-local",
+  "version": "1.0.4",
+  "description": "MiniMax 自定义 Provider 扩展 —— 让 pi 直接调用 MiniMax API，完整适配官方参数（service_tier 高倍率、thinking 思考、reasoning_split 思考拆分）",
+  "keywords": [
+    "pi-extension",
+    "pi-package",
+    "minimax",
+    "minimax-m3",
+    "service-tier",
+    "priority",
+    "high-speed",
+    "thinking",
+    "reasoning"
+  ],
+  "license": "MIT",
+  "author": "liziy",
+  "main": "index.ts",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yu-d1/pi-extensions.git",
+    "directory": "packages/minimax-local"
+  },
+  "homepage": "https://github.com/yu-d1/pi-extensions/tree/main/packages/minimax-local#readme",
+  "bugs": {
+    "url": "https://github.com/yu-d1/pi-extensions/issues"
+  },
+  "files": [
+    "index.ts",
+    "README.md"
+  ]
+}

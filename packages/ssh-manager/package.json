@@ -1,0 +1,36 @@
+{
+  "name": "@liziy/ssh-manager",
+  "version": "1.0.0",
+  "description": "SSH 连接管理扩展 — 添加/编辑/删除 SSH 配置，选择后显示连接信息和 ssh config 片段",
+  "keywords": [
+    "pi-extension",
+    "pi-package"
+  ],
+  "license": "MIT",
+  "main": "index.ts",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "ssh2": "^1.16.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yu-d1/pi-extensions.git",
+    "directory": "packages/ssh-manager"
+  },
+  "homepage": "https://github.com/yu-d1/pi-extensions/tree/main/packages/ssh-manager#readme",
+  "bugs": {
+    "url": "https://github.com/yu-d1/pi-extensions/issues"
+  },
+  "author": "liziy",
+  "files": [
+    "index.ts",
+    "README.md"
+  ]
+}

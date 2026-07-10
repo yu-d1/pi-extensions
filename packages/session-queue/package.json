@@ -1,0 +1,42 @@
+{
+  "name": "@liziy/session-queue",
+  "version": "0.2.0",
+  "description": "pi extension: linear session queue with file-change rollback, snapshot GC, dirty check, and Session Tree auto-sync (i18n: zh/en)",
+  "keywords": [
+    "pi-extension",
+    "pi-package",
+    "session",
+    "queue",
+    "rollback",
+    "file-snapshot",
+    "checkpoint",
+    "linear-history",
+    "memory",
+    "i18n"
+  ],
+  "license": "MIT",
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yu-d1/pi-extensions.git",
+    "directory": "packages/session-queue"
+  },
+  "homepage": "https://github.com/yu-d1/pi-extensions/tree/main/packages/session-queue#readme",
+  "bugs": {
+    "url": "https://github.com/yu-d1/pi-extensions/issues"
+  },
+  "author": "liziy"
+}
