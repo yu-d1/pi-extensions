@@ -1,6 +1,6 @@
 {
   "name": "@liziy/minimax-local",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "description": "MiniMax 自定义 Provider 扩展 —— 让 pi 直接调用 MiniMax API，完整适配官方参数（service_tier 高倍率、thinking 思考、reasoning_split 思考拆分）",
   "keywords": [
     "pi-extension",
