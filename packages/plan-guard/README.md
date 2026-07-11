@@ -1,5 +1,19 @@
 # @liziy/plan-guard
 
+> ⚠️ **兼容性修复**：本扩展通过 `pi.registerShortcut("tab", ...)` 抢占 Tab 键用于模式切换。若 `~/.pi/agent/keybindings.json` 中 `tui.input.tab` 仍保留默认绑定（`tab`），pi 启动时会检测到 `tui.input.tab`（内置）⇄ 扩展的快捷键冲突，并显示不兼容警告：
+>
+> ```
+> Extension shortcut conflict: 'tab' is built-in shortcut for tui.input.tab and .../plan-guard. Using .../plan-guard.
+> ```
+>
+> **修复方式**：在 `keybindings.json` 中清空 `tui.input.tab` 即可消除警告：
+>
+> ```json
+> { "tui.input.tab": [] }
+> ```
+>
+> 修改后重启 pi 或执行 `/reload` 即可生效。也可在 pi 会话中让 AI 助手直接帮你写入该配置。
+
 **pi 的 Plan/Act 模式切换扩展。**
 
 通过 Tab 键快速在「计划模式」(Plan mode) 和「执行模式」(Act mode) 之间切换，模式变更会自动调整：

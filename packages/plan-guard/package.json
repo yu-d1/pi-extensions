@@ -1,7 +1,7 @@
 {
   "name": "@liziy/plan-guard",
-  "version": "1.0.3",
-  "description": "Plan/Act 模式切换扩展 — Tab 键切换计划与执行模式，自动调整工具白名单和系统提示",
+  "version": "1.0.4",
+  "description": "Tab 键切换计划/执行模式",
   "keywords": [
     "pi-extension",
     "pi-package"
