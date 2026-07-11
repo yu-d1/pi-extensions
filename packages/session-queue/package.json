@@ -1,7 +1,7 @@
 {
   "name": "@liziy/session-queue",
-  "version": "0.2.1",
-  "description": "pi extension: linear session queue with file-change rollback, snapshot GC, dirty check, and Session Tree auto-sync (i18n: zh/en)",
+  "version": "0.2.2",
+  "description": "线性队列式回滚 · 文件快照一键还原",
   "keywords": [
     "pi-extension",
     "pi-package",
@@ -11,8 +11,7 @@
     "file-snapshot",
     "checkpoint",
     "linear-history",
-    "memory",
-    "i18n"
+    "memory"
   ],
   "license": "MIT",
   "main": "index.ts",

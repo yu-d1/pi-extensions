@@ -76,7 +76,6 @@ interface QueueData {
 interface Config {
   workspaces: string[];
   followSessionTree?: boolean;  // 是否在 Session Tree 导航时自动回滚队列
-  lang?: Lang;                  // 语言：'zh' | 'en'，默认 'zh'
 }
 
 // =============================================================================
@@ -115,237 +114,11 @@ const ANSI = {
   green: "\x1b[32m",  // 亮绿
 };
 
-// =============================================================================
-// i18n
-// =============================================================================
-
-type Lang = "zh" | "en";
-type I18nValue = string | ((...args: any[]) => string);
-
-const I18N: Record<Lang, Record<string, I18nValue>> = {
-  zh: {
-    // === 状态栏 ===
-    "status.sync":   `${ANSI.green}●${ANSI.reset} 同步`,
-    "status.record": `${ANSI.cyan}●${ANSI.reset} 记录`,
-
-    // === 主菜单 ===
-    "menu.rollbackHistory": (n: number) => `📋  回滚历史  (${n} 个变更点)`,
-    "menu.manageWorkspaces": "📂  管理工作区",
-    "menu.clearQueue": "🗑️  清空当前队列",
-    "menu.deleteAndClear": "⏸   删除并清空",
-    "menu.enableCurrent": "✅  启用当前工作区",
-    "menu.followSystemTree": (on: boolean) => `🔗  跟随系统Tree  (${on ? "开" : "关"})`,
-    "menu.collectOrphans": "🧹  回收孤儿快照",
-    "menu.exit": "❌  退出菜单",
-
-    // === 菜单子项 ===
-    "menu.back": "← 返回",
-    "menu.workspaceCurrent": "  ← 当前",
-    "menu.pauseThisWorkspace": "⏸  暂停此工作区",
-    "menu.enableThisWorkspace": "✅ 启用此工作区",
-    "menu.removeFromList": "🗑️  从列表中删除",
-
-    // === 选择器标题 ===
-    "select.mainTitle": "会话队列回滚",
-    "select.workspacesTitle": (n: number) => `已启用的工作区 (${n})`,
-    "select.workspaceActionTitle": (ws: string) => `工作区: ${ws}`,
-    "select.rollbackTitle": (n: number) => `回滚到哪个检查点？(${n} 个检查点 + 当前状态)`,
-
-    // === 确认弹窗 ===
-    "confirm.rollbackTitle": (text: string) => `确认回滚到「${text}」？`,
-    "confirm.willProcess": (n: number) => `将处理 ${n} 个文件变更：`,
-    "confirm.conflictsWarn": (n: number) => `⚠ ${n} 个文件被外部修改：`,
-    "confirm.btnForceOverwrite": "✅ 强制覆盖并回滚",
-    "confirm.btnSkipConflicts": "⏭  跳过冲突，回滚其他",
-    "confirm.btnConfirm": "✅ 确定回滚",
-    "confirm.btnCancel": "❌ 取消",
-
-    // === 预览格式 ===
-    "format.restore": (n: number, files: string) => `  还原（${n}）：${files}`,
-    "format.create":  (n: number, files: string) => `  新增（${n}）：${files}`,
-    "format.remove":  (n: number, files: string) => `  删除（${n}）：${files}`,
-    "format.noFileChanges": "  （无文件变更）",
-    "format.bashTag": "  ⚠bash",
-    "format.currentNode": "  ← 当前节点",
-    "format.currentState": "当前状态",
-    "format.restored": (n: number) => `还原 ${n}`,
-    "format.created":  (n: number) => `新增 ${n}`,
-    "format.removed":  (n: number) => `删除 ${n}`,
-    "format.skippedConflicts": (n: number) => `，跳过 ${n} 个冲突`,
-    "format.skipped": (n: number) => `，跳过 ${n} 个`,
-    "format.missingSnapshot": (n: number) => `（其中 ${n} 个快照丢失，请手动检查）`,
-    "format.noChange": "无变更",
-
-    // === 通知 ===
-    "notify.needInteractive": "rollback 需要交互模式",
-    "notify.noSession": "无活跃 session",
-    "notify.processing": "正在处理上一轮，请稍候",
-    "notify.emptyQueue": "队列为空",
-    "notify.onlyTurn0": "只有 Turn 0，没有可回滚的记录",
-    "notify.noCheckpoints": "没有可回滚的检查点",
-    "notify.currentNode": "当前节点不可回滚，请选其他 turn",
-    "notify.rolledBack": (text: string) => `已回滚到「${text}」`,
-    "notify.rolledBackWith": (text: string, parts: string) => `已回滚到「${text}」：${parts}`,
-    "notify.autoRollback": (text: string) => `↩️ Session Tree 导航 → 自动回滚到「${text}」`,
-    "notify.autoRollbackWith": (text: string, parts: string) => `↩️ Session Tree 导航 → 自动回滚到「${text}」：${parts}`,
-    "notify.queueCleared": (snap: number, queue?: number) => `✅ 队列已清空，回收 ${snap} 个孤儿快照${queue ? `，清理 ${queue} 个旧 queue 文件` : ""}`,
-    "notify.deletedAndCleared": (snap: number, queue?: number) => `⏸ 已删除并清空当前 session 的记录，回收 ${snap} 个孤儿快照${queue ? `，清理 ${queue} 个旧 queue 文件` : ""}`,
-    "notify.paused": (ws: string, snap: number, queue?: number) => `⏸ 已暂停：${ws}，回收 ${snap} 个孤儿快照${queue ? `，清理 ${queue} 个旧 queue 文件` : ""}`,
-    "notify.removedFromList": (ws: string) => `🗑️ 已从列表中删除：${ws}`,
-    "notify.enabledTracking": (path: string) => `✅ 已启用变更记录：${path}`,
-    "notify.enabled": (ws: string) => `✅ 已启用：${ws}`,
-    "notify.noWorkspace": "当前工作区未启用",
-    "notify.workspaceActive": "当前工作区已启用",
-    "notify.otherActive": "已有其他工作区启用中，请先暂停",
-    "notify.noWorkspaces": "没有已启用的工作区",
-    "notify.queueAlreadyEmpty": "队列已经为空",
-    "notify.followOn": "🔗 已开启：Session Tree 导航将自动回滚队列",
-    "notify.followOff": "⏸ 已关闭：Session Tree 导航不会自动回滚队列",
-    "notify.langSwitched": (lang: string) => `🌐 已切换语言：${lang}（zh=中文，en=English）`,
-    "notify.langInvalid": (lang: string) => `⚠ 无效语言代码：${lang}（可选：zh、en）`,
-    "notify.gcResult": (scanned: number, deleted: number, live: number, queueDeleted?: number, queueKept?: number) =>
-      `🧹 扫描 ${scanned} 个快照，删除 ${deleted} 个孤儿，存活 ${live} 个` +
-      `${queueDeleted ? `；清理 ${queueDeleted} 个旧 queue 文件，保留 ${queueKept ?? 0} 个` : ""}`,
-
-    // === Debug ===
-    "debug.fromExtension": "[SQ-debug] session_tree: fromExtension=true 跳过",
-    "debug.activeWorkspaceNull": (sess: string) => `[SQ-debug] session_tree: activeWorkspace=null, currentSession=${sess}`,
-    "debug.toggleOff": "[SQ-debug] session_tree: toggle off",
-    "debug.isProcessing": "[SQ-debug] session_tree: isProcessing=true",
-    "debug.noNav": (id: string) => `[SQ-debug] session_tree: 无实际导航 (newLeafId===oldLeafId=${id})`,
-    "debug.emptyQueue": "[SQ-debug] session_tree: queue.entries=[]",
-    "debug.nav": (src: string, navId: string, leafId: string, qLen: number, qCi: number, sess: string) =>
-      `[SQ-debug] nav: ${src}=${navId}, leafId=${leafId}, queue(${qLen}e/${qCi}ci), session=${sess}`,
-    "debug.noNavMsg": "[SQ-debug] session_tree: 未找到 nav user msg",
-    "debug.navNoMatch": (navId: string, entries: string) => `[SQ-debug] session_tree: nav=${navId} 未匹配 entries=${entries}`,
-    "debug.idxOutOfRange": (idx: number, len: number) => `[SQ-debug] session_tree: idx=${idx} >= ${len}（超出队列范围），跳过`,
-    "debug.rollbackFired": (idx: number, len: number) => `[SQ-debug] session_tree 回滚 idx=${idx} entries=${len}`,
-    "debug.exception": (msg: string) => `[SQ-debug] session_tree 异常: ${msg}`,
-
-    // === 命令描述 ===
-    "cmd.description": "会话队列回滚（单入口菜单）；/rollback zh|en 切换语言",
-  },
-
-  en: {
-    // === Status bar ===
-    "status.sync":   `${ANSI.green}●${ANSI.reset} Sync`,
-    "status.record": `${ANSI.cyan}●${ANSI.reset} Record`,
-
-    // === Main menu ===
-    "menu.rollbackHistory": (n: number) => `📋  Rollback History  (${n} checkpoints)`,
-    "menu.manageWorkspaces": "📂  Manage Workspaces",
-    "menu.clearQueue": "🗑️  Clear Current Queue",
-    "menu.deleteAndClear": "⏸   Delete & Clear",
-    "menu.enableCurrent": "✅  Enable Current Workspace",
-    "menu.followSystemTree": (on: boolean) => `🔗  Follow System Tree  (${on ? "on" : "off"})`,
-    "menu.collectOrphans": "🧹  Collect Orphan Snapshots",
-    "menu.exit": "❌  Exit Menu",
-
-    // === Submenu ===
-    "menu.back": "← Back",
-    "menu.workspaceCurrent": "  ← current",
-    "menu.pauseThisWorkspace": "⏸  Pause This Workspace",
-    "menu.enableThisWorkspace": "✅ Enable This Workspace",
-    "menu.removeFromList": "🗑️  Remove From List",
-
-    // === Select titles ===
-    "select.mainTitle": "Session Queue Rollback",
-    "select.workspacesTitle": (n: number) => `Enabled Workspaces (${n})`,
-    "select.workspaceActionTitle": (ws: string) => `Workspace: ${ws}`,
-    "select.rollbackTitle": (n: number) => `Rollback to which checkpoint? (${n} checkpoints + current state)`,
-
-    // === Confirm dialog ===
-    "confirm.rollbackTitle": (text: string) => `Confirm rollback to "${text}"?`,
-    "confirm.willProcess": (n: number) => `Will process ${n} file change(s):`,
-    "confirm.conflictsWarn": (n: number) => `⚠ ${n} file(s) externally modified:`,
-    "confirm.btnForceOverwrite": "✅ Force overwrite and rollback",
-    "confirm.btnSkipConflicts": "⏭  Skip conflicts, rollback others",
-    "confirm.btnConfirm": "✅ Confirm Rollback",
-    "confirm.btnCancel": "❌ Cancel",
-
-    // === Preview format ===
-    "format.restore": (n: number, files: string) => `  Restore (${n}): ${files}`,
-    "format.create":  (n: number, files: string) => `  Create (${n}): ${files}`,
-    "format.remove":  (n: number, files: string) => `  Remove (${n}): ${files}`,
-    "format.noFileChanges": "  (no file changes)",
-    "format.bashTag": "  ⚠bash",
-    "format.currentNode": "  ← current node",
-    "format.currentState": "Current State",
-    "format.restored": (n: number) => `Restored ${n}`,
-    "format.created":  (n: number) => `Created ${n}`,
-    "format.removed":  (n: number) => `Removed ${n}`,
-    "format.skippedConflicts": (n: number) => `, skipped ${n} conflict(s)`,
-    "format.skipped": (n: number) => `, skipped ${n}`,
-    "format.missingSnapshot": (n: number) => `(${n} snapshot(s) missing, please check manually)`,
-    "format.noChange": "no changes",
-
-    // === Notifications ===
-    "notify.needInteractive": "rollback requires interactive mode",
-    "notify.noSession": "No active session",
-    "notify.processing": "Processing previous turn, please wait",
-    "notify.emptyQueue": "Queue is empty",
-    "notify.onlyTurn0": "Only Turn 0, no rollback records",
-    "notify.noCheckpoints": "No checkpoints to roll back to",
-    "notify.currentNode": "Current node cannot be rolled back, choose another turn",
-    "notify.rolledBack": (text: string) => `Rolled back to "${text}"`,
-    "notify.rolledBackWith": (text: string, parts: string) => `Rolled back to "${text}": ${parts}`,
-    "notify.autoRollback": (text: string) => `↩️ Session Tree nav → auto rollback to "${text}"`,
-    "notify.autoRollbackWith": (text: string, parts: string) => `↩️ Session Tree nav → auto rollback to "${text}": ${parts}`,
-    "notify.queueCleared": (snap: number, queue?: number) => `✅ Queue cleared, collected ${snap} orphan snapshot(s)${queue ? `, cleaned ${queue} old queue file(s)` : ""}`,
-    "notify.deletedAndCleared": (snap: number, queue?: number) => `⏸ Deleted and cleared current session's records, collected ${snap} orphan snapshot(s)${queue ? `, cleaned ${queue} old queue file(s)` : ""}`,
-    "notify.paused": (ws: string, snap: number, queue?: number) => `⏸ Paused: ${ws}, collected ${snap} orphan snapshot(s)${queue ? `, cleaned ${queue} old queue file(s)` : ""}`,
-    "notify.removedFromList": (ws: string) => `🗑️ Removed from list: ${ws}`,
-    "notify.enabledTracking": (path: string) => `✅ Tracking enabled: ${path}`,
-    "notify.enabled": (ws: string) => `✅ Enabled: ${ws}`,
-    "notify.noWorkspace": "Current workspace not enabled",
-    "notify.workspaceActive": "Current workspace already enabled",
-    "notify.otherActive": "Another workspace is active, please pause it first",
-    "notify.noWorkspaces": "No enabled workspaces",
-    "notify.queueAlreadyEmpty": "Queue is already empty",
-    "notify.followOn": "🔗 Enabled: Session Tree navigation will auto-rollback queue",
-    "notify.followOff": "⏸ Disabled: Session Tree navigation will not auto-rollback queue",
-    "notify.langSwitched": (lang: string) => `🌐 Language switched: ${lang} (zh=中文, en=English)`,
-    "notify.langInvalid": (lang: string) => `⚠ Invalid language code: ${lang} (options: zh, en)`,
-    "notify.gcResult": (scanned: number, deleted: number, live: number, queueDeleted?: number, queueKept?: number) =>
-      `🧹 Scanned ${scanned} snapshot(s), deleted ${deleted} orphan(s), ${live} live` +
-      `${queueDeleted ? `; cleaned ${queueDeleted} old queue file(s), kept ${queueKept ?? 0}` : ""}`,
-
-    // === Debug ===
-    "debug.fromExtension": "[SQ-debug] session_tree: fromExtension=true skipped",
-    "debug.activeWorkspaceNull": (sess: string) => `[SQ-debug] session_tree: activeWorkspace=null, currentSession=${sess}`,
-    "debug.toggleOff": "[SQ-debug] session_tree: toggle off",
-    "debug.isProcessing": "[SQ-debug] session_tree: isProcessing=true",
-    "debug.noNav": (id: string) => `[SQ-debug] session_tree: no actual nav (newLeafId===oldLeafId=${id})`,
-    "debug.emptyQueue": "[SQ-debug] session_tree: queue.entries=[]",
-    "debug.nav": (src: string, navId: string, leafId: string, qLen: number, qCi: number, sess: string) =>
-      `[SQ-debug] nav: ${src}=${navId}, leafId=${leafId}, queue(${qLen}e/${qCi}ci), session=${sess}`,
-    "debug.noNavMsg": "[SQ-debug] session_tree: no nav user msg found",
-    "debug.navNoMatch": (navId: string, entries: string) => `[SQ-debug] session_tree: nav=${navId} not matched entries=${entries}`,
-    "debug.idxOutOfRange": (idx: number, len: number) => `[SQ-debug] session_tree: idx=${idx} >= ${len} (out of range), skipped`,
-    "debug.rollbackFired": (idx: number, len: number) => `[SQ-debug] session_tree rollback idx=${idx} entries=${len}`,
-    "debug.exception": (msg: string) => `[SQ-debug] session_tree exception: ${msg}`,
-
-    // === Command description ===
-    "cmd.description": "Session queue rollback (single-entry menu); /rollback zh|en to switch language",
-  },
-};
-
-let currentLang: Lang = "zh";
-
-function setLang(lang: Lang): void {
-  if (I18N[lang]) currentLang = lang;
-}
-
-function t(key: string, ...args: any[]): string {
-  const entry = I18N[currentLang]?.[key] ?? I18N.zh[key] ?? key;
-  return typeof entry === "function" ? entry(...args) : entry;
-}
-
 // 状态文本（3 态：未启用 / 仅记录 / 记录+同步）
 function getStatusText(): string | undefined {
   if (!activeWorkspace) return undefined;     // 状态 1：未启用 → 不显示
-  if (followSessionTreeEnabled) return t("status.sync");   // 状态 3：亮绿点
-  return t("status.record");                              // 状态 2：青色点
+  if (followSessionTreeEnabled) return `${ANSI.green}●${ANSI.reset} 同步`;   // 状态 3：亮绿点
+  return `${ANSI.cyan}●${ANSI.reset} 记录`;                              // 状态 2：青色点
 }
 
 // =============================================================================
@@ -484,9 +257,6 @@ function loadConfig(): Config {
     const cfg = JSON.parse(data) as Config;
     if (typeof cfg.followSessionTree === "boolean") {
       followSessionTreeEnabled = cfg.followSessionTree;
-    }
-    if (cfg.lang) {
-      setLang(cfg.lang);
     }
     return cfg;
   } catch {
@@ -1148,15 +918,15 @@ function previewRollback(plan: RollbackPlan, workspace: string): RollbackPreview
 function formatPreview(preview: RollbackPreview): string {
   const lines: string[] = [];
   if (preview.restore.length > 0) {
-    lines.push(t("format.restore", preview.restore.length, preview.restore.join(", ")));
+    lines.push(`  还原（${preview.restore.length}）：${preview.restore.join(", ")}`);
   }
   if (preview.create.length > 0) {
-    lines.push(t("format.create", preview.create.length, preview.create.join(", ")));
+    lines.push(`  新增（${preview.create.length}）：${preview.create.join(", ")}`);
   }
   if (preview.remove.length > 0) {
-    lines.push(t("format.remove", preview.remove.length, preview.remove.join(", ")));
+    lines.push(`  删除（${preview.remove.length}）：${preview.remove.join(", ")}`);
   }
-  if (lines.length === 0) lines.push(t("format.noFileChanges"));
+  if (lines.length === 0) lines.push("  （无文件变更）");
   return lines.join("\n");
 }
 
@@ -1256,10 +1026,10 @@ function autoRollbackForSessionTree(
 
   // 通知
   const parts: string[] = [];
-  if (result.restored > 0) parts.push(t("format.restored", result.restored));
-  let msg = t("notify.autoRollback", targetEntry.text.slice(0, 30));
+  if (result.restored > 0) parts.push(`还原 ${result.restored}`);
+  let msg = `↩️ Session Tree 导航 → 自动回滚到「${targetEntry.text.slice(0, 30)}」`;
   if (parts.length > 0) msg += `：${parts.join("、")}`;
-  if (result.skipped.length > 0) msg += t("format.skippedConflicts", result.skipped.length);
+  if (result.skipped.length > 0) msg += `，跳过 ${result.skipped.length} 个冲突`;
   ctx.ui.notify(msg, result.skipped.length > 0 ? "warning" : "info");
 }
 
@@ -1280,25 +1050,25 @@ function buildQueueItems(queue: QueueData): QueueItem[] {
 
 async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
   if (!ctx.hasUI) {
-    ctx.ui.notify(t("notify.needInteractive"), "error");
+    ctx.ui.notify("rollback 需要交互模式", "error");
     return;
   }
   if (!currentSessionId) {
-    ctx.ui.notify(t("notify.noSession"), "error");
+    ctx.ui.notify("无活跃 session", "error");
     return;
   }
   if (isProcessing) {
-    ctx.ui.notify(t("notify.processing"), "warning");
+    ctx.ui.notify("正在处理上一轮，请稍候", "warning");
     return;
   }
 
   const queue = loadQueue(currentSessionId);
   if (queue.entries.length === 0) {
-    ctx.ui.notify(t("notify.emptyQueue"), "info");
+    ctx.ui.notify("队列为空", "info");
     return;
   }
   if (queue.entries.length === 1) {
-    ctx.ui.notify(t("notify.onlyTurn0"), "info");
+    ctx.ui.notify("只有 Turn 0，没有可回滚的记录", "info");
     return;
   }
 
@@ -1310,7 +1080,7 @@ async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
   const phantomCurrent: QueueItem = {
     entry: {
       turnIndex: queue.entries.length,
-      text: t("format.currentState"),
+      text: "当前状态",
       timestamp: new Date().toISOString(),
       changes: [],
     },
@@ -1320,17 +1090,17 @@ async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
     (it) => !it.entry.residual && !(it.entry.turnIndex === 0 && it.entry.text === "（会话起点）"),
   );
   if (checkpoints.length === 0) {
-    ctx.ui.notify(t("notify.noCheckpoints"), "info");
+    ctx.ui.notify("没有可回滚的检查点", "info");
     return;
   }
   const orderedDisplay: QueueItem[] = [phantomCurrent, ...[...checkpoints].reverse()];
 
   const selectOptions = orderedDisplay.map((item) => {
-    const bashTag = item.entry.changes.some((c) => c.viaBash) ? t("format.bashTag") : "";
-    const curTag = item.isCurrent ? t("format.currentNode") : "";
+    const bashTag = item.entry.changes.some((c) => c.viaBash) ? "  ⚠bash" : "";
+    const curTag = item.isCurrent ? "  ← 当前节点" : "";
     let label: string;
     if (item.isCurrent) {
-      label = t("format.currentState");
+      label = "当前状态";
     } else {
       label = item.entry.text;
     }
@@ -1341,7 +1111,7 @@ async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
   let targetEntry: QueueEntry | null = null;
   while (targetEntry === null) {
     const choice = await ctx.ui.select(
-      t("select.rollbackTitle", checkpoints.length),
+      `回滚到哪个检查点？(${checkpoints.length} 个检查点 + 当前状态)`,
       selectOptions,
     );
     if (!choice) return;  // 用户取消
@@ -1349,7 +1119,7 @@ async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
     if (choiceIdx < 0) return;
     const picked = orderedDisplay[choiceIdx];
     if (picked.isCurrent) {
-      ctx.ui.notify(t("notify.currentNode"), "info");
+      ctx.ui.notify("当前节点不可回滚，请选其他 turn", "info");
       continue;  // 重新提示
     }
     targetEntry = picked.entry;
@@ -1370,15 +1140,15 @@ async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
     saveQueue(queue);
     maybeGc();
     lastFlushedUserMsgId = null;
-    ctx.ui.notify(t("notify.rolledBack", targetEntry.text.slice(0, 30)), "info");
+    ctx.ui.notify(`已回滚到「${targetEntry.text.slice(0, 30)}」`, "info");
     return;
   }
 
   // ── 第三步：单次确认弹窗（确定/取消 + 冲突处理一起） ──
   const preview = previewRollback(plan, activeWorkspace || process.cwd());
   let confirmTitle =
-    t("confirm.rollbackTitle", targetEntry.text.slice(0, 30)) + "\n" +
-    t("confirm.willProcess", plan.changes.length) + "\n" +
+    `确认回滚到「${targetEntry.text.slice(0, 30)}」？\n` +
+    `将处理 ${plan.changes.length} 个文件变更：\n` +
     formatPreview(preview);
   const hasConflict = plan.conflictPaths.length > 0;
   let confirmButtons: string[];
@@ -1386,14 +1156,14 @@ async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
     const conflictList = plan.conflictPaths
       .map((p) => "  ⚠ " + path.relative(activeWorkspace || process.cwd(), p))
       .join("\n");
-    confirmTitle += "\n" + t("confirm.conflictsWarn", plan.conflictPaths.length) + "\n" + conflictList;
+    confirmTitle += `\n⚠ ${plan.conflictPaths.length} 个文件被外部修改：\n` + conflictList;
     confirmButtons = [
-      t("confirm.btnForceOverwrite"),
-      t("confirm.btnSkipConflicts"),
-      t("confirm.btnCancel"),
+      "✅ 强制覆盖并回滚",
+      "⏭  跳过冲突，回滚其他",
+      "❌ 取消",
     ];
   } else {
-    confirmButtons = [t("confirm.btnConfirm"), t("confirm.btnCancel")];
+    confirmButtons = ["✅ 确定回滚", "❌ 取消"];
   }
 
   const confirm = await ctx.ui.select(confirmTitle, confirmButtons);
@@ -1448,15 +1218,15 @@ async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
     maybeGc(true);
 
     const parts: string[] = [];
-    if (preview.restore.length > 0) parts.push(t("format.restored", preview.restore.length));
-    if (preview.create.length > 0) parts.push(t("format.created", preview.create.length));
-    if (preview.remove.length > 0) parts.push(t("format.removed", preview.remove.length));
-    let msg = t("notify.rolledBackWith", targetEntry.text.slice(0, 30), parts.join("、") || t("format.noChange"));
+    if (preview.restore.length > 0) parts.push(`还原 ${preview.restore.length}`);
+    if (preview.create.length > 0) parts.push(`新增 ${preview.create.length}`);
+    if (preview.remove.length > 0) parts.push(`删除 ${preview.remove.length}`);
+    let msg = `已回滚到「${targetEntry.text.slice(0, 30)}」：${parts.join("、") || "无变更"}`;
     if (result.skipped.length > 0) {
-      msg += t("format.skipped", result.skipped.length);
+      msg += `，跳过 ${result.skipped.length} 个`;
     }
     if (result.missingSnapshot.length > 0) {
-      msg += t("format.missingSnapshot", result.missingSnapshot.length);
+      msg += `（其中 ${result.missingSnapshot.length} 个快照丢失，请手动检查）`;
     }
     ctx.ui.notify(msg, result.missingSnapshot.length > 0 ? "warning" : "success");
   } finally {
@@ -1501,30 +1271,30 @@ export default function (pi: ExtensionAPI) {
   // 改为：直接拿 branch 中最后一条 user 消息 id 作为 sessionEntryId 匹配。
   pi.on("session_tree", (event, ctx) => {
     if (event.fromExtension) {
-      ctx.ui.notify(t("debug.fromExtension"), "info");
+      ctx.ui.notify("[SQ-debug] session_tree: fromExtension=true 跳过", "info");
       return;
     }
     if (!activeWorkspace) {
-      ctx.ui.notify(t("debug.activeWorkspaceNull", currentSessionId?.slice(-12) ?? "?"), "info");
+      ctx.ui.notify(`[SQ-debug] session_tree: activeWorkspace=null, currentSession=${currentSessionId?.slice(-12) ?? "?"}`, "info");
       return;
     }
     if (!ctx.hasUI) return;
     if (!followSessionTreeEnabled) {
-      ctx.ui.notify(t("debug.toggleOff"), "info");
+      ctx.ui.notify("[SQ-debug] session_tree: toggle off", "info");
       return;
     }
     if (isProcessing) {
-      ctx.ui.notify(t("debug.isProcessing"), "info");
+      ctx.ui.notify("[SQ-debug] session_tree: isProcessing=true", "info");
       return;
     }
     if (event.newLeafId === event.oldLeafId) {
-      ctx.ui.notify(t("debug.noNav", event.newLeafId?.slice(0, 8) ?? "?"), "info");
+      ctx.ui.notify(`[SQ-debug] session_tree: 无实际导航 (newLeafId===oldLeafId=${event.newLeafId?.slice(0, 8) ?? "?"})`, "info");
       return;
     }
     try {
       const queue = loadQueue(currentSessionId || "");
       if (queue.entries.length === 0) {
-        ctx.ui.notify(t("debug.emptyQueue"), "info");
+        ctx.ui.notify("[SQ-debug] session_tree: queue.entries=[]", "info");
         return;
       }
 
@@ -1574,11 +1344,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        t("debug.nav", navSource, navUserMsgId?.slice(0, 8) ?? "?", leafId?.slice(0, 8) ?? "?", queue.entries.length, queue.currentIndex, currentSessionId?.slice(-12) ?? "?"),
+        `[SQ-debug] nav: ${navSource}=${navUserMsgId?.slice(0, 8) ?? "?"}, leafId=${leafId?.slice(0, 8) ?? "?"}, queue(${queue.entries.length}e/${queue.currentIndex}ci), session=${currentSessionId?.slice(-12) ?? "?"}`,
         "info",
       );
       if (!navUserMsgId) {
-        ctx.ui.notify(t("debug.noNavMsg"), "info");
+        ctx.ui.notify("[SQ-debug] session_tree: 未找到 nav user msg", "info");
         return;
       }
       // 查找队列中对应的 entry
@@ -1591,17 +1361,17 @@ export default function (pi: ExtensionAPI) {
       // 但 currentIndex 永远 = entries.length-1，所以 idx >= currentIndex 的情形是“未真正导航”。
       // 同样：idx > entries.length-1 的越界情形跳过。
       if (idx < 0) {
-        ctx.ui.notify(t("debug.navNoMatch", navUserMsgId?.slice(0, 8) ?? "?", queue.entries.map(e => (e.sessionEntryId || '?').slice(0, 8)).join(',')), "info");
+        ctx.ui.notify(`[SQ-debug] session_tree: nav=${navUserMsgId?.slice(0, 8) ?? "?"} 未匹配 entries=${queue.entries.map(e => (e.sessionEntryId || '?').slice(0, 8)).join(',')}`, "info");
         return;
       }
       // Option C 语义：entry 是检查点。“导航到 q3” 包含 “q3 本身被撤销”（q3 不再在检查点列表中）。
       // 所以即使 idx === currentIndex（队列中最后一个 entry），仍然需要 fire。
       // 唯一需要跳过的是 idx 超出 entries 范围（不可能访问的检查点）。
       if (idx >= queue.entries.length) {
-        ctx.ui.notify(t("debug.idxOutOfRange", idx, queue.entries.length), "info");
+        ctx.ui.notify(`[SQ-debug] session_tree: idx=${idx} >= ${queue.entries.length}（超出队列范围），跳过`, "info");
         return;
       }
-      ctx.ui.notify(t("debug.rollbackFired", idx, queue.entries.length), "info");
+      ctx.ui.notify(`[SQ-debug] session_tree 回滚 idx=${idx} entries=${queue.entries.length}`, "info");
       isProcessing = true;
       try {
         autoRollbackForSessionTree(ctx, queue, idx);
@@ -1609,7 +1379,7 @@ export default function (pi: ExtensionAPI) {
         isProcessing = false;
       }
     } catch (e: any) {
-      ctx.ui.notify(t("debug.exception", e.message), "warning");
+      ctx.ui.notify(`[SQ-debug] session_tree 异常: ${e.message}`, "warning");
     }
   });
 
@@ -1625,28 +1395,10 @@ export default function (pi: ExtensionAPI) {
 
   // ── 命令：/rollback（单入口菜单） ──
   pi.registerCommand("rollback", {
-    description: t("cmd.description"),
+    description: "会话队列回滚（单入口菜单）",
     handler: async (args, ctx) => {
-      // 子命令：/rollback zh | /rollback en  切换语言
-      const sub = args.trim().toLowerCase();
-      if (sub === "zh" || sub === "en") {
-        const config = loadConfig();
-        config.lang = sub;
-        saveConfig(config);
-        setLang(sub);
-        if (ctx.hasUI) {
-          ctx.ui.setStatus("session-queue", getStatusText());
-          ctx.ui.notify(t("notify.langSwitched", sub), "success");
-        }
-        return;
-      }
-      if (sub.length > 0 && sub !== "zh" && sub !== "en") {
-        if (ctx.hasUI) ctx.ui.notify(t("notify.langInvalid", args.trim()), "warning");
-        return;
-      }
-
       if (!ctx.hasUI) {
-        ctx.ui.notify(t("notify.needInteractive"), "error");
+        ctx.ui.notify("rollback 需要交互模式", "error");
         return;
       }
 
@@ -1658,17 +1410,17 @@ export default function (pi: ExtensionAPI) {
         const config = loadConfig();
 
         const mainOptions: string[] = [
-          t("menu.rollbackHistory", Math.max(0, queueSize - 1)),
-          t("menu.manageWorkspaces"),
-          t("menu.clearQueue"),
-          activeWorkspace ? t("menu.deleteAndClear") : t("menu.enableCurrent"),
-          t("menu.followSystemTree", followSessionTreeEnabled),
-          t("menu.collectOrphans"),
-          t("menu.exit"),
+          `📋  回滚历史  (${Math.max(0, queueSize - 1)} 个变更点)`,
+          "📂  管理工作区",
+          "🗑️  清空当前队列",
+          activeWorkspace ? "⏸   删除并清空" : "✅  启用当前工作区",
+          `🔗  跟随 Session Tree  (${followSessionTreeEnabled ? "开" : "关"})`,
+          "🧹  回收孤儿快照",
+          "❌  退出菜单",
         ];
 
         const mainChoice = await ctx.ui.select(
-          t("select.mainTitle"),
+          "会话队列回滚",
           mainOptions,
         );
         if (!mainChoice || mainChoice.startsWith("❌")) return;
@@ -1687,11 +1439,11 @@ export default function (pi: ExtensionAPI) {
         } else if (mainChoice.startsWith("🗑️")) {
           // 清空当前队列
           if (!currentSessionId) {
-            ctx.ui.notify(t("notify.noSession"), "info");
+            ctx.ui.notify("无活跃 session", "info");
             continue;
           }
           if (queueSize === 0) {
-            ctx.ui.notify(t("notify.queueAlreadyEmpty"), "info");
+            ctx.ui.notify("队列已经为空", "info");
             continue;
           }
           const clearedQueue = loadQueue(currentSessionId);
@@ -1707,14 +1459,14 @@ export default function (pi: ExtensionAPI) {
           // 清空后立即 GC，回收该 session 引用的孤儿快照
           const gc = runGc();
           ctx.ui.notify(
-            t("notify.queueCleared", gc.snapDeleted, gc.queueDeleted || undefined),
+            `✅ 队列已清空，回收 ${gc.snapDeleted} 个孤儿快照${gc.queueDeleted ? `，清理 ${gc.queueDeleted} 个旧 queue 文件` : ""}`,
             "success",
           );
           // 回到主菜单
         } else if (mainChoice.startsWith("⏸")) {
           // 删除并清空
           if (!activeWorkspace) {
-            ctx.ui.notify(t("notify.noWorkspace"), "info");
+            ctx.ui.notify("当前工作区未启用", "info");
             continue;
           }
           removeWorkspace(ctx.cwd);
@@ -1730,21 +1482,21 @@ export default function (pi: ExtensionAPI) {
           // 删除 queue.json 后 GC 回收该 session 独占的孤儿快照
           const gc = runGc();
           ctx.ui.notify(
-            t("notify.deletedAndCleared", gc.snapDeleted, gc.queueDeleted || undefined),
+            `⏸ 已删除并清空当前 session 的记录，回收 ${gc.snapDeleted} 个孤儿快照${gc.queueDeleted ? `，清理 ${gc.queueDeleted} 个旧 queue 文件` : ""}`,
             "success",
           );
           return;  // 状态已变，退出菜单
         } else if (mainChoice.startsWith("✅")) {
           // 启用当前工作区
           if (activeWorkspace) {
-            ctx.ui.notify(t("notify.workspaceActive"), "info");
+            ctx.ui.notify("当前工作区已启用", "info");
             continue;
           }
           const resolved = path.resolve(ctx.cwd);
           addWorkspace(resolved);
           activeWorkspace = resolved;
           ctx.ui.setStatus("session-queue", getStatusText());
-          ctx.ui.notify(t("notify.enabledTracking", resolved), "success");
+          ctx.ui.notify(`✅ 已启用变更记录：${resolved}`, "success");
           return;  // 状态已变，退出菜单
         } else if (mainChoice.startsWith("🔗")) {
           // 切换 Session Tree 跟随回滚开关
@@ -1761,7 +1513,7 @@ export default function (pi: ExtensionAPI) {
             );
           }
           ctx.ui.notify(
-            t(followSessionTreeEnabled ? "notify.followOn" : "notify.followOff"),
+            followSessionTreeEnabled ? "🔗 已开启：Session Tree 导航将自动回滚队列" : "⏸ 已关闭：Session Tree 导航不会自动回滚队列",
             "info",
           );
           // 同步更新状态栏文案
@@ -1771,7 +1523,7 @@ export default function (pi: ExtensionAPI) {
           // 手动 GC
           const gc = runGc();
           ctx.ui.notify(
-            t("notify.gcResult", gc.snapScanned, gc.snapDeleted, gc.live, gc.queueDeleted || undefined, gc.queueKept || undefined),
+            `🧹 扫描 ${gc.snapScanned} 个快照，删除 ${gc.snapDeleted} 个孤儿，存活 ${gc.live} 个${gc.queueDeleted ? `；清理 ${gc.queueDeleted} 个旧 queue 文件，保留 ${gc.queueKept ?? 0} 个` : ""}`,
             "success",
           );
         }
@@ -1788,24 +1540,24 @@ async function manageWorkspaces(ctx: any, _config: Config): Promise<boolean> {
   // 一级：列出已启用的工作区
   const config = loadConfig();
   if (config.workspaces.length === 0) {
-    ctx.ui.notify(t("notify.noWorkspaces"), "info");
+    ctx.ui.notify("没有已启用的工作区", "info");
     return false;
   }
 
   // 用绝对路径 + 标记当前激活
   const wsOptions = config.workspaces.map((ws) => {
     const isCurrent = activeWorkspace && path.resolve(ws) === activeWorkspace;
-    const tag = isCurrent ? t("menu.workspaceCurrent") : "";
+    const tag = isCurrent ? "  ← 当前" : "";
     return `${ws}${tag}`;
   });
-  wsOptions.push(t("menu.back"));
+  wsOptions.push("← 返回");
 
   const wsChoice = await ctx.ui.select(
-    t("select.workspacesTitle", config.workspaces.length),
+    `已启用的工作区 (${config.workspaces.length})`,
     wsOptions,
   );
 
-  if (!wsChoice || wsChoice === t("menu.back")) return false;
+  if (!wsChoice || wsChoice === "← 返回") return false;
 
   // 从选项中提取路径（精确匹配）
   const selectedWs = config.workspaces.find((ws) => wsChoice.startsWith(ws));
@@ -1815,19 +1567,19 @@ async function manageWorkspaces(ctx: any, _config: Config): Promise<boolean> {
   const isCurrent = activeWorkspace && path.resolve(selectedWs) === activeWorkspace;
   const opOptions: string[] = [];
   if (isCurrent) {
-    opOptions.push(t("menu.pauseThisWorkspace"));
+    opOptions.push("⏸  暂停此工作区");
   } else {
-    opOptions.push(t("menu.enableThisWorkspace"));
+    opOptions.push("✅ 启用此工作区");
   }
-  opOptions.push(t("menu.removeFromList"));
-  opOptions.push(t("menu.back"));
+  opOptions.push("🗑️  从列表中删除");
+  opOptions.push("← 返回");
 
   const opChoice = await ctx.ui.select(
-    t("select.workspaceActionTitle", selectedWs),
+    `工作区: ${selectedWs}`,
     opOptions,
   );
 
-  if (!opChoice || opChoice === t("menu.back")) return false;
+  if (!opChoice || opChoice === "← 返回") return false;
 
   if (opChoice.startsWith("⏸")) {
     // 暂停
@@ -1840,7 +1592,7 @@ async function manageWorkspaces(ctx: any, _config: Config): Promise<boolean> {
       }
       const gc = runGc();
       ctx.ui.notify(
-        t("notify.paused", selectedWs, gc.snapDeleted, gc.queueDeleted || undefined),
+        `⏸ 已暂停：${selectedWs}，回收 ${gc.snapDeleted} 个孤儿快照${gc.queueDeleted ? `，清理 ${gc.queueDeleted} 个旧 queue 文件` : ""}`,
         "success",
       );
       return true;
@@ -1851,10 +1603,10 @@ async function manageWorkspaces(ctx: any, _config: Config): Promise<boolean> {
       addWorkspace(ctx.cwd);
       activeWorkspace = path.resolve(ctx.cwd);
       ctx.ui.setStatus("session-queue", getStatusText());
-      ctx.ui.notify(t("notify.enabled", selectedWs), "success");
+      ctx.ui.notify(`✅ 已启用：${selectedWs}`, "success");
       return true;
     } else {
-      ctx.ui.notify(t("notify.otherActive"), "warning");
+      ctx.ui.notify("已有其他工作区启用中，请先暂停", "warning");
     }
   } else if (opChoice.startsWith("🗑️")) {
     // 删除（从 config 移除）
@@ -1865,7 +1617,7 @@ async function manageWorkspaces(ctx: any, _config: Config): Promise<boolean> {
       activeWorkspace = null;
       ctx.ui.setStatus("session-queue", undefined);
     }
-    ctx.ui.notify(t("notify.removedFromList", selectedWs), "success");
+    ctx.ui.notify(`🗑️ 已从列表中删除：${selectedWs}`, "success");
     return false;  // 状态未变（只是配置变了），可继续菜单
   }
 
