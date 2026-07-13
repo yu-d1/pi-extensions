@@ -1,7 +1,7 @@
 {
   "name": "@liziy/session-queue",
-  "version": "0.2.2",
-  "description": "线性队列式回滚 · 文件快照一键还原",
+  "version": "0.3.0",
+  "description": "pi 扩展：线性队列会话管理 + 文件变更记忆回滚",
   "keywords": [
     "pi-extension",
     "pi-package",
@@ -11,7 +11,8 @@
     "file-snapshot",
     "checkpoint",
     "linear-history",
-    "memory"
+    "memory",
+    "i18n"
   ],
   "license": "MIT",
   "main": "index.ts",
