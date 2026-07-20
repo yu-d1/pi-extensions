@@ -1,0 +1,38 @@
+{
+  "name": "@liziy/db-plugin",
+  "version": "1.0.0",
+  "description": "AI 接入数据库扩展 —— 添加/查看/删除数据库连接，支持 PostgreSQL / MySQL / Oracle，提供查询工具给 LLM",
+  "keywords": [
+    "pi-extension",
+    "pi-package",
+    "database",
+    "postgresql",
+    "mysql",
+    "oracle"
+  ],
+  "license": "MIT",
+  "main": "index.ts",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yu-d1/pi-extensions.git",
+    "directory": "packages/db-plugin"
+  },
+  "homepage": "https://github.com/yu-d1/pi-extensions/tree/main/packages/db-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/yu-d1/pi-extensions/issues"
+  },
+  "author": "liziy",
+  "files": [
+    "index.ts",
+    "scripts/",
+    "README.md"
+  ]
+}
