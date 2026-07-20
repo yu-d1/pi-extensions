@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { query, listTables, describeTable, testConnection, isWriteSql, isDropTable, type ConnConfig } from "./src/db.js";
 
 // ── 类型定义 ──────────────────────────────────────
 
@@ -21,19 +20,6 @@ interface DbConfig {
   database: string;
   extraParams?: Record<string, string>;
   createdAt: string;
-}
-
-interface ScriptResult {
-  success: boolean;
-  error?: string;
-  columns?: string[];
-  rows?: unknown[][];
-  rowCount?: number;
-  tables?: { schema: string; name: string; type: string; description: string }[];
-  count?: number;
-  version?: string;
-  latency?: string;
-  duration?: string;
 }
 
 // ── 全局插件配置 ────────────────────────────────
@@ -58,12 +44,8 @@ const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
 
 // ── 路径 ──────────────────────────────────────────
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
 const CONFIG_FILE = join(homedir(), ".pi", "agent", "db-configs.json");
 const PLUGIN_CONFIG_FILE = join(homedir(), ".pi", "agent", "db-plugin-config.json");
-const SCRIPTS_DIR = join(__dirname, "scripts");
 
 // ── JDBC URL 解析 ────────────────────────────────
 
@@ -184,44 +166,17 @@ function buildDisplayList(configs: DbConfig[]): { list: string[]; map: Map<strin
   return { list, map };
 }
 
-// ── SQL 安全检查 ─────────────────────────────────
+// ── 辅助: 从 DbConfig 提取 ConnConfig ────────────
 
-/** 检查 SQL 是否为写操作（非 SELECT） */
-function isWriteSql(sql: string): boolean {
-  return /^\s*(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|REPLACE|LOAD|MERGE|EXEC|EXECUTE|CALL)/i.test(sql.trim());
-}
-
-/** 检查 SQL 是否包含 DROP TABLE（即使 ai_readonly=false 也禁止） */
-function isDropTable(sql: string): boolean {
-  return /^\s*DROP\s+TABLE/i.test(sql.trim());
-}
-
-// ── Python 脚本执行 ──────────────────────────────
-
-async function runPythonScript(scriptName: string, input: object): Promise<ScriptResult> {
-  return new Promise((resolve, reject) => {
-    const child = execFile(
-      "python",
-      [join(SCRIPTS_DIR, scriptName)],
-      {
-        encoding: "utf-8",
-        maxBuffer: 10 * 1024 * 1024,
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          resolve({ success: false, error: error.message || stderr.trim() });
-          return;
-        }
-        try {
-          resolve(JSON.parse(stdout));
-        } catch {
-          resolve({ success: false, error: `脚本输出解析失败: ${stdout.slice(0, 200)}` });
-        }
-      }
-    );
-    child.stdin!.write(JSON.stringify(input));
-    child.stdin!.end();
-  });
+function toConnConfig(c: DbConfig): ConnConfig {
+  return {
+    type: c.type,
+    host: c.host || "localhost",
+    port: c.port || DEFAULT_PORTS[c.type] || 5432,
+    username: c.username || "",
+    password: c.password || "",
+    database: c.database,
+  };
 }
 
 // ── 导出扩展 ──────────────────────────────────────
@@ -252,7 +207,7 @@ export default function (pi: ExtensionAPI) {
 
     // 测试连接
     ctx.ui.notify(`正在测试 ${typeLabel} 连接...`, "info");
-    const result = await runPythonScript("test_connection.py", {
+    const result = await testConnection({
       type: parsed.type, host: parsed.host, port: parsed.port,
       username, password, database: parsed.database,
     });
@@ -371,14 +326,8 @@ export default function (pi: ExtensionAPI) {
       const sql = (await ctx.ui.input("输入 SQL 语句", ""))?.trim();
       if (!sql) return;
       ctx.ui.notify("正在执行查询...", "info");
-      const connInfo: any = { type: config.type, database: config.database, sql, readonly: true };
-      if (config.host) {
-        connInfo.host = config.host;
-        connInfo.port = config.port;
-        connInfo.username = config.username;
-        connInfo.password = config.password;
-      }
-      const result = await runPythonScript("query.py", connInfo);
+      const cfg = loadPluginConfig();
+      const result = await query(toConnConfig(config), sql, true, cfg.max_rows, cfg.query_timeout);
       if (result.success) {
         const lines = [`查询完成 (${result.duration})`, `返回 ${result.rowCount} 行`];
         if (result.columns && result.columns.length > 0) {
@@ -396,14 +345,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`查询失败: ${result.error}`, "error");
       }
     } else if (choice === "📋 列出表") {
-      const connInfo: any = { type: config.type, database: config.database };
-      if (config.host) {
-        connInfo.host = config.host;
-        connInfo.port = config.port;
-        connInfo.username = config.username;
-        connInfo.password = config.password;
-      }
-      const result = await runPythonScript("list_tables.py", connInfo);
+      const result = await listTables(toConnConfig(config));
       if (result.success && result.tables) {
         const lines = result.tables.map((t) => {
           const schema = t.schema ? `${t.schema}.` : "";
@@ -570,22 +512,13 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const connInfo: any = {
-        type: config.type,
-        database: config.database,
-        sql: params.sql,
-        readonly: cfg.ai_readonly,
-        max_rows: cfg.max_rows,
-        timeout: cfg.query_timeout,
-      };
-      if (config.host) {
-        connInfo.host = config.host;
-        connInfo.port = config.port;
-        connInfo.username = config.username;
-        connInfo.password = config.password;
-      }
-
-      const result = await runPythonScript("query.py", connInfo);
+      const result = await query(
+        toConnConfig(config),
+        params.sql,
+        cfg.ai_readonly,
+        cfg.max_rows,
+        cfg.query_timeout,
+      );
 
       if (!result.success) {
         return {
@@ -632,15 +565,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const connInfo: any = { type: config.type, database: config.database };
-      if (config.host) {
-        connInfo.host = config.host;
-        connInfo.port = config.port;
-        connInfo.username = config.username;
-        connInfo.password = config.password;
-      }
-
-      const result = await runPythonScript("list_tables.py", connInfo);
+      const result = await listTables(toConnConfig(config));
 
       if (!result.success || !result.tables) {
         return {
@@ -679,15 +604,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const connInfo: any = { type: config.type, database: config.database, table: params.table };
-      if (config.host) {
-        connInfo.host = config.host;
-        connInfo.port = config.port;
-        connInfo.username = config.username;
-        connInfo.password = config.password;
-      }
-
-      const result = await runPythonScript("describe_table.py", connInfo);
+      const result = await describeTable(toConnConfig(config), params.table);
 
       if (!result.success || !result.columns) {
         return {
