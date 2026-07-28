@@ -1,6 +1,6 @@
 {
   "name": "@liziy/db-plugin",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "AI 接入数据库扩展 —— 添加/查看/删除数据库连接，支持 PostgreSQL / MySQL / Oracle，提供查询工具给 LLM",
   "keywords": [
     "pi-extension",
