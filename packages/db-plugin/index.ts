@@ -479,7 +479,7 @@ export default function (pi: ExtensionAPI) {
       database: Type.String({ description: "数据库连接名称" }),
       sql: Type.String({ description: "SQL 语句" }),
     }),
-    async execute(_toolCallId: string, params: { database: string; sql: string }, _signal: any) {
+    async execute(_toolCallId: string, params: { database: string; sql: string }, _signal: any, _onUpdate?: any, ctx?: any) {
       const cfg = loadPluginConfig();
 
       // 硬限制：禁止 AI 删除表
@@ -498,9 +498,21 @@ export default function (pi: ExtensionAPI) {
 
       // 确认策略
       if (cfg.confirm_before_exec === "always" || (cfg.confirm_before_exec === "write" && isWriteSql(params.sql))) {
-        return {
-          content: [{ type: "text" as const, text: "SQL 执行需要用户确认，请手动通过 /db 命令执行此 SQL。" }],
-        };
+        if (!ctx?.hasUI) {
+          return {
+            content: [{ type: "text" as const, text: "当前环境无法弹出确认对话框，已取消 SQL 执行。请在有界面的环境中操作。" }],
+          };
+        }
+        const ok = await ctx.ui.confirm(
+          "SQL 执行确认",
+          `数据库: ${params.database}\n\nSQL:\n${params.sql}`
+        );
+        if (!ok) {
+          return {
+            content: [{ type: "text" as const, text: "用户取消了 SQL 执行。" }],
+          };
+        }
+        // 用户确认，继续执行
       }
 
       const configs = loadConfigs();
