@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { query, listTables, describeTable, testConnection, isWriteSql, isDropTable, type ConnConfig } from "./src/db.js";
 
@@ -166,6 +166,34 @@ function buildDisplayList(configs: DbConfig[]): { list: string[]; map: Map<strin
   return { list, map };
 }
 
+// ── 辅助: 查找数据库配置（忽略大小写和首尾空格） ────
+
+function findConfig(configs: DbConfig[], name: string): DbConfig | undefined {
+  const target = name.trim().toLowerCase();
+  return configs.find((c) => c.name.toLowerCase() === target);
+}
+
+// ── 构建「可用数据库」提示（注入系统提示，让 AI 知道有哪些连接） ────
+
+function buildDbListHint(configs: DbConfig[]): string {
+  if (configs.length === 0) {
+    return [
+      "[可用数据库]",
+      "暂无数据库连接。请告知用户先通过 /db add 添加数据库连接，再执行查询。",
+    ].join("\n");
+  }
+  const lines = configs.map((c) => {
+    const typeLabel = { postgresql: "PostgreSQL", mysql: "MySQL", oracle: "Oracle" }[c.type] || c.type;
+    const desc = c.description ? ` - ${c.description}` : "";
+    return `- ${c.name} [${typeLabel}]${desc}`;
+  });
+  return [
+    "[可用数据库]",
+    ...lines,
+    "query_database / list_tables / describe_table 的 database 参数必须使用上述名称（不含中括号内容，名称区分大小写）。",
+  ].join("\n");
+}
+
 // ── 辅助: 从 DbConfig 提取 ConnConfig ────────────
 
 function toConnConfig(c: DbConfig): ConnConfig {
@@ -310,6 +338,41 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(`已更新: ${updated.name}`, "success");
   };
 
+  // ── 选择数据库公共操作 ────────────────────────────
+
+  const selectDbConfig = async (ctx: any, configs: DbConfig[], title: string): Promise<DbConfig | undefined> => {
+    if (configs.length === 0) {
+      ctx.ui.notify("尚无数据库连接", "info");
+      return undefined;
+    }
+    const { list, map } = buildDisplayList(configs);
+    const choice = await ctx.ui.select(title, list);
+    return choice ? map.get(choice) : undefined;
+  };
+
+  const showDbList = (ctx: any, configs: DbConfig[]) => {
+    if (configs.length === 0) {
+      ctx.ui.notify("尚无数据库连接", "info");
+      return;
+    }
+    const lines = configs.map((c) => {
+      const typeLabel = { postgresql: "PG", mysql: "MySQL", oracle: "Oracle" }[c.type] || c.type;
+      const desc = c.description ? ` - ${c.description}` : "";
+      return `  ${c.name} [${typeLabel}]${desc}`;
+    });
+    ctx.ui.notify(`数据库连接 (${configs.length}):\n${lines.join("\n")}`, "info");
+  };
+
+  const deleteDbConfig = async (ctx: any, configs: DbConfig[]) => {
+    const target = await selectDbConfig(ctx, configs, "选择要删除的连接");
+    if (!target) return;
+    const ok = await ctx.ui.confirm("确认删除", `确定删除数据库连接 ${target.name}？`);
+    if (!ok) return;
+    const all = loadConfigs();
+    saveConfigs(all.filter((c) => c.id !== target.id));
+    ctx.ui.notify(`已删除: ${target.name}`, "success");
+  };
+
   // ── 选择数据库后操作菜单 ────────────────────────
   const showDbActions = async (ctx: any, config: DbConfig) => {
     const actions = [
@@ -371,6 +434,8 @@ export default function (pi: ExtensionAPI) {
     } else if (choice === "✏️ 编辑") {
       await editDbConfig(ctx, config);
     } else if (choice === "🗑️ 删除") {
+      const ok = await ctx.ui.confirm("确认删除", `确定删除数据库连接 ${config.name}？`);
+      if (!ok) return;
       const all = loadConfigs();
       saveConfigs(all.filter((c) => c.id !== config.id));
       ctx.ui.notify(`已删除: ${config.name}`, "success");
@@ -380,7 +445,7 @@ export default function (pi: ExtensionAPI) {
   // ── 插件全局配置菜单 ────────────────────────────
   const showPluginConfigMenu = async (ctx: any) => {
     const cfg = loadPluginConfig();
-    ctx.ui.notify(getConfigSummary(cfg), "info");
+    ctx.ui.notify(`当前设置:\n${getConfigSummary(cfg)}`, "info");
     await editPluginConfig(ctx, cfg);
   };
 
@@ -420,7 +485,7 @@ export default function (pi: ExtensionAPI) {
     const newCfg = { ...cfg };
 
     while (true) {
-      const pick = await ctx.ui.select("选择要修改的配置项", fieldLabels);
+      const pick = await ctx.ui.select("选择要修改的设置项", fieldLabels);
       if (!pick || pick === "✅ 完成修改") break;
 
       const idx = fieldLabels.indexOf(pick);
@@ -464,8 +529,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     savePluginConfig(newCfg);
-    ctx.ui.notify(`配置已保存\n${getConfigSummary(newCfg)}`, "success");
+    ctx.ui.notify(`设置已保存\n${getConfigSummary(newCfg)}`, "success");
   };
+
+  // ── 系统提示注入：每轮告知 AI 可用数据库列表 ──────
+  // 解决 AI 不知道有哪些数据库连接、database 参数只能靠猜的问题。
+
+  pi.on("before_agent_start", async (event) => {
+    return { systemPrompt: event.systemPrompt + "\n\n" + buildDbListHint(loadConfigs()) };
+  });
 
   // ── 注册 3 个工具（给 LLM 调用） ──────────────────
 
@@ -474,9 +546,9 @@ export default function (pi: ExtensionAPI) {
     name: "query_database",
     label: "数据库查询",
     description: "执行 SQL 查询，支持 PostgreSQL / MySQL / Oracle。返回结果集。只读模式下仅允许 SELECT 查询。",
-    promptSnippet: "执行 SQL 查询。可用数据库列表自动更新。使用 list_tables 查看表结构后再编写 SQL。",
+    promptSnippet: "执行 SQL 查询。database 参数取系统提示「可用数据库」列表中的名称。使用 list_tables 查看表结构后再编写 SQL。",
     parameters: Type.Object({
-      database: Type.String({ description: "数据库连接名称" }),
+      database: Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称）" }),
       sql: Type.String({ description: "SQL 语句" }),
     }),
     async execute(_toolCallId: string, params: { database: string; sql: string }, _signal: any, _onUpdate?: any, ctx?: any) {
@@ -516,11 +588,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       const configs = loadConfigs();
-      const config = configs.find((c) => c.name === params.database);
+      const config = findConfig(configs, params.database);
       if (!config) {
-        const available = configs.map((c) => c.name).join(", ");
+        const available = configs.map((c) => c.name).join(", ") || "无";
         return {
-          content: [{ type: "text" as const, text: `数据库 "${params.database}" 未找到。可用数据库: ${available || "无"}` }],
+          content: [{ type: "text" as const, text: `数据库 "${params.database}" 未找到。可用数据库: ${available}。database 参数应使用系统提示「可用数据库」列表中的名称。` }],
         };
       }
 
@@ -564,16 +636,16 @@ export default function (pi: ExtensionAPI) {
     name: "list_tables",
     label: "列出数据库表",
     description: "列出指定数据库中的所有表，包含 schema、表名、类型。",
-    promptSnippet: "列出数据库中的表，了解表结构后再查询。",
+    promptSnippet: "列出数据库中的表，了解表结构后再查询。database 参数取系统提示「可用数据库」列表中的名称。",
     parameters: Type.Object({
-      database: Type.String({ description: "数据库连接名称" }),
+      database: Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称）" }),
     }),
     async execute(_toolCallId: string, params: { database: string }, _signal: any) {
       const configs = loadConfigs();
-      const config = configs.find((c) => c.name === params.database);
+      const config = findConfig(configs, params.database);
       if (!config) {
         return {
-          content: [{ type: "text" as const, text: `数据库 "${params.database}" 未找到。` }],
+          content: [{ type: "text" as const, text: `数据库 "${params.database}" 未找到。可用数据库: ${configs.map((c) => c.name).join(", ") || "无"}` }],
         };
       }
 
@@ -602,17 +674,17 @@ export default function (pi: ExtensionAPI) {
     name: "describe_table",
     label: "查看表结构",
     description: "查看指定表的列定义、类型、默认值、主键等。",
-    promptSnippet: "查看表结构，了解列名和类型后编写精确的 SQL。",
+    promptSnippet: "查看表结构，了解列名和类型后编写精确的 SQL。database 参数取系统提示「可用数据库」列表中的名称。",
     parameters: Type.Object({
-      database: Type.String({ description: "数据库连接名称" }),
+      database: Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称）" }),
       table: Type.String({ description: "表名（可带 schema，如 public.users）" }),
     }),
     async execute(_toolCallId: string, params: { database: string; table: string }, _signal: any) {
       const configs = loadConfigs();
-      const config = configs.find((c) => c.name === params.database);
+      const config = findConfig(configs, params.database);
       if (!config) {
         return {
-          content: [{ type: "text" as const, text: `数据库 "${params.database}" 未找到。` }],
+          content: [{ type: "text" as const, text: `数据库 "${params.database}" 未找到。可用数据库: ${configs.map((c) => c.name).join(", ") || "无"}` }],
         };
       }
 
@@ -648,81 +720,50 @@ export default function (pi: ExtensionAPI) {
       const configs = loadConfigs();
 
       if (!sub) {
-        // 导航菜单：查看 / 新增 / 删除 / 配置
+        // 导航菜单：查看 / 编辑 / 新增 / 删除 / 设置
         const navActions = [
           "📋 查看连接",
+          "✏️ 编辑连接",
           "➕ 新增连接",
           "🗑️ 删除连接",
-          "⚙️ 配置",
+          "⚙️ 设置",
         ];
         const navChoice = await ctx.ui.select("数据库管理", navActions);
         if (!navChoice) return;
 
-        if (navChoice === "⚙️ 配置") {
+        if (navChoice === "⚙️ 设置") {
           await showPluginConfigMenu(ctx);
         } else if (navChoice === "📋 查看连接") {
-          if (configs.length === 0) {
-            ctx.ui.notify("尚无数据库连接", "info");
-            return;
-          }
-          const lines = configs.map((c) => {
-            const typeLabel = { postgresql: "PG", mysql: "MySQL", oracle: "Oracle" }[c.type] || c.type;
-            const desc = c.description ? ` - ${c.description}` : "";
-            return `  ${c.name} [${typeLabel}]${desc}`;
-          });
-          ctx.ui.notify(`数据库连接 (${configs.length}):\n${lines.join("\n")}`, "info");
+          const config = await selectDbConfig(ctx, configs, "选择连接");
+          if (config) await showDbActions(ctx, config);
+        } else if (navChoice === "✏️ 编辑连接") {
+          const config = await selectDbConfig(ctx, configs, "选择要编辑的连接");
+          if (config) await editDbConfig(ctx, config);
         } else if (navChoice === "➕ 新增连接") {
           await addDbConfig(ctx);
         } else if (navChoice === "🗑️ 删除连接") {
-          if (configs.length === 0) {
-            ctx.ui.notify("没有可删除的配置", "info");
-            return;
-          }
-          const { list, map } = buildDisplayList(configs);
-          const choice = await ctx.ui.select("选择要删除的连接", list);
-          if (!choice) return;
-          const target = map.get(choice);
-          if (!target) return;
-          const all = loadConfigs();
-          saveConfigs(all.filter((c) => c.id !== target.id));
-          ctx.ui.notify(`已删除: ${target.name}`, "success");
+          await deleteDbConfig(ctx, configs);
         }
       } else if (sub === "config" || sub === "c") {
         await showPluginConfigMenu(ctx);
       } else if (sub === "add" || sub === "new" || sub === "a") {
         await addDbConfig(ctx);
+      } else if (sub === "edit" || sub === "e") {
+        const config = await selectDbConfig(ctx, configs, "选择要编辑的连接");
+        if (config) await editDbConfig(ctx, config);
       } else if (sub === "rm" || sub === "remove" || sub === "del" || sub === "delete" || sub === "d") {
-        if (configs.length === 0) {
-          ctx.ui.notify("没有可删除的配置", "info");
-          return;
-        }
-        const { list, map } = buildDisplayList(configs);
-        const choice = await ctx.ui.select("选择要删除的连接", list);
-        if (!choice) return;
-        const target = map.get(choice);
-        if (!target) return;
-        const all = loadConfigs();
-        saveConfigs(all.filter((c) => c.id !== target.id));
-        ctx.ui.notify(`已删除: ${target.name}`, "success");
+        await deleteDbConfig(ctx, configs);
       } else if (sub === "ls" || sub === "list") {
-        if (configs.length === 0) {
-          ctx.ui.notify("尚无数据库连接", "info");
-          return;
-        }
-        const lines = configs.map((c) => {
-          const typeLabel = { postgresql: "PG", mysql: "MySQL", oracle: "Oracle" }[c.type] || c.type;
-          const desc = c.description ? ` - ${c.description}` : "";
-          return `  ${c.name} [${typeLabel}]${desc}`;
-        });
-        ctx.ui.notify(`数据库连接 (${configs.length}):\n${lines.join("\n")}`, "info");
+        showDbList(ctx, configs);
       } else {
         ctx.ui.notify(
-          "用法: /db [add|rm|ls|config]\n" +
+          "用法: /db [add|edit|rm|ls|config]\n" +
           "  add    新增数据库连接\n" +
+          "  edit   编辑连接\n" +
           "  rm     删除连接\n" +
           "  ls     列出所有连接\n" +
-          "  config 查看/修改插件配置\n" +
-          "  默认    打开管理菜单（查看/新增/删除/配置）",
+          "  config 查看/修改插件设置\n" +
+          "  默认    打开管理菜单（查看/编辑/新增/删除/设置）",
           "info"
         );
       }

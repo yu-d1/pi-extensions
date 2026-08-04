@@ -1,6 +1,6 @@
 # @liziy/db-plugin
 
-> 版本 2.1.0 — AI 接入数据库，原生 Node.js 实现
+> 版本 2.2.0 — AI 接入数据库，原生 Node.js 实现
 
 安装后，AI 助手可以直接查询你的数据库——无需手动切换工具、复制粘贴连接信息。
 
@@ -8,6 +8,7 @@
 
 - 管理数据库连接（PostgreSQL / MySQL / Oracle）
 - 给 LLM 注册了 3 个工具：`query_database`、`list_tables`、`describe_table`
+- 系统提示自动注入「可用数据库」列表，AI 每轮都能看到现有连接，不用再猜连接名称
 - 当 AI 需要查数据时，会自动使用这些工具，你只需告知它用哪个数据库
 - 原生 Node.js 实现（`pg` / `mysql2` / `oracledb`），无需 Python
 
@@ -15,19 +16,20 @@
 
 | 命令 | 说明 |
 |------|------|
-| `/db` | 管理菜单：查看连接 / 新增连接 / 删除连接 / 配置 |
+| `/db` | 管理菜单：查看连接 / 编辑连接 / 新增连接 / 删除连接 / 设置 |
 | `/db add` | 快速新增 |
+| `/db edit` | 快速编辑 |
 | `/db rm` | 快速删除 |
 | `/db ls` | 列出所有连接 |
-| `/db config` | 查看/修改全局配置 |
+| `/db config` | 查看/修改全局设置 |
 
 新增时只需提供 JDBC URL（如 `jdbc:postgresql://host:5432/db`），系统会自动解析类型和地址，并测试连接是否可达。
 
-## 配置
+## 设置
 
-通过 `/db config` 修改全局配置：
+通过 `/db config` 修改全局设置：
 
-| 配置项 | 默认值 | 说明 |
+| 设置项 | 默认值 | 说明 |
 |--------|--------|------|
 | AI 只读模式 | 是 | AI 只能执行 SELECT 查询 |
 | 执行确认 | 写操作确认 | 不确认 / 写操作确认 / 每次都确认 |
@@ -46,9 +48,16 @@
 pi install npm:@liziy/db-plugin
 ```
 
-> 依赖 `pg` / `mysql2` / `oracledb` npm 包，`pi install` 会自动安装。
+> 依赖 `pg` / `mysql2` / `oracledb` / `typebox` npm 包，`pi install` 会自动安装。
 
 ## 更新日志
+
+### 2.2.0
+
+- 系统提示注入「可用数据库」列表，AI 不再猜连接名称
+- `/db` 菜单新增「编辑连接」，删除连接增加二次确认
+- 「配置」改名「设置」，`database` 参数忽略大小写匹配
+- 依赖改用 `typebox`（原 `@sinclair/typebox` 未声明且无法解析）
 
 ### 2.1.0
 
