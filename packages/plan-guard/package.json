@@ -1,6 +1,6 @@
 {
   "name": "@liziy/plan-guard",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Tab 键切换计划/执行模式",
   "keywords": [
     "pi-extension",

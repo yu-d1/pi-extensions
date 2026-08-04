@@ -8,11 +8,16 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // 计划模式下应禁用的工具（破坏性写入操作）。
-// bash 不在此列 —— 计划模式下允许 bash 执行只读命令，通过提示词约束。
+// bash 不在此列 —— 计划模式下允许 bash 执行只读命令，通过提示词约束；
+// 仅拦截高破坏性的删除命令（rm/rmdir），采用命令位置匹配避免误判参数里的 "rm" 字样。
 const PLAN_BLOCKED_TOOLS = new Set([
   "edit",
   "write",
 ]);
+
+// 命令起始位置（行首、分号、&&、||、管道、括号、常见前缀）后紧跟 rm/rmdir 才算命中。
+// 例如 `grep "rm" file`、`echo rm` 中的 rm 不匹配；`rm -rf /`、`sudo rm a.txt` 命中。
+const PLAN_BLOCKED_BASH = /(^|[;&|(]|\b(?:sudo|nohup|env)\s+)\s*(rm\b|rmdir\b)/;
 
 const PLAN_MODE_PROMPT_ADDON = `
 [计划模式已激活 - 只读设计阶段]
@@ -87,11 +92,20 @@ export default function planGuardExtension(pi: ExtensionAPI) {
     if (!targetModelId) return;
     const slashIdx = targetModelId.indexOf("/");
     if (slashIdx === -1) return;
+    // 当前已是目标模型时跳过，避免无意义的 setModel 调用
+    if (ctx.model && `${ctx.model.provider}/${ctx.model.id}` === targetModelId) return;
     const model = ctx.modelRegistry.find(
       targetModelId.slice(0, slashIdx),
       targetModelId.slice(slashIdx + 1),
     );
-    if (model) await pi.setModel(model);
+    if (!model) {
+      ctx.ui.notify(`找不到模型 ${targetModelId}，请重新选择`, "error");
+      return;
+    }
+    const ok = await pi.setModel(model);
+    if (!ok) {
+      ctx.ui.notify(`模型 ${targetModelId} 无可用 API key`, "error");
+    }
   };
 
   // ── 切换核心 ────────────────────────────────────────
@@ -108,6 +122,17 @@ export default function planGuardExtension(pi: ExtensionAPI) {
   pi.registerShortcut("tab", {
     description: "切换 Plan/Act 模式",
     handler: async (ctx) => toggleMode(ctx),
+  });
+
+  // ── /plan 命令 ──────────────────────────────────────
+  // 供 TUI 手动输入或 Web 端按钮调用：切换计划/执行模式。
+  pi.registerCommand("plan", {
+    description: "切换计划模式（计划 ⇄ 执行）",
+    handler: async (_args, ctx) => {
+      await toggleMode(ctx);
+      const label = state.mode === "plan" ? "计划" : "执行";
+      ctx.ui.notify(`已切换到${label}模式`, "info");
+    },
   });
 
   // ── 系统提示注入 + 工具调用拦截 ──────────────────
@@ -127,19 +152,31 @@ export default function planGuardExtension(pi: ExtensionAPI) {
   });
 
   // 工具调用拦截：计划模式下阻止破坏性工具执行，但不移除工具定义
-  pi.on("tool_call", async (event, ctx) => {
-    if (state.mode === "plan" && PLAN_BLOCKED_TOOLS.has(event.toolName)) {
+  pi.on("tool_call", async (event) => {
+    if (state.mode !== "plan") return;
+    if (PLAN_BLOCKED_TOOLS.has(event.toolName)) {
       return { block: true, reason: "计划模式禁止写操作，切换到执行模式后再试" };
+    }
+    const command = (event.input as { command?: string } | undefined)?.command;
+    if (event.toolName === "bash" && command && PLAN_BLOCKED_BASH.test(command)) {
+      return { block: true, reason: "计划模式禁止删除命令（rm/rmdir），切换到执行模式后再试" };
     }
   });
 
   // ── 模型偏好追踪（自动记录各模式下的模型选择）───────
+  // 注意：source 为 "restore"（pi 会话恢复时自动恢复上次模型）不记录，
+  // 否则会把恢复的模型误写进当前模式的偏好，污染 planModelId/actModelId。
 
   pi.on("model_select", async (event) => {
-    if (!event.model) return;
+    if (!event.model || event.source === "restore") return;
     const modelId = `${event.model.provider}/${event.model.id}`;
-    if (state.mode === "plan") state.planModelId = modelId;
-    else state.actModelId = modelId;
+    if (state.mode === "plan") {
+      if (state.planModelId === modelId) return;
+      state.planModelId = modelId;
+    } else {
+      if (state.actModelId === modelId) return;
+      state.actModelId = modelId;
+    }
     persistState();
   });
 
@@ -148,5 +185,7 @@ export default function planGuardExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     restoreState(ctx);
     updateUI(ctx);
+    // 恢复该模式对应的偏好模型（幂等：与当前模型相同则跳过）
+    await switchModelForMode(ctx, state.mode);
   });
 }
