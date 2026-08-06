@@ -1597,7 +1597,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
           const modelName = ctx.model?.id || "";
           const provider = ctx.model?.provider || "";
-          const rightSide = provider ? `(${provider}) ${modelName}` : modelName;
+          const level = ctx.thinkingLevel || "off";
+          const rightSide = (provider ? `(${provider}) ${modelName}` : modelName) + ` · ${level}`;
 
           const leftWidth = visibleWidth(left);
           const rightWidth = visibleWidth(rightSide);
