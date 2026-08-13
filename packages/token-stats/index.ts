@@ -200,6 +200,8 @@ type QuotaError =
 
 let quotaState: QuotaDisplayState | null = null;
 let quotaTimerId: ReturnType<typeof setInterval> | null = null;
+/** session 存活标志：session_shutdown 置 false，session_start 置 true，用于守卫异步回调 */
+let sessionActive = false;
 let tokenConfig: TokenConfig | null = null;
 let lastQuotaProvider: string | null = null;
 
@@ -427,7 +429,10 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
     // 跨 provider 切换：force refresh（绕过缓存，避免 P7）
     if (lastQuotaProvider !== null || curProvider !== null) {
       setTimeout(() => {
-        refreshQuota(ctx, true).then(() => requestFooterRender?.());
+        if (!sessionActive) return;
+        refreshQuota(ctx, true)
+          .then(() => requestFooterRender?.())
+          .catch(() => { /* ctx 已失效（session 被替换），忽略 */ });
       }, 0);
     }
     lastQuotaProvider = curProvider;
@@ -1552,9 +1557,28 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     requestFooterRender?.();
   });
 
+  // ── session_shutdown: 清理跨 session 资源（定时器 / footer 引用）───────
+
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    // session 替换（/new /resume /fork）或 /reload 时旧 ctx 会失效，
+    // 必须在此清掉旧实例的定时器与闭包引用，否则定时器回调访问旧 ctx
+    // 会抛 "extension ctx is stale" 导致 pi 崩溃退出。
+    // 注意：reload 会重新执行本文件（全新实例、quotaTimerId 为 null），
+    // 所以只有这里能清掉旧实例的定时器，不能依赖 session_start 里的清理。
+    sessionActive = false;
+    if (quotaTimerId) {
+      clearInterval(quotaTimerId);
+      quotaTimerId = null;
+    }
+    requestFooterRender = null;
+    lastQuotaProvider = null;
+    quotaState = null;
+  });
+
   // ── session_start: 恢复累计状态 + 注册 footer ───────
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionActive = true;
     rebuildFromHistory(ctx);
 
     // 套餐用量：加载配置 + 定时刷新
@@ -1569,12 +1593,15 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     await refreshQuota(ctx, true);
     requestFooterRender?.();
     quotaTimerId = setInterval(async () => {
-      // 定时器也先检测 provider 变化；变化则 force refresh
-      if (ctx.model?.provider !== lastQuotaProvider) {
-        await refreshQuota(ctx, true);
-      } else {
-        await refreshQuota(ctx, false);
-      }
+      if (!sessionActive) return;
+      try {
+        // 定时器也先检测 provider 变化；变化则 force refresh
+        if (ctx.model?.provider !== lastQuotaProvider) {
+          await refreshQuota(ctx, true);
+        } else {
+          await refreshQuota(ctx, false);
+        }
+      } catch { /* ctx 已失效（session 被替换），忽略本次刷新 */ }
       requestFooterRender?.();
     }, (tokenConfig?.ttl || 60) * 1000);
 
@@ -1591,6 +1618,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         },
         invalidate() {},
         render(width: number): string[] {
+          // session 替换后旧 footer 可能仍被 TUI 渲染，此时 ctx 已失效，直接返回空
+          if (!sessionActive) return [];
           // ── 上行：指标左对齐，模型名右对齐 ──────────
           const metrics = buildMetricParts(theme, ctx);
           const left = metrics.join(" | ");
@@ -1664,7 +1693,10 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           quotaState = null;
           if (quotaTimerId) clearInterval(quotaTimerId);
           quotaTimerId = setInterval(async () => {
-            await refreshQuota(ctx);
+            if (!sessionActive) return;
+            try {
+              await refreshQuota(ctx);
+            } catch { /* ctx 已失效（session 被替换），忽略 */ }
             requestFooterRender?.();
           }, (tokenConfig?.ttl || 60) * 1000);
           requestFooterRender?.();
@@ -1682,7 +1714,10 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           await forceRefreshQuota(ctx);
           if (quotaTimerId) clearInterval(quotaTimerId);
           quotaTimerId = setInterval(async () => {
-            await refreshQuota(ctx);
+            if (!sessionActive) return;
+            try {
+              await refreshQuota(ctx);
+            } catch { /* ctx 已失效（session 被替换），忽略 */ }
             requestFooterRender?.();
           }, (tokenConfig?.ttl || 60) * 1000);
           if (quotaState?.error) {
@@ -1804,7 +1839,10 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
               // 重设定时器
               if (quotaTimerId) clearInterval(quotaTimerId);
               quotaTimerId = setInterval(async () => {
-                await refreshQuota(ctx);
+                if (!sessionActive) return;
+                try {
+                  await refreshQuota(ctx);
+                } catch { /* ctx 已失效（session 被替换），忽略 */ }
                 requestFooterRender?.();
               }, sec * 1000);
               ctx.ui.notify("刷新时间已设为 " + sec + " 秒", "info");

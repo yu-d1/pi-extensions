@@ -218,6 +218,11 @@ jq -r '"\(.date) \(.avgCacheHitRate)"' \
 - 会话恢复（`session_start`）会从历史 assistant 消息重建累计统计，无需重启 pi 就能看到本会话完整账单
 - `message_end` 与 `turn_end` 通过 `responseId + provider + model + usage` 复合 key 去重，避免重复累加
 
+## 更新记录
+
+- **v1.3.3** — 修复 `/new`、`/resume`、`/fork`、`/reload` 等 session 替换场景下旧实例配额刷新定时器未清理、访问失效 ctx 导致 pi 崩溃退出（`extension ctx is stale`）的问题：新增 `session_shutdown` 清理处理器，定时器/延迟回调/footer 渲染统一加 `sessionActive` 守卫与异常兜底
+- **v1.3.2** — `/stats` 启用套餐时不再误报“未知错误”
+
 ## 协议
 
 MIT
