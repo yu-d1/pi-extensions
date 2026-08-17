@@ -1009,7 +1009,7 @@ function resolveActivePlan(provider?: string): TokenPlan | null {
   return BUILTIN_PLANS.find(p => p.id === planId) || null;
 }
 
-function resolveApiKey(plan: TokenPlan): string | null {
+function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
   // 1. 环境变量优先
   if (plan.apiKeyEnv && process.env[plan.apiKeyEnv]) {
     return process.env[plan.apiKeyEnv]!;
@@ -1020,6 +1020,11 @@ function resolveApiKey(plan: TokenPlan): string | null {
     if (existsSync(authPath)) {
       const raw = readFileSync(authPath, "utf-8");
       const auth = JSON.parse(raw);
+      // 2a. 优先取「当前 provider」自己的 key：
+      //     避免 provider 映射到套餐后盗用套餐原生 provider 的 key（如
+      //     opencode-go 映射 deepseek 套餐时误用 deepseek 官方 key 查余额）。
+      if (provider && auth[provider]?.key) return auth[provider].key;
+      // 2b. 回退：套餐原生 provider 的 key
       for (const providerId of plan.matchProviders) {
         const entry = auth[providerId];
         if (entry?.key) return entry.key;
@@ -1163,7 +1168,7 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   }
 
   // 3. 解析 key
-  const key = resolveApiKey(plan);
+  const key = resolveApiKey(plan, curProvider);
   if (!key) {
     quotaState = buildErrorState(curProvider, plan.id, {
       kind: "key_missing",
