@@ -4,10 +4,61 @@
 //
 // 独立原则：本扩展不读取任何其他扩展的状态，只通过 pi.getActiveTools() 和
 // pi.setActiveTools() 与运行时交互。即使 plugin-manager 未安装，也能正常工作。
+//
+// v2.0.0 整合：
+//   - 内嵌 rpiv-todo（todo 工具 + /todos 命令 + overlay 面板）与
+//     rpiv-ask-user-question（ask_user_question 终端对话框）两个子扩展，
+//     源码位于 ask-user-question/ 与 todo/ 子目录（MIT, juicesharp），
+//     配置工具内联于 rpiv-config.ts（MIT, juicesharp）。
+//   - 开关：~/.pi/agent/extensions/plan-guard/config.json 的 features 字段
+//     （todo / askUserQuestion，默认全开），/plan config 子菜单可切换。
+//     注册决策在扩展加载期完成，切换开关后需 /reload 生效。
+//   - 关闭的子扩展不注册 → pi 内置的同名工具（todo / ask_user_question）
+//     自然生效。
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { loadJsonConfig, saveJsonConfig } from "./rpiv-config.js";
+import registerAskUserQuestionExtension from "./ask-user-question/index.js";
+import registerTodoExtension from "./todo/index.js";
 
-// 计划模式下应禁用的工具（破坏性写入操作）。
+// ── 配置（features 开关）────────────────────────────
+
+const PLAN_GUARD_CONFIG_DIR = join(homedir(), ".pi/agent/extensions/plan-guard");
+const PLAN_GUARD_CONFIG_FILE = join(PLAN_GUARD_CONFIG_DIR, "config.json");
+
+interface PlanGuardFeatures {
+  /** todo 工具 + /todos 命令 + overlay 面板（rpiv-todo 整合） */
+  todo: boolean;
+  /** ask_user_question 终端对话框（rpiv-ask-user-question 整合） */
+  askUserQuestion: boolean;
+}
+
+interface PlanGuardConfig {
+  features: PlanGuardFeatures;
+}
+
+const DEFAULT_PLAN_GUARD_CONFIG: PlanGuardConfig = {
+  features: { todo: true, askUserQuestion: true },
+};
+
+/** 读取 features 配置（缺失/损坏 → 默认全开）。同步读取，供扩展加载期注册决策。 */
+function loadPlanGuardConfig(): PlanGuardConfig {
+  const raw = loadJsonConfig<Partial<PlanGuardConfig>>(PLAN_GUARD_CONFIG_FILE);
+  const f = raw.features;
+  return {
+    features: {
+      todo: typeof f?.todo === "boolean" ? f.todo : DEFAULT_PLAN_GUARD_CONFIG.features.todo,
+      askUserQuestion:
+        typeof f?.askUserQuestion === "boolean"
+          ? f.askUserQuestion
+          : DEFAULT_PLAN_GUARD_CONFIG.features.askUserQuestion,
+    },
+  };
+}
+
+// ── 计划模式下应禁用的工具（破坏性写入操作）──────────
 // bash 不在此列 —— 计划模式下允许 bash 执行只读命令，通过提示词约束；
 // 仅拦截高破坏性的删除命令（rm/rmdir），采用命令位置匹配避免误判参数里的 "rm" 字样。
 const PLAN_BLOCKED_TOOLS = new Set([
@@ -51,6 +102,18 @@ interface PlanGuardState {
 
 export default function planGuardExtension(pi: ExtensionAPI) {
   const state: PlanGuardState = { mode: "act" };
+
+  // ── 整合子扩展（按 features 开关条件注册）───────────
+  // 注册决策在扩展加载期完成：开关关闭时不注册 → pi 内置同名工具生效；
+  // 开关切换后需 /reload 重新加载生效（与 rpiv 自身 config 的 register-once
+  // 语义一致）。
+  const features = loadPlanGuardConfig().features;
+  if (features.askUserQuestion) {
+    registerAskUserQuestionExtension(pi);
+  }
+  if (features.todo) {
+    registerTodoExtension(pi);
+  }
 
   // ── 核心过滤逻辑（独立于其他扩展）──────────────────
   // 注意：不通过 setActiveTools 移工具（那会导致 LLM 看不见工具定义，
@@ -117,6 +180,36 @@ export default function planGuardExtension(pi: ExtensionAPI) {
     await switchModelForMode(ctx, state.mode);
   };
 
+  // ── /plan config 配置菜单 ──────────────────────────
+
+  const showConfigMenu = async (ctx: ExtensionContext) => {
+    const cfg = loadPlanGuardConfig();
+    const todoLabel = `📋 Todo 任务面板  (${cfg.features.todo ? "✅ 开启" : "⬜ 关闭"})`;
+    const aqLabel = `💬 提问对话框    (${cfg.features.askUserQuestion ? "✅ 开启" : "⬜ 关闭"})`;
+    const choice = await ctx.ui.select("Plan Guard 配置（重新加载后生效）", [
+      todoLabel,
+      aqLabel,
+      "🔙 返回",
+    ]);
+    if (!choice || choice === "🔙 返回") return;
+
+    const next: PlanGuardConfig = {
+      features: { ...cfg.features },
+    };
+    if (choice === todoLabel) next.features.todo = !cfg.features.todo;
+    else if (choice === aqLabel) next.features.askUserQuestion = !cfg.features.askUserQuestion;
+
+    const ok = saveJsonConfig(PLAN_GUARD_CONFIG_FILE, next);
+    if (ok) {
+      ctx.ui.notify(
+        `已保存（Todo ${next.features.todo ? "开" : "关"} · 提问 ${next.features.askUserQuestion ? "开" : "关"}）→ /reload 后生效`,
+        "info",
+      );
+    } else {
+      ctx.ui.notify("配置保存失败（磁盘错误？）", "error");
+    }
+  };
+
   // ── Tab 快捷键 ──────────────────────────────────────
 
   pi.registerShortcut("tab", {
@@ -125,10 +218,15 @@ export default function planGuardExtension(pi: ExtensionAPI) {
   });
 
   // ── /plan 命令 ──────────────────────────────────────
-  // 供 TUI 手动输入或 Web 端按钮调用：切换计划/执行模式。
+  // /plan          —— 切换计划/执行模式（TUI 手动输入或 Web 端按钮调用）
+  // /plan config   —— 配置整合子扩展的开关（Todo 面板 / 提问对话框）
   pi.registerCommand("plan", {
-    description: "切换计划模式（计划 ⇄ 执行）",
-    handler: async (_args, ctx) => {
+    description: "切换计划模式（计划 ⇄ 执行）；/plan config 配置整合子扩展",
+    handler: async (args, ctx) => {
+      if (args === "config") {
+        await showConfigMenu(ctx);
+        return;
+      }
       await toggleMode(ctx);
       const label = state.mode === "plan" ? "计划" : "执行";
       ctx.ui.notify(`已切换到${label}模式`, "info");
