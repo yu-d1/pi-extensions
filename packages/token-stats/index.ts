@@ -29,6 +29,7 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
+import { createDeepseekBackend, type SearchBackend } from "./search";
 
 // ── 路径 ──────────────────────────────────────────────────
 
@@ -105,6 +106,15 @@ interface TokenPlan {
 interface TokenConfig {
   providerPlans: Record<string, string | null>;
   ttl: number;
+  /** 联网搜索配置（v1.4.0+；旧配置文件无此字段时用默认值：开启 + deepseek 映射） */
+  search?: SearchConfig;
+}
+
+interface SearchConfig {
+  /** 总开关，默认 true */
+  enabled: boolean;
+  /** 套餐 id → 搜索后端 id 映射（如 { "deepseek": "deepseek-server" }） */
+  backends: Record<string, string>;
 }
 
 interface QuotaCache {
@@ -698,7 +708,11 @@ const TOKEN_CONFIG_DIR = join(homedir(), ".pi/agent/extensions/token-stats");
 const TOKEN_CONFIG_FILE = join(TOKEN_CONFIG_DIR, "config.json");
 const QUOTA_CACHE_FILE = join(LOGS_DIR, "quota-cache.json");
 
-const DEFAULT_TOKEN_CONFIG: TokenConfig = { providerPlans: {}, ttl: 60 };
+const DEFAULT_TOKEN_CONFIG: TokenConfig = {
+  providerPlans: {},
+  ttl: 60,
+  search: { enabled: true, backends: { deepseek: "deepseek-server" } },
+};
 
 const DISPLAY_CONFIG_FILE = join(TOKEN_CONFIG_DIR, "display-config.json");
 const DEFAULT_DISPLAY_CONFIG: DisplayConfig = {
@@ -914,10 +928,19 @@ async function loadTokenConfig(): Promise<TokenConfig> {
   try {
     if (existsSync(TOKEN_CONFIG_FILE)) {
       const raw = await readFile(TOKEN_CONFIG_FILE, "utf-8");
-      return { ...DEFAULT_TOKEN_CONFIG, ...JSON.parse(raw) };
+      const parsed = JSON.parse(raw) as Partial<TokenConfig>;
+      return {
+        ...DEFAULT_TOKEN_CONFIG,
+        ...parsed,
+        // search 深合并：旧配置无 search 字段时自动获得默认（开启 + deepseek 映射）
+        search: { ...DEFAULT_TOKEN_CONFIG.search!, ...(parsed.search ?? {}) },
+      };
     }
   } catch {}
-  return { ...DEFAULT_TOKEN_CONFIG };
+  return {
+    ...DEFAULT_TOKEN_CONFIG,
+    search: { ...DEFAULT_TOKEN_CONFIG.search! },
+  };
 }
 
 async function saveTokenConfig(cfg: TokenConfig) {
@@ -1004,6 +1027,47 @@ function resolveApiKey(plan: TokenPlan): string | null {
     }
   } catch {}
   return null;
+}
+
+// ── 联网搜索（内嵌 deepseek-server，见 search.ts）────────
+
+/** 当前应激活的搜索后端 id（由 syncSearchTool 计算，供 execute 守卫读取） */
+let activeSearchBackendId: string | null = null;
+
+const SEARCH_BACKENDS: SearchBackend[] = [
+  createDeepseekBackend({
+    resolveApiKey: () =>
+      resolveApiKey(BUILTIN_PLANS.find((p) => p.id === "deepseek")!),
+    isActive: () => activeSearchBackendId === "deepseek-server",
+  }),
+];
+
+/**
+ * 根据配置 + 当前 provider 的套餐，同步 web_search 工具注册状态。
+ * 规则（套餐驱动）：search.enabled=false 或 backends[plan.id] 未命中 → 不启用；
+ * 未命中时若已注册完整实现则覆盖为禁用空壳（pi 无注销 API，同名注册即覆盖）。
+ */
+function syncSearchTool(pi: ExtensionAPI, provider: string | null | undefined) {
+  const searchCfg = tokenConfig?.search ?? DEFAULT_TOKEN_CONFIG.search!;
+  let targetId: string | null = null;
+  if (searchCfg.enabled) {
+    const plan = resolveActivePlan(provider ?? undefined);
+    if (plan) {
+      const backendId = searchCfg.backends[plan.id];
+      if (backendId && SEARCH_BACKENDS.some((b) => b.id === backendId)) {
+        targetId = backendId;
+      }
+    }
+  }
+  for (const backend of SEARCH_BACKENDS) {
+    if (backend.id === targetId) {
+      backend.enable(pi);
+      activeSearchBackendId = backend.id;
+    } else {
+      backend.disable(pi);
+      if (activeSearchBackendId === backend.id) activeSearchBackendId = null;
+    }
+  }
 }
 
 /**
@@ -1408,6 +1472,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       lastQuotaProvider = ctx.model?.provider ?? null;
       quotaState = null; // 跨 provider 立即清旧 state
       await refreshQuota(ctx, true); // force 绕过缓存
+      // 搜索后端跟随套餐：provider 切换时同步注册状态
+      syncSearchTool(pi, ctx.model?.provider);
       requestFooterRender?.();
     }
 
@@ -1577,6 +1643,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     requestFooterRender = null;
     lastQuotaProvider = null;
     quotaState = null;
+    activeSearchBackendId = null;
   });
 
   // ── session_start: 恢复累计状态 + 注册 footer ───────
@@ -1588,6 +1655,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     // 套餐用量：加载配置 + 定时刷新
     tokenConfig = await loadTokenConfig();
     displayConfig = await loadDisplayConfig();
+    // 联网搜索：按配置 + 当前套餐注册 web_search（默认开启）
+    syncSearchTool(pi, ctx.model?.provider);
     lastQuotaProvider = null; // 强制让 refreshQuota 检测一次
     quotaState = null;
     // P7 修复：清空所有 plan 的缓存（避免跨 session 复用旧数据）
@@ -1686,13 +1755,19 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           options,
         );
 
-        const defaults: TokenConfig = { providerPlans: {}, ttl: 60 };
+        const defaults: TokenConfig = {
+          providerPlans: {},
+          ttl: 60,
+          search: { ...DEFAULT_TOKEN_CONFIG.search! },
+        };
 
         if (!choice || choice === "关闭") {
           tokenConfig = tokenConfig
             ? { ...tokenConfig, providerPlans: { ...tokenConfig.providerPlans, [provider]: null } }
             : { ...defaults, providerPlans: { [provider]: null } };
           await saveTokenConfig(tokenConfig);
+          // 搜索跟随套餐：关闭套餐时同步注销搜索工具
+          syncSearchTool(pi, provider);
           lastQuotaProvider = provider;
           quotaState = null;
           if (quotaTimerId) clearInterval(quotaTimerId);
@@ -1716,6 +1791,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           lastQuotaProvider = provider;
           // 立即查询
           await forceRefreshQuota(ctx);
+          // 搜索跟随套餐：选择 deepseek 等带搜索后端的套餐时同步注册
+          syncSearchTool(pi, provider);
           if (quotaTimerId) clearInterval(quotaTimerId);
           quotaTimerId = setInterval(async () => {
             if (!sessionActive) return;
@@ -1741,6 +1818,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           "显示样式",
           "显示内容",
           "刷新时间  (当前 " + (tokenConfig?.ttl || 60) + "s)",
+          "🔍 联网搜索",
         ]);
         if (!subChoice) return;
 
@@ -1851,6 +1929,33 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
               }, sec * 1000);
               ctx.ui.notify("刷新时间已设为 " + sec + " 秒", "info");
             }
+          }
+        } else if (subChoice === "🔍 联网搜索") {
+          const searchCfg = (tokenConfig ?? DEFAULT_TOKEN_CONFIG).search!;
+          const plan = resolveActivePlan(ctx.model?.provider);
+          const backendId = searchCfg.enabled && plan
+            ? searchCfg.backends[plan.id]
+            : null;
+          const backendName = backendId
+            ? (SEARCH_BACKENDS.find((b) => b.id === backendId)?.name ?? backendId)
+            : "无（该套餐暂无搜索后端）";
+          const planName = plan ? `${plan.id} (${plan.name})` : "未配置套餐";
+          ctx.ui.notify(`当前套餐: ${planName} | 搜索后端: ${backendName}`, "info");
+          const toggleLabel = (searchCfg.enabled ? "✅" : "⬜") + " 启用联网搜索";
+          const choice = await ctx.ui.select("🔍 联网搜索", [
+            toggleLabel,
+            "🔙 返回",
+          ]);
+          if (choice === toggleLabel) {
+            const next = !searchCfg.enabled;
+            tokenConfig = {
+              ...(tokenConfig ?? DEFAULT_TOKEN_CONFIG),
+              search: { ...searchCfg, enabled: next },
+            };
+            await saveTokenConfig(tokenConfig);
+            syncSearchTool(pi, ctx.model?.provider);
+            requestFooterRender?.();
+            ctx.ui.notify(next ? "联网搜索已开启" : "联网搜索已关闭", "info");
           }
         }
         return;

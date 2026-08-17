@@ -175,6 +175,15 @@ API Key 读取顺序：环境变量 > `~/.pi/agent/auth.json` 中对应 provider
 
 查询结果按 TTL（默认 60s，可在 `/stats config` 中调整）缓存到 `quota-cache.json`，避免高频调用触发平台限流。
 
+## 联网搜索
+
+选择 DeepSeek 套餐后自动获得联网搜索能力（默认开启）：模型可直接调用 `web_search` 工具进行实时搜索，结果带来源链接。
+
+- **开关**：`/stats config` → `🔍 联网搜索` → 切换 `启用联网搜索`（默认开启）
+- **联动规则（套餐驱动）**：搜索后端由当前套餐决定 —— 选择 DeepSeek 套餐 → 使用 DeepSeek 服务端搜索（`deepseek-v4-flash` + `web_search_20260209`，与官方 [pi-deepseek-search](https://github.com/bxff/pi-deepseek-search) 相同的调用逻辑）；其它套餐暂无搜索后端，工具不注册
+- **key 复用**：与配额查询共用同一套 key 解析（环境变量 > auth.json），无需额外配置
+- **与 pi-deepseek-search 共存**：两者都会注册同名 `web_search` 工具，pi 按扩展加载顺序取先注册者生效，后注册者被静默忽略。使用本扩展的搜索时建议卸载 pi-deepseek-search（搜索已内嵌，功能等价）
+
 ## 日志文件结构
 
 ```
@@ -219,6 +228,8 @@ jq -r '"\(.date) \(.avgCacheHitRate)"' \
 - `message_end` 与 `turn_end` 通过 `responseId + provider + model + usage` 复合 key 去重，避免重复累加
 
 ## 更新记录
+
+- **v1.4.0** — 新增联网搜索：`/stats config` 可配置（默认开启），搜索后端跟随套餐（DeepSeek 套餐 → DeepSeek 服务端搜索，内嵌移植 pi-deepseek-search 核心逻辑，带 provider 守卫）
 
 - **v1.3.4** — 修复 DeepSeek 配额启用后余额不显示：余额型显示无 `5h:/W:/⏱` 字段被过滤丢失，空结果时回退显示完整内容
 - **v1.3.3** — 修复 `/new`、`/resume`、`/fork`、`/reload` 等 session 替换场景下旧实例配额刷新定时器未清理、访问失效 ctx 导致 pi 崩溃退出（`extension ctx is stale`）的问题：新增 `session_shutdown` 清理处理器，定时器/延迟回调/footer 渲染统一加 `sessionActive` 守卫与异常兜底
