@@ -220,6 +220,7 @@ jq -r '"\(.date) \(.avgCacheHitRate)"' \
 
 ## 更新记录
 
+- **v1.3.4** — 修复 DeepSeek 配额启用后余额不显示：余额型显示无 `5h:/W:/⏱` 字段被过滤丢失，空结果时回退显示完整内容
 - **v1.3.3** — 修复 `/new`、`/resume`、`/fork`、`/reload` 等 session 替换场景下旧实例配额刷新定时器未清理、访问失效 ctx 导致 pi 崩溃退出（`extension ctx is stale`）的问题：新增 `session_shutdown` 清理处理器，定时器/延迟回调/footer 渲染统一加 `sessionActive` 守卫与异常兜底
 - **v1.3.2** — `/stats` 启用套餐时不再误报“未知错误”
 

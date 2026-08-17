@@ -466,6 +466,10 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
       }
       if (filteredParts.length > 0) {
         parts.push(qColor(prefix + filteredParts.join(" ")));
+      } else if (cfg.quota5h || cfg.quotaWeek || cfg.quotaClock) {
+        // 余额型套餐（DeepSeek ¥xx.x 等）不含 5h/W/⏱ 字段，
+        // 子项过滤匹配不到任何内容时回退显示完整 display，避免配额段静默消失
+        parts.push(qColor(prefix + fullDisplay));
       }
     }
   }
