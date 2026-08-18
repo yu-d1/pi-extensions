@@ -1304,7 +1304,10 @@ async function manageWorkspaces(ctx: any): Promise<boolean> {
 // 入口
 // =============================================================================
 
-export default function (pi: ExtensionAPI) {
+export { default } from "./src/index";
+
+/** 旧实现已迁移到 src/，此函数仅保留作参考，不会注册任何事件。 */
+function __legacyDisabled(pi: ExtensionAPI) {
   ensureDirs();
   activeWorkspace = null;
 

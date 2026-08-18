@@ -1,7 +1,7 @@
 {
   "name": "@liziy/session-queue",
-  "version": "0.3.0",
-  "description": "pi 扩展：线性队列会话管理 + 文件变更记忆回滚",
+  "version": "0.4.0",
+  "description": "pi 扩展：会话树形队列 + 文件变更记忆回滚（分支独立状态 / 执行前-执行后双语义）",
   "keywords": [
     "pi-extension",
     "pi-package",
@@ -18,6 +18,7 @@
   "main": "index.ts",
   "files": [
     "index.ts",
+  "src",
     "README.md"
   ],
   "pi": {
