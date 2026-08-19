@@ -1,0 +1,44 @@
+{
+  "name": "@liziy/pi-sub",
+  "version": "1.0.0",
+  "description": "pi 子进程调度扩展：内置文件探索、审查、调研和视觉子进程，支持主模型按需新增配置",
+  "keywords": [
+    "pi-extension",
+    "pi-package",
+    "subagent",
+    "multi-agent",
+    "research",
+    "review",
+    "vision"
+  ],
+  "license": "MIT",
+  "main": "index.ts",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "dependencies": {
+    "typebox": "^1.3.13"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yu-d1/pi-extensions.git",
+    "directory": "packages/pi-sub"
+  },
+  "homepage": "https://github.com/yu-d1/pi-extensions/tree/main/packages/pi-sub#readme",
+  "bugs": {
+    "url": "https://github.com/yu-d1/pi-extensions/issues"
+  },
+  "author": "liziy",
+  "files": [
+    "index.ts",
+    "agents/",
+    "README.md"
+  ]
+}
