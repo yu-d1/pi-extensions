@@ -1,9 +1,9 @@
 ---
 name: review
+enabled: true
 aliases: 审查,复核,二审,reviewer,检查
 description: 独立代码审查与验证——检查改动、方案、测试和运行结果，必要时执行只读数据库查询、SSH 检查和测试命令；只报告问题，不修改文件
 prompt: 当用户明确要求审查、复核、二审、独立验证改动/方案/测试结果，或要求核对数据库、SSH、测试命令结果时，调用 sub，agent=review；把审查目标、相关文件、改动范围和验证要求写进 task
-model: cctq/gpt-5.6-luna
 thinking: max
 tools: plan
 maxTokens: 8192

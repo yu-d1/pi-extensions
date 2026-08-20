@@ -1,9 +1,9 @@
 ---
 name: file-scout
+enabled: true
 aliases: 文件探索,文件搜索,内容搜索,流程追踪,file-scout
 description: 快速探索项目文件、搜索内容并追踪代码与配置流程
 prompt: 当用户要求快速查找项目文件、搜索文件内容、定位定义或引用、理解代码执行流程、追踪调用链或梳理配置与数据流时，调用 sub，agent=file-scout；任务中应提供目标、关键词、范围和需要回答的问题
-model: opencode-go/deepseek-v4-flash
 thinking: off
 tools: read,ls,find,grep
 maxTokens: 8192

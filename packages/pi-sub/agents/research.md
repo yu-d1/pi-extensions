@@ -1,9 +1,9 @@
 ---
 name: research
+enabled: true
 aliases: 调研,研究,搜索,资料,查资料,researcher
 description: 独立资料调研——联网搜索并交叉核对当前信息，返回带来源链接的结构化调研简报
 prompt: 当用户要求搜索、联网调研、查资料、获取最新信息、查找来源、排名、对比或核实外部事实时，调用 sub，agent=research；不要用 bash 或 curl 替代 research，把问题和输出要求写进 task
-model: deepseek/deepseek-v4-flash
 thinking: off
 tools: web_search,read
 maxTokens: 8192

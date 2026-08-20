@@ -57,6 +57,8 @@ const PI_SUB_CONFIG_FILE = path.join(USER_EXTENSION_DIR, "config.json");
 const DEFAULT_PROGRESS_LINES = 5;
 /** 可配置显示行数上限 */
 const MAX_PROGRESS_LINES = 10;
+/** 子进程最长运行时间，避免不支持图片或网络异常时永久等待。 */
+const DEFAULT_SUBPROCESS_TIMEOUT_MS = 120_000;
 
 interface PiSubConfig {
 	/** 子进程实时输出固定显示行数（最新 N 行滚动窗口） */
@@ -83,6 +85,8 @@ function savePiSubConfig(config: PiSubConfig): void {
 type AgentSource = "builtin" | "user";
 
 interface AgentDef {
+	/** 是否启用自动注入和调用；未声明时兼容旧配置，默认为启用。 */
+	enabled: boolean;
 	name: string;
 	aliases?: string[];
 	description?: string;
@@ -146,6 +150,7 @@ function loadAgentFile(filePath: string, source: AgentSource): AgentDef | null {
 		if (!AGENT_NAME_RE.test(name)) return null;
 		const maxTokens = frontmatter.maxTokens ? Number(frontmatter.maxTokens) : undefined;
 		return {
+			enabled: frontmatter.enabled === undefined ? true : toBool(frontmatter.enabled) === true,
 			name,
 			aliases: parseAliases(frontmatter.aliases),
 			description: frontmatter.description,
@@ -188,9 +193,10 @@ function findAgent(name: string): AgentDef | undefined {
 const AGENT_LABEL_MAX_WIDTH = 72;
 
 function agentChoiceLabel(a: AgentDef): string {
-	const model = a.model || "继承当前";
+	const enabled = a.enabled ? "启用" : "停用";
+	const model = a.model || "未配置模型";
 	const thinking = a.thinking || "默认";
-	return truncateToWidth(`${a.name}（模型=${model}，思考=${thinking}）`, AGENT_LABEL_MAX_WIDTH, "…");
+	return truncateToWidth(`${a.name}（${enabled}，模型=${model}，思考=${thinking}）`, AGENT_LABEL_MAX_WIDTH, "…");
 }
 
 function choiceAgentName(label: string): string {
@@ -206,8 +212,9 @@ function compactAgentText(value: string | undefined, fallback: string): string {
 }
 
 function buildAgentCatalog(agents: AgentDef[] = loadAgents()): string {
-	if (agents.length === 0) return "（暂无已配置的子进程）";
-	const catalog = agents
+	const enabledAgents = agents.filter((agent) => agent.enabled && agent.model);
+	if (enabledAgents.length === 0) return "（暂无已启用且已配置模型的子进程）";
+	const catalog = enabledAgents
 		.map((agent) => {
 			const aliases = agent.aliases?.length ? `（别名：${agent.aliases.join("、")}）` : "";
 			const description = compactAgentText(agent.description, "未填写用途说明");
@@ -218,7 +225,8 @@ function buildAgentCatalog(agents: AgentDef[] = loadAgents()): string {
 }
 
 function buildAgentParameterDescription(agents: AgentDef[]): string {
-	const names = [...new Set(agents.flatMap((agent) => [agent.name, ...(agent.aliases ?? [])]))];
+	const enabledAgents = agents.filter((agent) => agent.enabled && agent.model);
+	const names = [...new Set(enabledAgents.flatMap((agent) => [agent.name, ...(agent.aliases ?? [])]))];
 	const choices = names.length > 0 ? truncateToWidth(names.join("、"), 900, "…") : "（暂无）";
 	return `子进程名称或别名。当前可用：${choices}`;
 }
@@ -228,18 +236,19 @@ function buildSubToolDescription(agents: AgentDef[]): string {
 		"唤醒一个独立的 pi 子进程执行任务并返回结果文本（子进程有独立模型、系统提示词、工具与上下文，不污染当前对话）。",
 		"当前可用子进程：",
 		buildAgentCatalog(agents),
-		"每个 agent 的调用提示由其配置文件中的 prompt 字段自动注册。",
+		"只有 enabled=true 且已配置 model 的子进程才会注入调用提示；配置缺少 model 或 enabled=false 时不会自动调用，但可以在调用时显式传入可用的 model。",
 		"如需新增子进程，不要修改 index.ts；请根据用户需求生成完整配置，并使用 write 工具写入用户配置目录：",
 		USER_AGENTS_DIR_DISPLAY,
-		"文件应包含 name、aliases、description、prompt、model、thinking、tools、maxTokens、inheritProjectContext 等 frontmatter 字段，以及子进程系统提示词正文。写入后请提示用户执行 /reload。",
+		"文件应包含 name、aliases、description、prompt、enabled、model、thinking、tools、maxTokens、inheritProjectContext 等 frontmatter 字段，以及子进程系统提示词正文。model 应从当前已配置的后端模型中选择；写入后请提示用户执行 /reload。",
 		"task 为任务说明；images 可显式传入图片 base64，插件会保存为临时文件并把路径追加到 task；context 可给子进程附加一段上下文；model 可临时覆盖子进程模型。",
 	].join("\n");
 }
 
 function buildSubPromptGuidelines(agents: AgentDef[]): string[] {
+	const enabledAgents = agents.filter((agent) => agent.enabled && agent.model);
 	return [
 		`当用户要求新增或设计子进程时，由当前主模型根据需求生成完整配置，并使用 write 写入 ${USER_AGENTS_DIR_DISPLAY}/<name>.md；不要让用户逐项填写，也不要修改 index.ts。写入后提示用户执行 /reload。`,
-		...agents.map((agent) => agent.prompt?.trim()).filter((prompt): prompt is string => Boolean(prompt)),
+		...enabledAgents.map((agent) => agent.prompt?.trim()).filter((prompt): prompt is string => Boolean(prompt)),
 	];
 }
 
@@ -251,12 +260,43 @@ function splitModelSpec(spec: string): { base: string; level?: string } {
 	return { base: spec.trim() };
 }
 
-/** 解析子进程模型 spec：显式 model > 继承当前会话模型。返回 "provider/modelId" */
-function resolveModelSpec(ctx: ExtensionContext, spec?: string, overrideSpec?: string): string {
+/** 解析子进程模型 spec：必须显式配置后端模型或由调用方临时覆盖。返回 "provider/modelId" */
+function resolveModelSpec(_ctx: ExtensionContext, spec?: string, overrideSpec?: string): string {
 	const raw = overrideSpec || spec;
 	if (raw) return splitModelSpec(raw).base;
-	if (ctx.model) return `${ctx.model.provider}/${ctx.model.id}`;
-	throw new Error("未配置子进程模型且当前会话没有活动模型（可在 /sub 菜单配置，或指定 model 参数）");
+	throw new Error("未配置子进程模型。请在 /sub 菜单中为已启用的子进程选择后端模型，或在调用时传入 model 参数");
+}
+
+function getModelSelectionScope(ctx: ExtensionContext): Model<any>[] {
+	// 与 /model 一致：配置了模型筛选时使用 scopedModels；未配置筛选时才使用全部可用模型。
+	const scoped = ctx.scopedModels?.map((item) => item.model) ?? [];
+	return scoped.length > 0 ? scoped : [...(ctx.modelRegistry.getAvailable() ?? [])];
+}
+
+function findModelBySpec(ctx: ExtensionContext, spec: string): Model<any> | undefined {
+	const base = splitModelSpec(spec).base;
+	const separator = base.indexOf("/");
+	if (separator <= 0 || separator === base.length - 1) return undefined;
+	const provider = base.slice(0, separator);
+	const modelId = base.slice(separator + 1);
+	return getModelSelectionScope(ctx).find(
+		(model) => model.provider === provider && model.id === modelId,
+	);
+}
+
+function assertBackendModelAvailable(ctx: ExtensionContext, modelSpec: string): Model<any> {
+	const model = findModelBySpec(ctx, modelSpec);
+	if (!model) {
+		throw new Error(`子进程模型 ${modelSpec} 不在当前已配置的后端模型列表中。请在 /sub 菜单中重新选择模型，或传入可用的 provider/modelId`);
+	}
+	return model;
+}
+
+function assertImageModelSupported(modelSpec: string, model: Model<any>, images: string[] | undefined): void {
+	if (!images || images.length === 0) return;
+	if (!model.input.includes("image")) {
+		throw new Error(`子进程模型 ${modelSpec} 不支持图片输入，已取消本次任务，避免子进程等待无响应。请更换支持图片的后端模型`);
+	}
 }
 
 /** 解析思考等级：agent.thinking > 模型 spec 的 :level 后缀 > 不指定 */
@@ -354,6 +394,7 @@ function runPiCli(
 		cwd?: string;
 		signal?: AbortSignal;
 		onEvent?: (event: any) => boolean | void;
+		timeoutMs?: number;
 	},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const { command, argsPrefix } = resolvePiCommand();
@@ -365,6 +406,7 @@ function runPiCli(
 		let stdout = "";
 		let stderr = "";
 		let stdoutRemainder = "";
+		let timeout: ReturnType<typeof setTimeout> | undefined;
 		const removeAbortListener = () => {
 			if (opts.signal && onAbort) opts.signal.removeEventListener("abort", onAbort);
 		};
@@ -385,6 +427,7 @@ function runPiCli(
 		const settle = (exitCode: number) => {
 			if (settled) return;
 			settled = true;
+			if (timeout) clearTimeout(timeout);
 			removeAbortListener();
 			resolve({ exitCode, stdout, stderr });
 		};
@@ -442,6 +485,12 @@ function runPiCli(
 			settle(-1);
 		};
 		if (opts.signal) opts.signal.addEventListener("abort", onAbort, { once: true });
+		if (opts.timeoutMs && opts.timeoutMs > 0) {
+			timeout = setTimeout(() => {
+				terminate();
+				settle(-2);
+			}, opts.timeoutMs);
+		}
 		proc.on("close", (code) => {
 			if (settled) return;
 			handleStdout("", true);
@@ -591,8 +640,10 @@ function parseSubOutput(stdout: string): { text: string; model?: string; usage?:
 }
 
 async function runSub(ctx: ExtensionContext, agent: AgentDef, opts: RunOptions): Promise<RunResult> {
-	// 1. 模型与思考等级
+	// 1. 模型与思考等级。enabled 只控制是否注入主模型提示；显式命令或 model 覆盖仍可运行已配置模型的子进程。
 	const modelSpec = resolveModelSpec(ctx, agent.model, opts.modelOverride);
+	const model = assertBackendModelAvailable(ctx, modelSpec);
+	assertImageModelSupported(modelSpec, model, opts.images);
 	const thinking = resolveThinkingLevel(agent, agent.model, opts.modelOverride);
 
 	// 2. 系统提示词（写临时文件，避免 argv 过长）
@@ -634,20 +685,32 @@ async function runSub(ctx: ExtensionContext, agent: AgentDef, opts: RunOptions):
 	//    最终 assistant message_end 到达即返回 true，立即结束子进程，避免收尾卡顿。
 	const progress = createProgressReporter(opts.onProgress);
 	const liveOutput: LiveOutputState = { text: "", lines: loadPiSubConfig().progressLines };
-	const { exitCode, stdout, stderr } = await runPiCli(args, {
-		cwd: ctx.cwd,
-		signal: opts.signal,
-		onEvent: (event) => {
-			const text = realtimeSubOutput(event, liveOutput);
-			if (text) progress.report(text);
-			return isFinalAssistantMessageEnd(event);
-		},
-	});
-	progress.finish();
+	let exitCode = -1;
+	let stdout = "";
+	let stderr = "";
+	try {
+		({ exitCode, stdout, stderr } = await runPiCli(args, {
+			cwd: ctx.cwd,
+			signal: opts.signal,
+			timeoutMs: DEFAULT_SUBPROCESS_TIMEOUT_MS,
+			onEvent: (event) => {
+				const text = realtimeSubOutput(event, liveOutput);
+				if (text) progress.report(text);
+				return isFinalAssistantMessageEnd(event);
+			},
+		}));
+	} finally {
+		progress.finish();
+		cleanupTempDir(savedImages.dir);
+		cleanupTempDir(promptDir);
+	}
 	const parsed = parseSubOutput(stdout);
-	// 清理临时文件
-	cleanupTempDir(savedImages.dir);
-	cleanupTempDir(promptDir);
+	if (exitCode === -2) {
+		throw new Error(`子进程执行超时（超过 ${Math.round(DEFAULT_SUBPROCESS_TIMEOUT_MS / 1000)} 秒），已终止，可能是模型不支持图片输入或网络无响应`);
+	}
+	if (exitCode === -1) {
+		throw new Error("子进程已取消");
+	}
 	if (!parsed.text) {
 		const detail = parsed.errorMessage || stderr.trim() || "(无输出)";
 		throw new Error(`子进程执行失败（退出码 ${exitCode}）：${detail.slice(0, 500)}`);
@@ -664,6 +727,7 @@ async function runSub(ctx: ExtensionContext, agent: AgentDef, opts: RunOptions):
 function serializeAgentFile(agent: AgentDef, currentText: string): string {
 	const { frontmatter } = parseFrontmatter(currentText);
 	const ordered: Array<[keyof AgentDef, string]> = [
+		["enabled", "enabled"],
 		["name", "name"],
 		["aliases", "aliases"],
 		["description", "description"],
@@ -711,7 +775,8 @@ function updateAgentField(agent: AgentDef, key: string, value: string): boolean 
 	const text = fs.readFileSync(filePath, "utf8");
 	const current = loadAgentFile(filePath, "user");
 	const merged: AgentDef = current ?? { ...agent, filePath, source: "user" };
-	if (key === "model") merged.model = value || undefined;
+	if (key === "enabled") merged.enabled = value === "true";
+	else if (key === "model") merged.model = value || undefined;
 	else if (key === "thinking") merged.thinking = value || undefined;
 	else if (key === "description") merged.description = value || undefined;
 	else if (key === "maxTokens") merged.maxTokens = Number(value) || undefined;
@@ -791,7 +856,7 @@ function registerReplyRenderer(pi: ExtensionAPI): void {
 
 // ─── 运行与展示 ────────────────────────────────────────
 async function runSubAndReport(pi: ExtensionAPI, ctx: ExtensionCommandContext, def: AgentDef, task: string): Promise<void> {
-	ctx.ui.notify(`运行子进程「${def.name}」…${def.model ? `（模型：${def.model}）` : "（继承当前模型）"}`, "info");
+	ctx.ui.notify(`运行子进程「${def.name}」…${def.model ? `（模型：${def.model}）` : "（未配置模型）"}`, "info");
 	try {
 		const result = await runSub(ctx, def, {
 			task,
@@ -810,11 +875,12 @@ async function runSubAndReport(pi: ExtensionAPI, ctx: ExtensionCommandContext, d
 
 function listAgentsText(): string {
 	const agents = loadAgents();
-	const lines = ["## 子进程清单", "| 名称 | 模型 | 思考 | 工具 | 说明 |", "|---|---|---|---|---|"];
+	const lines = ["## 子进程清单", "| 名称 | 状态 | 模型 | 思考 | 工具 | 说明 |", "|---|---|---|---|---|---|"];
 	for (const a of agents) {
-		const model = a.model || "继承当前";
+		const status = a.enabled ? "启用" : "停用";
+		const model = a.model || "未配置";
 		const think = a.thinking || "默认";
-		lines.push(`| ${a.name} | ${model} | ${think} | ${a.tools || "默认"} | ${a.description || ""} |`);
+		lines.push(`| ${a.name} | ${status} | ${model} | ${think} | ${a.tools || "默认"} | ${a.description || ""} |`);
 	}
 	if (agents.length === 0) lines.push("（暂无子进程，可在 /sub 菜单中新增）");
 	lines.push(
@@ -833,7 +899,7 @@ async function openMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise
 		return;
 	}
 	const choice = await ctx.ui.select("sub 子进程", [
-		"配置子进程（模型/思考等级）",
+		"配置子进程（启用/模型/思考等级）",
 		"新增子进程",
 		"通用设置",
 		"删除子进程",
@@ -858,7 +924,7 @@ async function flowGeneralSettings(ctx: ExtensionCommandContext): Promise<void> 
 			const current = loadPiSubConfig().progressLines;
 			const options = Array.from({ length: MAX_PROGRESS_LINES }, (_, i) => String(i + 1));
 			const value = await ctx.ui.select(`实时输出显示行数（当前：${current}）`, options);
-			if (!value) return;
+			if (!value) continue;
 			const n = Number(value);
 			if (!Number.isInteger(n) || n < 1 || n > MAX_PROGRESS_LINES) return;
 			savePiSubConfig({ progressLines: n });
@@ -880,59 +946,81 @@ async function pickAgent(ctx: ExtensionCommandContext, title: string): Promise<A
 }
 
 async function flowConfig(ctx: ExtensionCommandContext): Promise<void> {
-	const def = await pickAgent(ctx, "选择要配置的子进程");
-	if (!def) return;
-	// 配置完一个字段后返回本页（可继续配置另一项），直到用户取消或选择「完成」
+	// 两层菜单：字段页的 Esc/完成返回子进程列表，子进程列表的 Esc/完成才退出配置。
+	// 每次修改都会立即保存，修改后继续留在字段页，可连续修改多个字段。
 	for (;;) {
-		const cur = `当前：模型=${def.model || "继承当前"}，思考=${def.thinking || "默认"}`;
-		const field = await ctx.ui.select(`配置「${def.name}」（${cur}）`, [
-			"model（模型）",
-			"thinking（思考等级）",
-			"完成",
-		]);
-		if (!field || field.startsWith("完成")) return; // 取消或完成退出
-
-		if (field.startsWith("model")) {
-			const available = loadAvailableModels(ctx);
-			const inherit = "继承当前会话模型（不指定）";
-			const options = [inherit, ...available.map((m) => `${m.provider}/${m.id}`)];
-			const value = await ctx.ui.select(`选择模型（当前：${def.model || "继承当前"}）`, options);
-			if (!value) return;
-			const final = value === inherit ? "" : value;
-			if (!updateAgentField(def, "model", final)) {
-				ctx.ui.notify(`无法保存 ${def.name} 的模型配置`, "error");
-				return;
-			}
-			ctx.ui.notify(`已设置 ${def.name} 模型=${final || "继承当前会话模型"}`, "info");
-			continue; // 返回字段选择页
-		}
-
-		const cur2 = def.thinking || "默认";
-		const value = await ctx.ui.select(`思考等级（当前：${cur2}）`, ["off", ...THINKING_VALUES, "默认（不强制）"]);
-		if (!value) return;
-		const final = value === "默认（不强制）" ? "" : value;
-		if (!updateAgentField(def, "thinking", final)) {
-			ctx.ui.notify(`无法保存 ${def.name} 的 thinking 配置`, "error");
+		const agents = loadAgents();
+		if (agents.length === 0) {
+			ctx.ui.notify("还没有子进程，请在 /sub 菜单中「新增子进程」", "warning");
 			return;
 		}
-		ctx.ui.notify(`已设置 ${def.name} thinking=${final || "默认"}`, "info");
-		continue; // 返回字段选择页
+		const doneAgents = "✅ 完成配置";
+		const agentOptions = [...agents.map(agentChoiceLabel), doneAgents];
+		const label = await ctx.ui.select("选择要配置的子进程", agentOptions);
+		if (!label || label === doneAgents) return;
+		const def = findAgent(choiceAgentName(label));
+		if (!def) continue;
+
+		for (;;) {
+			const cur = `当前：${def.enabled ? "启用" : "停用"}，模型=${def.model || "未配置"}，思考=${def.thinking || "默认"}`;
+			const doneFields = "✅ 完成当前子进程";
+			const field = await ctx.ui.select(`配置「${def.name}」（${cur}）`, [
+				"enabled（是否启用）",
+				"model（后端模型）",
+				"thinking（思考等级）",
+				doneFields,
+			]);
+			if (!field || field === doneFields) break;
+
+			if (field.startsWith("enabled")) {
+				const value = await ctx.ui.select(`是否启用「${def.name}」`, ["启用", "停用"]);
+				if (!value) continue;
+				const final = value === "启用" ? "true" : "false";
+				if (!updateAgentField(def, "enabled", final)) {
+					ctx.ui.notify(`无法保存 ${def.name} 的启用状态`, "error");
+					continue;
+				}
+				ctx.ui.notify(`${def.name} 已${value}`, "info");
+				continue;
+			}
+
+			if (field.startsWith("model")) {
+				const available = await loadAvailableModels(ctx);
+				if (available.length === 0) continue;
+				const options = available.map((m) => `${m.provider}/${m.id}`);
+				options.push("清除模型（停用该子进程提示）");
+				const value = await ctx.ui.select(`选择后端模型（当前：${def.model || "未配置"}）`, options);
+				if (!value) continue;
+				const final = value === "清除模型（停用该子进程提示）" ? "" : value;
+				if (!updateAgentField(def, "model", final)) {
+					ctx.ui.notify(`无法保存 ${def.name} 的模型配置`, "error");
+					continue;
+				}
+				ctx.ui.notify(`已设置 ${def.name} 模型=${final || "未配置"}；未配置模型时不会注入该子进程提示`, "info");
+				continue;
+			}
+
+			const cur2 = def.thinking || "默认";
+			const value = await ctx.ui.select(`思考等级（当前：${cur2}）`, ["off", ...THINKING_VALUES, "默认（不强制）"]);
+			if (!value) continue;
+			const final = value === "默认（不强制）" ? "" : value;
+			if (!updateAgentField(def, "thinking", final)) {
+				ctx.ui.notify(`无法保存 ${def.name} 的 thinking 配置`, "error");
+				continue;
+			}
+			ctx.ui.notify(`已设置 ${def.name} thinking=${final || "默认"}`, "info");
+		}
 	}
 }
 
-function buildAgentCreationPrompt(requirement: string, pi: ExtensionAPI, ctx: ExtensionContext): string {
+async function buildAgentCreationPrompt(requirement: string, pi: ExtensionAPI, ctx: ExtensionContext): Promise<string> {
 	const existing = loadAgents()
 		.map((agent) => `- ${agent.name}${agent.aliases?.length ? `（别名：${agent.aliases.join("、")}）` : ""}`)
 		.join("\n") || "（暂无）";
-	try {
-		ctx.modelRegistry.refresh?.();
-	} catch {
-		// 使用当前已缓存的模型列表
-	}
-	const models = (ctx.modelRegistry.getAvailable() ?? [])
+	const availableModels = await loadAvailableModels(ctx);
+	const models = availableModels
 		.map((model) => `${model.provider}/${model.id}`)
-		.filter((model, index, list) => list.indexOf(model) === index)
-		.join("、") || "（未读取到模型列表；可省略 model）";
+		.join("、") || "（未读取到后端模型；请先配置模型）";
 	const tools = pi.getActiveTools().join("、") || "（当前没有启用工具）";
 	return [
 		"请根据下面的用户需求，直接创建一个新的 pi-sub 子进程配置。",
@@ -948,7 +1036,7 @@ function buildAgentCreationPrompt(requirement: string, pi: ExtensionAPI, ctx: Ex
 		`4. 文件必须使用绝对路径写入这个目录：${USER_AGENTS_DIR_DISPLAY}`, 
 		`5. 文件路径应为：${USER_AGENTS_DIR_DISPLAY}/<name>.md；name 必须是 1-30 个字符，不能含空格、括号或 Windows 文件名非法字符；不得覆盖已有文件。`,
 		"6. 不要修改 pi-sub/index.ts、README.md、settings.json 或其他已有 agent 文件。",
-		`7. 当前可选模型：${models}；model 只能从此列表选择，无法确定合适的固定模型时可以省略，让它继承当前会话模型。`,
+		`7. 当前可选后端模型：${models}；model 只能从此列表选择。没有合适模型时不要填写 model，未配置模型的子进程不会注入主模型提示，但可以在调用时显式传入可用模型。`,
 		`8. 当前可用工具名：${tools}；tools 可写 plan（Plan 权限：全部只读工具自动可用，含以后新增的扩展工具，适合审查/调研类）或逗号分隔的白名单工具名（只启用列出的工具，适合单一职责），禁止凭空编造工具名。涉及数据库、SSH 或测试验证时遵守只读和非破坏性原则。`,
 		"9. 写入成功后返回文件路径、子进程名称、职责、模型、工具和触发规则摘要，并明确提示用户执行 /reload。",
 		"10. frontmatter 的每个值保持单行；值中包含冒号或 # 时使用双引号，避免破坏配置解析。",
@@ -960,7 +1048,8 @@ function buildAgentCreationPrompt(requirement: string, pi: ExtensionAPI, ctx: Ex
 		"aliases: <逗号分隔的别名>",
 		"description: <一句话用途>",
 		"prompt: <什么时候应调用 sub，以及 agent 名称>",
-		"model: <provider/modelId，可省略>",
+		"enabled: <true 或 false，默认 true>",
+		"model: <provider/modelId，必须从当前后端模型列表选择>",
 		"thinking: <off|minimal|low|medium|high|xhigh|max，可省略>",
 		"tools: <plan 或逗号分隔的工具名，可省略>；plan = 全部只读工具（排除 edit/write/交互类），新工具自动可用",
 		"maxTokens: <正整数，可省略>",
@@ -982,7 +1071,7 @@ async function flowAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<
 	}
 	const requirement = await ctx.ui.input("描述想要的子进程", "如：创建一个只读审查 SQL 和数据库结构的子进程");
 	if (!requirement?.trim()) return;
-	const prompt = buildAgentCreationPrompt(requirement, pi, ctx);
+	const prompt = await buildAgentCreationPrompt(requirement, pi, ctx);
 	try {
 		pi.sendUserMessage(prompt, { deliverAs: "followUp", expandPromptTemplates: false });
 		ctx.ui.notify("已将创建需求交给当前主模型；主模型会生成完整配置并写入 agents 目录，完成后请执行 /reload。", "info");
@@ -1005,16 +1094,19 @@ async function flowDelete(ctx: ExtensionCommandContext): Promise<void> {
 	ctx.ui.notify(`已删除子进程 ${def.name}；请执行 /reload 使模型侧的 sub 工具描述同步`, "info");
 }
 
-/** 当前已可用模型（已配置好认证的模型，与 /model 列表一致） */
-function loadAvailableModels(ctx: ExtensionContext): Model<any>[] {
+/** 当前已可用的后端模型（已配置认证、支持文本输入，与 /model 列表一致） */
+async function loadAvailableModels(ctx: ExtensionContext): Promise<Model<any>[]> {
 	try {
-		ctx.modelRegistry.refresh?.();
+		await ctx.modelRegistry.refresh?.();
 	} catch {
 		// 忽略刷新失败，使用最后一次列表
 	}
-	const list = ctx.modelRegistry.getAvailable() ?? [];
-	if (list.length === 0) ctx.ui.notify("当前没有可用模型，请先在 /model 中配置模型", "warning");
-	return list;
+	const models = getModelSelectionScope(ctx)
+		.filter((model) => model.input.includes("text"))
+		.filter((model, index, list) => list.findIndex((item) => item.provider === model.provider && item.id === model.id) === index)
+		.sort((a, b) => `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
+	if (models.length === 0) ctx.ui.notify("当前没有可用的后端模型，请先在 /model 中配置模型", "warning");
+	return models;
 }
 
 // ─── 命令：/sub ────────────────────────────────────────

@@ -1,9 +1,9 @@
 ---
 name: vision
+enabled: true
 aliases: 看图,截图,识别,转写,image,ocr
 description: 图片理解——读取图片文件并返回结构化描述/逐字转写（截图、表格、报错、界面）
 prompt: 当用户要求理解图片或截图，且当前会话模型不支持图片输入时，调用 sub，agent=vision；如果当前模型支持图片输入，主模型直接查看，不要调用子进程
-model: opencode-go/mimo-v2.5
 thinking: high
 tools: read
 maxTokens: 4096
