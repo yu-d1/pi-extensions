@@ -1,17 +1,15 @@
 {
-  "name": "@liziy/minimax-local",
-  "version": "1.1.0",
-  "description": "MiniMax 自定义 Provider 扩展 —— 让 pi 直接调用 MiniMax API，完整适配官方参数（service_tier 高倍率、thinking 思考、reasoning_split 思考拆分）",
+  "name": "@liziy/model-provider",
+  "version": "0.1.0",
+  "description": "pi 模型供应商管理扩展：统一管理 MiniMax Local 与 OpenAI、Responses、Claude 兼容供应商",
   "keywords": [
     "pi-extension",
     "pi-package",
-    "minimax",
-    "minimax-m3",
-    "service-tier",
-    "priority",
-    "high-speed",
-    "thinking",
-    "reasoning"
+    "model-provider",
+    "openai",
+    "responses",
+    "anthropic",
+    "minimax"
   ],
   "license": "MIT",
   "author": "liziy",
@@ -29,9 +27,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/yu-d1/pi-extensions.git",
-    "directory": "packages/minimax-local"
+    "directory": "packages/model-provider"
   },
-  "homepage": "https://github.com/yu-d1/pi-extensions/tree/main/packages/minimax-local#readme",
+  "homepage": "https://github.com/yu-d1/pi-extensions/tree/main/packages/model-provider#readme",
   "bugs": {
     "url": "https://github.com/yu-d1/pi-extensions/issues"
   },
