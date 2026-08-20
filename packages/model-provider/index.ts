@@ -783,6 +783,9 @@ async function tryFetchJson(path: string, baseUrl: string, headers: Record<strin
 
 type ModelInput = ("text" | "image")[];
 
+/** 服务端没有返回上下文窗口时，通用模型使用 1M 默认值。 */
+const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+
 /**
  * 从 /models 返回的供应商扩展字段推断输入能力。
  * 标准 OpenAI/Claude /models 通常只有 id，没有能力字段；未知时默认开放图片输入，
@@ -826,7 +829,17 @@ function extractModels(data: any, api: string): StoredModel[] {
 		let id = rawId.trim();
 		if (api.startsWith("google-")) id = id.replace(/^models\//, "");
 		const display = m?.display_name ?? m?.displayName ?? id;
-		out.push({ id, name: typeof display === "string" ? display : id, input: inferModelInput(m) });
+		const contextWindow = [m?.contextWindow, m?.context_window, m?.context_length, m?.max_context_length, m?.limit?.context]
+			.find((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
+		const maxTokens = [m?.maxTokens, m?.max_tokens, m?.max_output_tokens, m?.limit?.output]
+			.find((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
+		out.push({
+			id,
+			name: typeof display === "string" ? display : id,
+			input: inferModelInput(m),
+			...(contextWindow ? { contextWindow } : {}),
+			...(maxTokens ? { maxTokens } : {}),
+		});
 	}
 	return out;
 }
@@ -877,7 +890,7 @@ function normalizeModel(m: StoredModel): any {
 		name: m.name ?? m.id,
 		reasoning: m.reasoning ?? false,
 		input: m.input ?? ["text", "image"],
-		contextWindow: m.contextWindow ?? 128000,
+		contextWindow: m.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
 		maxTokens: m.maxTokens ?? 16384,
 		cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
@@ -1313,13 +1326,57 @@ async function addModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 		if (old) {
 			old.input = input;
 		} else {
-			entry.models.push({ id, input });
+			entry.models.push({ id, input, contextWindow: DEFAULT_CONTEXT_WINDOW });
 			added++;
 		}
 	}
 	if (api) unregisterAndReRegister(api, entry.name, entry);
 	await saveStore();
 	ctx.ui.notify(`已处理 ${list.length} 个模型，新增 ${added} 个；输入能力：${inputModeText(input)}。`, "info");
+}
+
+function parseContextWindowInput(value: string): number | undefined {
+	const match = value.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*(k|m|g)?$/);
+	if (!match) return undefined;
+	const amount = Number(match[1]);
+	const multiplier = match[2] === "g" ? 1_000_000_000 : match[2] === "m" ? 1_000_000 : match[2] === "k" ? 1_000 : 1;
+	const result = Math.round(amount * multiplier);
+	return Number.isSafeInteger(result) && result > 0 ? result : undefined;
+}
+
+function formatContextWindow(value: number | undefined): string {
+	if (!value) return `默认 ${DEFAULT_CONTEXT_WINDOW.toLocaleString()}（1M）`;
+	if (value % 1_000_000 === 0) return `${value / 1_000_000}M`;
+	if (value % 1_000 === 0) return `${value / 1_000}K`;
+	return value.toLocaleString();
+}
+
+async function editModelContextFlow(ctx: any, entry: CommonEntry): Promise<void> {
+	if (entry.models.length === 0) {
+		ctx.ui.notify("暂无模型，请先刷新或手动添加。", "info");
+		return;
+	}
+	const options = entry.models.map((model) => `${model.id}  [上下文 ${formatContextWindow(model.contextWindow)}]`);
+	options.push("取消");
+	const choice = await ctx.ui.select("选择要修改上下文窗口的模型", options);
+	if (!choice || choice === "取消") return;
+	const id = choice.split(/\s+\[/)[0];
+	const model = entry.models.find((item) => item.id === id);
+	if (!model) return;
+	const value = await ctx.ui.input(
+		`模型 ${id} 的上下文窗口（当前：${formatContextWindow(model.contextWindow)}）`,
+		"例如：256k、512k、1m，也可以填写纯数字",
+	);
+	if (!value?.trim()) return;
+	const contextWindow = parseContextWindowInput(value);
+	if (!contextWindow) {
+		ctx.ui.notify("上下文窗口必须是正整数，支持 256k、512k、1m 或纯数字。", "error");
+		return;
+	}
+	model.contextWindow = contextWindow;
+	if (api) unregisterAndReRegister(api, entry.name, entry);
+	await saveStore();
+	ctx.ui.notify(`已更新 ${id}：上下文 ${formatContextWindow(contextWindow)}（${contextWindow.toLocaleString()}）`, "info");
 }
 
 async function editModelInputFlow(ctx: any, entry: CommonEntry): Promise<void> {
@@ -1365,6 +1422,7 @@ async function modelsMenu(ctx: any): Promise<void> {
 		const action = await ctx.ui.select(`模型管理：${entry.name}（${entry.models.length} 个）`, [
 			"刷新模型",
 			"添加模型 id",
+			"修改上下文窗口",
 			"修改图片输入能力",
 			"查看模型列表",
 			"删除模型",
@@ -1373,9 +1431,12 @@ async function modelsMenu(ctx: any): Promise<void> {
 		if (!action || action === "返回") return;
 		if (action === "刷新模型") await refreshCommonModels(ctx, entry);
 		else if (action === "添加模型 id") await addModelsFlow(ctx, entry);
+		else if (action === "修改上下文窗口") await editModelContextFlow(ctx, entry);
 		else if (action === "修改图片输入能力") await editModelInputFlow(ctx, entry);
 		else if (action === "查看模型列表") {
-			const lines = entry.models.map((model) => `  ${model.id}  [${inputModeText(model.input)}]${model.reasoning ? "  [思考]" : ""}`);
+			const lines = entry.models.map(
+				(model) => `  ${model.id}  [上下文 ${formatContextWindow(model.contextWindow)}]  [${inputModeText(model.input)}]${model.reasoning ? "  [思考]" : ""}`,
+			);
 			ctx.ui.notify(lines.length ? `【${entry.name}】\n${lines.join("\n")}` : `${entry.name} 暂无模型。`, "info");
 		} else if (action === "删除模型") {
 			if (entry.models.length === 0) {
@@ -1390,8 +1451,7 @@ async function modelsMenu(ctx: any): Promise<void> {
 async function providerMenu(ctx: any): Promise<void> {
 	while (true) {
 		const commons = getCommonEntries();
-		const options = ["添加供应商"];
-		if (commons.length > 0) options.push("编辑供应商", "删除供应商", "管理模型");
+		const options = commons.length > 0 ? ["管理模型", "添加供应商", "编辑供应商", "删除供应商"] : ["添加供应商"];
 		options.push("返回");
 		const action = await ctx.ui.select("Common 供应商", options);
 		if (!action || action === "返回") return;
