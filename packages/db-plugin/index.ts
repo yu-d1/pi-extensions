@@ -175,9 +175,24 @@ function findConfig(configs: DbConfig[], name: string): DbConfig | undefined {
 
 // ── 构建「可用数据库」提示（注入系统提示，让 AI 知道有哪些连接） ────
 
-function buildDbListHint(configs: DbConfig[]): string {
+function buildDbListHint(configs: DbConfig[], cfg: PluginConfig): string {
+  const policy = cfg.ai_readonly
+    ? "当前 AI 只读模式：是。query_database 只能执行查询语句，禁止 INSERT、UPDATE、DELETE 等写操作。"
+    : "当前 AI 只读模式：否。query_database 允许执行查询和写操作，不要因为工具名称或通用描述而将其限制为 SELECT。";
+  const confirmation =
+    cfg.confirm_before_exec === "never"
+      ? "当前执行确认：不确认。符合条件的 SQL 不会弹出确认框。"
+      : cfg.confirm_before_exec === "write"
+        ? "当前执行确认：写操作确认。写操作执行前会弹出确认框。"
+        : "当前执行确认：每次都确认。每条 SQL 执行前都会弹出确认框。";
+  const safety = "DROP TABLE 始终禁止通过 query_database 执行，与 AI 只读模式设置无关。";
+
   if (configs.length === 0) {
     return [
+      "[数据库工具执行策略]",
+      policy,
+      confirmation,
+      safety,
       "[可用数据库]",
       "暂无数据库连接。请告知用户先通过 /db add 添加数据库连接，再执行查询。",
     ].join("\n");
@@ -188,6 +203,10 @@ function buildDbListHint(configs: DbConfig[]): string {
     return `- ${c.name} [${typeLabel}]${desc}`;
   });
   return [
+    "[数据库工具执行策略]",
+    policy,
+    confirmation,
+    safety,
     "[可用数据库]",
     ...lines,
     "query_database / list_tables / describe_table 的 database 参数必须使用上述名称（不含中括号内容，名称区分大小写）。",
@@ -390,7 +409,7 @@ export default function (pi: ExtensionAPI) {
       if (!sql) return;
       ctx.ui.notify("正在执行查询...", "info");
       const cfg = loadPluginConfig();
-      const result = await query(toConnConfig(config), sql, true, cfg.max_rows, cfg.query_timeout);
+      const result = await query(toConnConfig(config), sql, cfg.ai_readonly, cfg.max_rows, cfg.query_timeout);
       if (result.success) {
         const lines = [`查询完成 (${result.duration})`, `返回 ${result.rowCount} 行`];
         if (result.columns && result.columns.length > 0) {
@@ -536,7 +555,9 @@ export default function (pi: ExtensionAPI) {
   // 解决 AI 不知道有哪些数据库连接、database 参数只能靠猜的问题。
 
   pi.on("before_agent_start", async (event) => {
-    return { systemPrompt: event.systemPrompt + "\n\n" + buildDbListHint(loadConfigs()) };
+    return {
+      systemPrompt: event.systemPrompt + "\n\n" + buildDbListHint(loadConfigs(), loadPluginConfig()),
+    };
   });
 
   // ── 注册 3 个工具（给 LLM 调用） ──────────────────
@@ -545,8 +566,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "query_database",
     label: "数据库查询",
-    description: "执行 SQL 查询，支持 PostgreSQL / MySQL / Oracle。返回结果集。只读模式下仅允许 SELECT 查询。",
-    promptSnippet: "执行 SQL 查询。database 参数取系统提示「可用数据库」列表中的名称。使用 list_tables 查看表结构后再编写 SQL。",
+    description: "执行 SQL 语句，支持 PostgreSQL / MySQL / Oracle，返回执行结果。实际是否允许写操作以及是否需要确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE 始终禁止。",
+    promptSnippet: "执行 SQL 语句。先根据系统提示中的当前数据库工具执行策略判断是否允许写操作；database 参数取系统提示「可用数据库」列表中的名称。使用 list_tables 查看表结构后再编写 SQL。",
     parameters: Type.Object({
       database: Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称）" }),
       sql: Type.String({ description: "SQL 语句" }),
