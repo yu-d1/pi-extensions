@@ -24,6 +24,7 @@ import {
   existsSync,
   readFileSync,
 } from "node:fs";
+import { Container, Input, Key, matchesKey, Spacer, Text, fuzzyFilter } from "@earendil-works/pi-tui";
 import {
   mkdir,
   readFile,
@@ -603,6 +604,231 @@ function fmtTokens(n: number): string {
   return n >= 1000 ? `~${(n / 1000).toFixed(1)}K` : `~${n}`;
 }
 
+// ── 勾选组件（样式与交互对齐内置 /scoped-models 选择器）─────────────
+
+interface ToggleEntry {
+  /** 唯一 id */
+  id: string;
+  /** 主文本 */
+  primary: string;
+  /** muted 徽标，如 "[MCP] (3 工具, ~1.2K)" */
+  badge?: string;
+  /** 底部选中详情行 */
+  detail?: string;
+}
+
+interface ToggleSelectorOptions {
+  /** 标题 */
+  title: string;
+  /** 副标题说明（muted 提示行） */
+  subtitle: string;
+  /** footer 计数标签，如 "已启用" */
+  countLabel: string;
+}
+
+/**
+ * 勾选组件：↑↓ 选择、enter 切换勾选、ctrl+a 全选、ctrl+x 清空、
+ * ctrl+s 保存、esc 取消；支持模糊搜索过滤；勾选的条目排在最上面。
+ * 仅限 TUI 模式通过 ctx.ui.custom() 挂载；done(ids) 保存，done(null) 取消。
+ */
+class ToggleSelectorComponent extends Container {
+  private entriesById = new Map<string, ToggleEntry>();
+  private allIds: string[] = [];
+  private markedIds: string[];
+  private filteredItems: { entry: ToggleEntry; marked: boolean }[] = [];
+  private selectedIndex = 0;
+  private searchInput: Input;
+  private listContainer: Container;
+  private footerText: Text;
+  private readonly maxVisible = 10;
+  private isDirty = false;
+  private readonly options: ToggleSelectorOptions;
+  private readonly keybindings: any;
+  private readonly theme: any;
+  private readonly done: (result: string[] | null) => void;
+
+  constructor(
+    options: ToggleSelectorOptions,
+    entries: ToggleEntry[],
+    initialMarked: string[],
+    keybindings: any,
+    theme: any,
+    done: (result: string[] | null) => void,
+  ) {
+    super();
+    this.options = options;
+    this.keybindings = keybindings;
+    this.theme = theme;
+    this.done = done;
+    this.markedIds = [...initialMarked];
+    for (const entry of entries) {
+      this.entriesById.set(entry.id, entry);
+      this.allIds.push(entry.id);
+    }
+    const border = this.theme.fg("border", "─".repeat(56));
+    this.addChild(new Text(border, 0, 0));
+    this.addChild(new Spacer(1));
+    this.addChild(new Text(this.theme.fg("accent", this.theme.bold(options.title)), 0, 0));
+    this.addChild(
+      new Text(this.theme.fg("muted", `${options.subtitle} · ${this.keyLabel("app.models.save")} 保存`), 0, 0),
+    );
+    this.addChild(new Spacer(1));
+    this.searchInput = new Input();
+    this.addChild(this.searchInput);
+    this.addChild(new Spacer(1));
+    this.listContainer = new Container();
+    this.addChild(this.listContainer);
+    this.addChild(new Spacer(1));
+    this.footerText = new Text("", 0, 0);
+    this.addChild(this.footerText);
+    this.addChild(new Text(border, 0, 0));
+    this.refresh();
+  }
+
+  private keyLabel(id: string): string {
+    try {
+      const keys = this.keybindings?.getKeys?.(id);
+      return Array.isArray(keys) && keys.length > 0 ? keys.join("/") : "";
+    } catch {
+      return "";
+    }
+  }
+
+  private buildItems() {
+    // 勾选的排最上（按勾选顺序），未勾选的保持原顺序排在后面
+    const markedSet = new Set(this.markedIds);
+    const sorted = [
+      ...this.markedIds.filter((id) => this.entriesById.has(id)),
+      ...this.allIds.filter((id) => !markedSet.has(id)),
+    ];
+    return sorted.map((id) => ({ entry: this.entriesById.get(id) as ToggleEntry, marked: markedSet.has(id) }));
+  }
+
+  private getFooterText(): string {
+    const parts = [
+      `${this.keyLabel("tui.select.confirm")} 切换`,
+      `${this.keyLabel("app.models.enableAll")} 全选`,
+      `${this.keyLabel("app.models.clearAll")} 清空`,
+      `${this.keyLabel("app.models.save")} 保存`,
+      "esc 取消",
+      `${this.options.countLabel} ${this.markedIds.length}/${this.allIds.length}`,
+    ];
+    const text = `  ${parts.join(" · ")}`;
+    return this.isDirty ? this.theme.fg("dim", text) + this.theme.fg("warning", " （未保存）") : this.theme.fg("dim", text);
+  }
+
+  private refresh(): void {
+    const query = this.searchInput.getValue();
+    const items = this.buildItems();
+    this.filteredItems = query
+      ? fuzzyFilter(items, query, (item) => item.entry.primary)
+      : items;
+    if (this.selectedIndex >= this.filteredItems.length) {
+      this.selectedIndex = Math.max(0, this.filteredItems.length - 1);
+    }
+    this.updateList();
+    this.footerText.setText(this.getFooterText());
+  }
+
+  private updateList(): void {
+    this.listContainer.clear();
+    if (this.filteredItems.length === 0) {
+      this.listContainer.addChild(new Text(this.theme.fg("muted", "  没有匹配的条目"), 0, 0));
+      return;
+    }
+    const startIndex = Math.max(
+      0,
+      Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
+    );
+    const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+    for (let i = startIndex; i < endIndex; i++) {
+      const item = this.filteredItems[i];
+      const isSelected = i === this.selectedIndex;
+      const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
+      const primary = isSelected ? this.theme.fg("accent", item.entry.primary) : item.entry.primary;
+      const badge = item.entry.badge ? this.theme.fg("muted", ` ${item.entry.badge}`) : "";
+      const status = item.marked ? this.theme.fg("success", " ✓") : this.theme.fg("dim", " ✗");
+      this.listContainer.addChild(new Text(`${prefix}${primary}${badge}${status}`, 0, 0));
+    }
+    if (startIndex > 0 || endIndex < this.filteredItems.length) {
+      this.listContainer.addChild(
+        new Text(this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredItems.length})`), 0, 0),
+      );
+    }
+    const selected = this.filteredItems[this.selectedIndex];
+    if (selected?.entry.detail) {
+      this.listContainer.addChild(new Spacer(1));
+      this.listContainer.addChild(new Text(this.theme.fg("muted", `  ${selected.entry.detail}`), 0, 0));
+    }
+  }
+
+  handleInput(data: string): void {
+    const kb = this.keybindings;
+    if (kb.matches(data, "tui.select.up")) {
+      if (this.filteredItems.length === 0) return;
+      this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
+      this.updateList();
+      return;
+    }
+    if (kb.matches(data, "tui.select.down")) {
+      if (this.filteredItems.length === 0) return;
+      this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
+      this.updateList();
+      return;
+    }
+    if (kb.matches(data, "tui.select.confirm")) {
+      const item = this.filteredItems[this.selectedIndex];
+      if (item) {
+        const index = this.markedIds.indexOf(item.entry.id);
+        if (index >= 0) this.markedIds.splice(index, 1);
+        else this.markedIds.push(item.entry.id);
+        this.isDirty = true;
+        this.refresh();
+      }
+      return;
+    }
+    if (kb.matches(data, "app.models.enableAll")) {
+      const targets = this.searchInput.getValue() ? this.filteredItems.map((i) => i.entry.id) : this.allIds;
+      for (const id of targets) {
+        if (!this.markedIds.includes(id)) this.markedIds.push(id);
+      }
+      this.isDirty = true;
+      this.refresh();
+      return;
+    }
+    if (kb.matches(data, "app.models.clearAll")) {
+      if (this.searchInput.getValue()) {
+        const targets = new Set(this.filteredItems.map((i) => i.entry.id));
+        this.markedIds = this.markedIds.filter((id) => !targets.has(id));
+      } else {
+        this.markedIds = [];
+      }
+      this.isDirty = true;
+      this.refresh();
+      return;
+    }
+    if (kb.matches(data, "app.models.save")) {
+      this.done([...this.markedIds]);
+      return;
+    }
+    if (matchesKey(data, Key.ctrl("c"))) {
+      if (this.searchInput.getValue()) {
+        this.searchInput.setValue("");
+        this.refresh();
+      } else {
+        this.done(null);
+      }
+      return;
+    }
+    if (matchesKey(data, Key.escape)) {
+      this.done(null);
+      return;
+    }
+    this.searchInput.handleInput(data);
+    this.refresh();
+  }
+}
+
 /** 计算各分类的来源名列表（排序后） */
 function getSortedNames(manifest: Manifest): {
   mcp: string[]; ext: string[]; skill: string[]; total: number;
@@ -623,11 +849,123 @@ async function showPluginsMenu(ctx: ExtensionContext, pi: ExtensionAPI) {
     return;
   }
 
+  // TUI 模式：勾选组件批量编辑，ctrl+s 统一保存生效
+  if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
+    await runPluginToggleComponent(ctx, pi, config, manifest);
+    return;
+  }
+  // 非 TUI：保留原有循环 select 交互
   if (total <= 20) {
     await showFlatMenu(ctx, pi, config, manifest);
   } else {
     await showCategoryMenu(ctx, pi, config, manifest);
   }
+}
+
+/** 收集所有可管理条目（MCP + 扩展 + 技能）及其分类元数据 */
+function collectPluginEntries(
+  config: Config,
+  manifest: Manifest,
+): { entries: ToggleEntry[]; meta: Map<string, { cat: ItemCat; name: string }> } {
+  const { mcp, ext, skill } = getSortedNames(manifest);
+  const entries: ToggleEntry[] = [];
+  const meta = new Map<string, { cat: ItemCat; name: string }>();
+  const add = (cat: ItemCat, name: string) => {
+    const off = cat === "mcp" ? !!config.opt_out.mcp_servers[name]
+      : cat === "ext" ? !!config.opt_out.extensions[name]
+      : !!config.opt_out.skills[name];
+    const info = cat === "skill" ? null
+      : cat === "mcp" ? manifest.mcp_servers[name]
+      : manifest.extensions[name];
+    const badgeName = cat === "mcp" ? "MCP" : cat === "ext" ? "扩展" : "技能";
+    const tail = info ? ` (${info.tools.length} 工具, ${fmtTokens(info.totalTokens)})` : "";
+    const id = `${cat}:${name}`;
+    entries.push({
+      id,
+      primary: name,
+      badge: `[${badgeName}]${tail}`,
+      detail: off ? "当前已禁用" : "当前已启用",
+    });
+    meta.set(id, { cat, name });
+  };
+  for (const n of mcp) add("mcp", n);
+  for (const n of ext) add("ext", n);
+  for (const n of skill) add("skill", n);
+  return { entries, meta };
+}
+
+/** 把勾选结果应用到 opt_out 配置，返回变更数与非技能变更数 */
+function applyPluginToggleDiff(
+  config: Config,
+  meta: Map<string, { cat: ItemCat; name: string }>,
+  enabledIds: Set<string>,
+): { changed: number; nonSkillChanged: number } {
+  let changed = 0;
+  let nonSkillChanged = 0;
+  for (const [id, { cat, name }] of meta) {
+    const bucket = cat === "mcp" ? config.opt_out.mcp_servers
+      : cat === "ext" ? config.opt_out.extensions
+      : config.opt_out.skills;
+    const shouldEnable = enabledIds.has(id);
+    if (shouldEnable && bucket[name]) {
+      delete bucket[name];
+      changed++;
+      if (cat !== "skill") nonSkillChanged++;
+    } else if (!shouldEnable && !bucket[name]) {
+      bucket[name] = { disabled_at: new Date().toISOString() };
+      changed++;
+      if (cat !== "skill") nonSkillChanged++;
+    }
+  }
+  return { changed, nonSkillChanged };
+}
+
+/** TUI 勾选组件入口：批量编辑启用状态，ctrl+s 统一保存并应用工具过滤 */
+async function runPluginToggleComponent(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  config: Config,
+  manifest: Manifest,
+) {
+  const { entries, meta } = collectPluginEntries(config, manifest);
+  const initialMarked = entries.filter((e) => !isEntryDisabled(config, meta, e.id)).map((e) => e.id);
+  const ids = await ctx.ui.custom<string[] | null>(
+    (_tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+      new ToggleSelectorComponent(
+        {
+          title: "插件管理",
+          subtitle: "勾选 = 启用该来源的工具；未勾选的不注入上下文",
+          countLabel: "已启用",
+        },
+        entries,
+        initialMarked,
+        keybindings,
+        theme,
+        done,
+      ),
+  );
+  if (ids === null || ids === undefined) return; // 取消
+  const { changed, nonSkillChanged } = applyPluginToggleDiff(config, meta, new Set(ids));
+  if (changed === 0) {
+    ctx.ui.notify("没有变更", "info");
+    return;
+  }
+  cachedConfig = config;
+  await saveConfig(config);
+  if (nonSkillChanged > 0) applyToolFilter(pi, config);
+  const enabledCount = ids.length;
+  ctx.ui.notify(`已保存：启用 ${enabledCount} / 共 ${entries.length} 个来源（变更 ${changed} 处）。`, "info");
+  ctx.ui.setStatus("plugin-manager", getFooterStatus());
+}
+
+/** 条目当前是否处于禁用状态 */
+function isEntryDisabled(config: Config, meta: Map<string, { cat: ItemCat; name: string }>, id: string): boolean {
+  const item = meta.get(id);
+  if (!item) return false;
+  const bucket = item.cat === "mcp" ? config.opt_out.mcp_servers
+    : item.cat === "ext" ? config.opt_out.extensions
+    : config.opt_out.skills;
+  return !!bucket[item.name];
 }
 
 /** 扁平菜单：所有来源在一个列表里，按分类标题分组 */

@@ -19,7 +19,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Input, Key, Text, fuzzyFilter, matchesKey, Spacer, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   appendFile,
   mkdir,
@@ -732,6 +732,221 @@ const DEFAULT_DISPLAY_CONFIG: DisplayConfig = {
 };
 
 let displayConfig: DisplayConfig = { ...DEFAULT_DISPLAY_CONFIG, items: { ...DEFAULT_DISPLAY_CONFIG.items } };
+
+// ── 勾选组件（样式与交互对齐内置 /scoped-models 选择器）─────────────
+
+interface ToggleEntry {
+  id: string;
+  primary: string;
+  badge?: string;
+  detail?: string;
+}
+
+interface ToggleSelectorOptions {
+  title: string;
+  subtitle: string;
+  countLabel: string;
+}
+
+/**
+ * 勾选组件：↑↓ 选择、enter 切换勾选、ctrl+a 全选、ctrl+x 清空、
+ * ctrl+s 保存、esc 取消；支持模糊搜索过滤；勾选的条目排在最上面。
+ * 仅限 TUI 模式通过 ctx.ui.custom() 挂载；done(ids) 保存，done(null) 取消。
+ */
+class ToggleSelectorComponent extends Container {
+  private entriesById = new Map<string, ToggleEntry>();
+  private allIds: string[] = [];
+  private markedIds: string[];
+  private filteredItems: { entry: ToggleEntry; marked: boolean }[] = [];
+  private selectedIndex = 0;
+  private searchInput: Input;
+  private listContainer: Container;
+  private footerText: Text;
+  private readonly maxVisible = 10;
+  private isDirty = false;
+  private readonly options: ToggleSelectorOptions;
+  private readonly keybindings: any;
+  private readonly theme: any;
+  private readonly done: (result: string[] | null) => void;
+
+  constructor(
+    options: ToggleSelectorOptions,
+    entries: ToggleEntry[],
+    initialMarked: string[],
+    keybindings: any,
+    theme: any,
+    done: (result: string[] | null) => void,
+  ) {
+    super();
+    this.options = options;
+    this.keybindings = keybindings;
+    this.theme = theme;
+    this.done = done;
+    this.markedIds = [...initialMarked];
+    for (const entry of entries) {
+      this.entriesById.set(entry.id, entry);
+      this.allIds.push(entry.id);
+    }
+    const border = this.theme.fg("border", "─".repeat(56));
+    this.addChild(new Text(border, 0, 0));
+    this.addChild(new Spacer(1));
+    this.addChild(new Text(this.theme.fg("accent", this.theme.bold(options.title)), 0, 0));
+    this.addChild(
+      new Text(this.theme.fg("muted", `${options.subtitle} · ${this.keyLabel("app.models.save")} 保存`), 0, 0),
+    );
+    this.addChild(new Spacer(1));
+    this.searchInput = new Input();
+    this.addChild(this.searchInput);
+    this.addChild(new Spacer(1));
+    this.listContainer = new Container();
+    this.addChild(this.listContainer);
+    this.addChild(new Spacer(1));
+    this.footerText = new Text("", 0, 0);
+    this.addChild(this.footerText);
+    this.addChild(new Text(border, 0, 0));
+    this.refresh();
+  }
+
+  private keyLabel(id: string): string {
+    try {
+      const keys = this.keybindings?.getKeys?.(id);
+      return Array.isArray(keys) && keys.length > 0 ? keys.join("/") : "";
+    } catch {
+      return "";
+    }
+  }
+
+  private buildItems() {
+    const markedSet = new Set(this.markedIds);
+    const sorted = [
+      ...this.markedIds.filter((id) => this.entriesById.has(id)),
+      ...this.allIds.filter((id) => !markedSet.has(id)),
+    ];
+    return sorted.map((id) => ({ entry: this.entriesById.get(id) as ToggleEntry, marked: markedSet.has(id) }));
+  }
+
+  private getFooterText(): string {
+    const parts = [
+      `${this.keyLabel("tui.select.confirm")} 切换`,
+      `${this.keyLabel("app.models.enableAll")} 全选`,
+      `${this.keyLabel("app.models.clearAll")} 清空`,
+      `${this.keyLabel("app.models.save")} 保存`,
+      "esc 取消",
+      `${this.options.countLabel} ${this.markedIds.length}/${this.allIds.length}`,
+    ];
+    const text = `  ${parts.join(" · ")}`;
+    return this.isDirty ? this.theme.fg("dim", text) + this.theme.fg("warning", " （未保存）") : this.theme.fg("dim", text);
+  }
+
+  private refresh(): void {
+    const query = this.searchInput.getValue();
+    const items = this.buildItems();
+    this.filteredItems = query ? fuzzyFilter(items, query, (item) => item.entry.primary) : items;
+    if (this.selectedIndex >= this.filteredItems.length) {
+      this.selectedIndex = Math.max(0, this.filteredItems.length - 1);
+    }
+    this.updateList();
+    this.footerText.setText(this.getFooterText());
+  }
+
+  private updateList(): void {
+    this.listContainer.clear();
+    if (this.filteredItems.length === 0) {
+      this.listContainer.addChild(new Text(this.theme.fg("muted", "  没有匹配的条目"), 0, 0));
+      return;
+    }
+    const startIndex = Math.max(
+      0,
+      Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
+    );
+    const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+    for (let i = startIndex; i < endIndex; i++) {
+      const item = this.filteredItems[i];
+      const isSelected = i === this.selectedIndex;
+      const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
+      const primary = isSelected ? this.theme.fg("accent", item.entry.primary) : item.entry.primary;
+      const badge = item.entry.badge ? this.theme.fg("muted", ` ${item.entry.badge}`) : "";
+      const status = item.marked ? this.theme.fg("success", " ✓") : this.theme.fg("dim", " ✗");
+      this.listContainer.addChild(new Text(`${prefix}${primary}${badge}${status}`, 0, 0));
+    }
+    if (startIndex > 0 || endIndex < this.filteredItems.length) {
+      this.listContainer.addChild(
+        new Text(this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredItems.length})`), 0, 0),
+      );
+    }
+    const selected = this.filteredItems[this.selectedIndex];
+    if (selected?.entry.detail) {
+      this.listContainer.addChild(new Spacer(1));
+      this.listContainer.addChild(new Text(this.theme.fg("muted", `  ${selected.entry.detail}`), 0, 0));
+    }
+  }
+
+  handleInput(data: string): void {
+    const kb = this.keybindings;
+    if (kb.matches(data, "tui.select.up")) {
+      if (this.filteredItems.length === 0) return;
+      this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
+      this.updateList();
+      return;
+    }
+    if (kb.matches(data, "tui.select.down")) {
+      if (this.filteredItems.length === 0) return;
+      this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
+      this.updateList();
+      return;
+    }
+    if (kb.matches(data, "tui.select.confirm")) {
+      const item = this.filteredItems[this.selectedIndex];
+      if (item) {
+        const index = this.markedIds.indexOf(item.entry.id);
+        if (index >= 0) this.markedIds.splice(index, 1);
+        else this.markedIds.push(item.entry.id);
+        this.isDirty = true;
+        this.refresh();
+      }
+      return;
+    }
+    if (kb.matches(data, "app.models.enableAll")) {
+      const targets = this.searchInput.getValue() ? this.filteredItems.map((i) => i.entry.id) : this.allIds;
+      for (const id of targets) {
+        if (!this.markedIds.includes(id)) this.markedIds.push(id);
+      }
+      this.isDirty = true;
+      this.refresh();
+      return;
+    }
+    if (kb.matches(data, "app.models.clearAll")) {
+      if (this.searchInput.getValue()) {
+        const targets = new Set(this.filteredItems.map((i) => i.entry.id));
+        this.markedIds = this.markedIds.filter((id) => !targets.has(id));
+      } else {
+        this.markedIds = [];
+      }
+      this.isDirty = true;
+      this.refresh();
+      return;
+    }
+    if (kb.matches(data, "app.models.save")) {
+      this.done([...this.markedIds]);
+      return;
+    }
+    if (matchesKey(data, Key.ctrl("c"))) {
+      if (this.searchInput.getValue()) {
+        this.searchInput.setValue("");
+        this.refresh();
+      } else {
+        this.done(null);
+      }
+      return;
+    }
+    if (matchesKey(data, Key.escape)) {
+      this.done(null);
+      return;
+    }
+    this.searchInput.handleInput(data);
+    this.refresh();
+  }
+}
 
 // ── 内置套餐定义 ─────────────────────────────────────────
 
@@ -1893,22 +2108,53 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             cacheHit: "缓存命中", speed: "速度", context: "容量",
             quota5h: "5h额度", quotaWeek: "周额度", quotaClock: "刷新时间",
           };
-          while (true) {
-            const options = itemLabels.map(k =>
-              `${displayConfig.items[k] ? "✅" : "⬜"} ${itemNames[k]}`,
+          // TUI 模式：勾选组件批量编辑，ctrl+s 统一保存
+          if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
+            const entries: ToggleEntry[] = itemLabels.map((k) => ({ id: k, primary: itemNames[k] }));
+            const initialMarked = itemLabels.filter((k) => displayConfig.items[k]);
+            const ids = await ctx.ui.custom<string[] | null>(
+              (_tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+                new ToggleSelectorComponent(
+                  {
+                    title: "状态栏显示内容",
+                    subtitle: "勾选 = 在 footer 中显示该项",
+                    countLabel: "显示",
+                  },
+                  entries,
+                  initialMarked,
+                  keybindings,
+                  theme,
+                  done,
+                ),
             );
-            options.push("🔙 完成");
-            const choice = await ctx.ui.select("选择要切换显示的项目", options);
-            if (!choice || choice === "🔙 完成") break;
-            const idx = options.indexOf(choice);
-            if (idx >= 0 && idx < itemLabels.length) {
-              const key = itemLabels[idx];
+            if (ids !== null && ids !== undefined) {
+              const marked = new Set(ids);
               displayConfig = {
                 ...displayConfig,
-                items: { ...displayConfig.items, [key]: !displayConfig.items[key] },
+                items: Object.fromEntries(itemLabels.map((k) => [k, marked.has(k)])) as Record<DisplayKey, boolean>,
               };
               await saveDisplayConfig(displayConfig);
               requestFooterRender?.();
+            }
+          } else {
+            // 非 TUI：保留循环 select 切换
+            while (true) {
+              const options = itemLabels.map(k =>
+                `${displayConfig.items[k] ? "✅" : "⬜"} ${itemNames[k]}`,
+              );
+              options.push("🔙 完成");
+              const choice = await ctx.ui.select("选择要切换显示的项目", options);
+              if (!choice || choice === "🔙 完成") break;
+              const idx = options.indexOf(choice);
+              if (idx >= 0 && idx < itemLabels.length) {
+                const key = itemLabels[idx];
+                displayConfig = {
+                  ...displayConfig,
+                  items: { ...displayConfig.items, [key]: !displayConfig.items[key] },
+                };
+                await saveDisplayConfig(displayConfig);
+                requestFooterRender?.();
+              }
             }
           }
           ctx.ui.notify("状态栏显示配置已保存", "info");
