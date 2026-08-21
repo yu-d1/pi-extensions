@@ -1,6 +1,6 @@
 {
   "name": "@liziy/model-provider",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "pi 模型供应商管理扩展：统一管理 MiniMax Local 与 OpenAI、Responses、Claude 兼容供应商",
   "keywords": [
     "pi-extension",

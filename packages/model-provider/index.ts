@@ -29,6 +29,7 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { Container, Input, Key, matchesKey, Spacer, Text, fuzzyFilter } from "@earendil-works/pi-tui";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -94,6 +95,8 @@ interface StoredModel {
 	maxTokens?: number;
 	cost?: StoredCost;
 	thinkingLevelMap?: Record<string, string | null>;
+	/** 勾选启用：true/undefined = 启用并显示在 /model；false = 不显示（配置保留）。 */
+	enabled?: boolean;
 }
 
 type ServiceTier = "standard" | "priority";
@@ -215,9 +218,25 @@ function normalizeStore(raw: any): Store {
 			const entry: CommonEntry = {
 				kind: "common",
 				name: p.name.trim(),
-						api: typeof p.api === "string" && KNOWN_APIS.includes(p.api) ? p.api : "openai-completions",
+				api: typeof p.api === "string" && KNOWN_APIS.includes(p.api) ? p.api : "openai-completions",
 				baseUrl: typeof p.baseUrl === "string" ? p.baseUrl : "",
-				models: Array.isArray(p.models) ? p.models.filter((m: any) => typeof m?.id === "string").map((m: any) => ({ id: m.id, ...(m.name ? { name: m.name } : {}), ...(typeof m.reasoning === "boolean" ? { reasoning: m.reasoning } : {}), input: normalizeInput(m.input), ...(typeof m.contextWindow === "number" ? { contextWindow: m.contextWindow } : {}), ...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}), ...(m.cost ? { cost: m.cost } : {}), ...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}) })) : [],
+				models: sortModels(
+					Array.isArray(p.models)
+						? p.models
+								.filter((m: any) => typeof m?.id === "string")
+								.map((m: any) => ({
+									id: m.id,
+									...(m.name ? { name: m.name } : {}),
+									...(typeof m.reasoning === "boolean" ? { reasoning: m.reasoning } : {}),
+									input: normalizeInput(m.input),
+									...(typeof m.contextWindow === "number" ? { contextWindow: m.contextWindow } : {}),
+									...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}),
+									...(m.cost ? { cost: m.cost } : {}),
+									...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
+									...(typeof m.enabled === "boolean" ? { enabled: m.enabled } : {}),
+								}))
+						: [],
+				),
 			};
 			providers.push(entry);
 		}
@@ -931,7 +950,7 @@ function extractModels(data: any, api: string): StoredModel[] {
 	for (const m of arr) {
 		if (m === undefined || m === null) continue;
 		if (typeof m === "string") {
-			out.push({ id: m, input: ["text", "image"] });
+			out.push({ id: m, input: ["text", "image"], enabled: false });
 			continue;
 		}
 		const rawId = m?.id ?? m?.name ?? m?.model ?? m?.key ?? (typeof m === "object" ? Object.keys(m)[0] : undefined);
@@ -947,6 +966,7 @@ function extractModels(data: any, api: string): StoredModel[] {
 			id,
 			name: typeof display === "string" ? display : id,
 			input: inferModelInput(m),
+			enabled: false,
 			...(contextWindow ? { contextWindow } : {}),
 			...(maxTokens ? { maxTokens } : {}),
 		});
@@ -1008,17 +1028,34 @@ function normalizeModel(m: StoredModel): any {
 	return base;
 }
 
+/** 模型是否启用（未设置 enabled 视为启用，兼容旧配置）。 */
+function isModelEnabled(m: StoredModel): boolean {
+	return m.enabled !== false;
+}
+
+/** 启用的模型排在前面（稳定排序，各组内保持原有相对顺序）。 */
+function sortModels(models: StoredModel[]): StoredModel[] {
+	const enabled: StoredModel[] = [];
+	const disabled: StoredModel[] = [];
+	for (const m of models) {
+		(isModelEnabled(m) ? enabled : disabled).push(m);
+	}
+	return [...enabled, ...disabled];
+}
+
 function mergeModels(existing: StoredModel[], fetched: StoredModel[]): StoredModel[] {
-	const merged = fetched.map((f) => ({
-		...f,
-		...existing.find((e) => e.id === f.id),
-	}));
+	// 新拉取的模型一律默认未勾选（不显示在 /model），需在“启用模型”中手动挑选；
+	// 已存在的模型保留用户的勾选与配置。
+	const merged = fetched.map((f) => {
+		const old = existing.find((e) => e.id === f.id);
+		return old ? { ...f, ...old } : { ...f, enabled: false };
+	});
 	for (const e of existing) {
 		if (!fetched.some((f) => f.id === e.id)) {
 			merged.push(e);
 		}
 	}
-	return merged;
+	return sortModels(merged);
 }
 
 function registerCommon(pi: ExtensionAPI, entry: CommonEntry): void {
@@ -1026,19 +1063,21 @@ function registerCommon(pi: ExtensionAPI, entry: CommonEntry): void {
 		name: entry.name,
 		baseUrl: entry.baseUrl,
 		api: entry.api,
-		models: entry.models.map(normalizeModel),
+		// 只注册勾选启用的模型；未勾选的保留在配置中但不显示在 /model。
+		models: entry.models.filter(isModelEnabled).map(normalizeModel),
 		// 仅允许登录后的有网络刷新访问 /models；注册、注销、删除模型等本地变更
 		// 会触发 pi 的无网络同步，此时必须直接保留当前列表。
+		// 未勾选启用的模型不暴露给 pi，因此不会出现在 /model 选择器中。
 		refreshModels: async (context: any) => {
 			if (context?.allowNetwork !== true || context?.signal?.aborted) {
-				return entry.models.map(normalizeModel);
+				return entry.models.filter(isModelEnabled).map(normalizeModel);
 			}
 			const key = extractCredentialKey(context?.credential);
 			const fetched = await fetchModelsByApi(entry.api, entry.baseUrl, key);
 			const merged = mergeModels(entry.models, fetched);
 			entry.models = merged;
 			await saveStore();
-			return merged.map(normalizeModel);
+			return merged.filter(isModelEnabled).map(normalizeModel);
 		},
 	};
 	pi.registerProvider(entry.name, cfg);
@@ -1275,10 +1314,11 @@ function listProvidersText(): string {
 			lines.push(`   服务层级：${cfg.serviceTier}  思考拆分：${cfg.reasoningSplit}`);
 		} else {
 			const apiOption = getCommonApiOption(p.api);
+			const enabledCount = p.models.filter(isModelEnabled).length;
 			lines.push(`● ${p.name}`);
 			lines.push(`   请求格式：${apiOption.label}（${p.api}）`);
 			lines.push(`   请求地址前缀：${p.baseUrl}`);
-			lines.push(`   模型：${p.models.length ? p.models.map((m) => m.id).join(", ") : "（空，请用模型管理添加）"}`);
+			lines.push(`   模型：启用 ${enabledCount} / 共 ${p.models.length} 个（未勾选的不显示在 /model 中）`);
 			lines.push(`   认证：/login ${p.name}  自动取模：开启`);
 		}
 		lines.push("");
@@ -1346,7 +1386,8 @@ async function selectCommon(ctx: any, title: string): Promise<CommonEntry | unde
 	}
 	const options = commons.map((p) => {
 		const apiOption = getCommonApiOption(p.api);
-		return `${p.name}  [${apiOption.label}]  ${p.baseUrl}  （${p.models.length} 个模型）`;
+		const enabledCount = p.models.filter(isModelEnabled).length;
+		return `${p.name}  [${apiOption.label}]  ${p.baseUrl}  （启用 ${enabledCount}/${p.models.length} 个模型）`;
 	});
 	options.push("取消");
 	const choice = await ctx.ui.select(title, options);
@@ -1421,10 +1462,17 @@ async function refreshCommonModels(ctx: any, entry: CommonEntry): Promise<void> 
 			key = undefined;
 		}
 		const list = await fetchModelsByApi(entry.api, entry.baseUrl, key);
+		const knownIds = new Set(entry.models.map((m) => m.id));
+		const added = list.filter((m) => !knownIds.has(m.id)).length;
 		entry.models = mergeModels(entry.models, list);
 		if (api) unregisterAndReRegister(api, entry.name, entry);
 		await saveStore();
-		ctx.ui.notify(`已刷新 ${entry.name}，共 ${entry.models.length} 个模型。`, "info");
+		const enabledCount = entry.models.filter(isModelEnabled).length;
+		let message = `已刷新 ${entry.name}：启用 ${enabledCount} / 共 ${entry.models.length} 个模型。`;
+		if (added > 0) {
+			message += `\n新增 ${added} 个模型默认未勾选，请到“启用模型”中挑选启用。`;
+		}
+		ctx.ui.notify(message, "info");
 	} catch (e) {
 		ctx.ui.notify(`刷新失败：${e instanceof Error ? e.message : String(e)}\n可直接手动添加模型 id。`, "error");
 	} finally {
@@ -1433,7 +1481,7 @@ async function refreshCommonModels(ctx: any, entry: CommonEntry): Promise<void> 
 }
 
 async function addModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
-	const ids = (await ctx.ui.input("添加模型 id（多个用逗号分隔）", "例如：gpt-4o, claude-sonnet-4-20250514"))?.trim();
+	const ids = (await ctx.ui.input("新增模型（多个用逗号分隔）", "例如：gpt-4o, claude-sonnet-4-20250514"))?.trim();
 	if (!ids) return;
 	const list = ids.split(/[,，\s]+/).map((s: string) => s.trim()).filter(Boolean);
 	const inputChoice = await ctx.ui.select("这些模型是否支持图片输入？", [
@@ -1449,13 +1497,15 @@ async function addModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 		if (old) {
 			old.input = input;
 		} else {
-			entry.models.push({ id, input, contextWindow: DEFAULT_CONTEXT_WINDOW });
+			// 手动添加的模型同样默认未勾选，需在“启用模型”中挑选。
+			entry.models.push({ id, input, contextWindow: DEFAULT_CONTEXT_WINDOW, enabled: false });
 			added++;
 		}
 	}
+	entry.models = sortModels(entry.models);
 	if (api) unregisterAndReRegister(api, entry.name, entry);
 	await saveStore();
-	ctx.ui.notify(`已处理 ${list.length} 个模型，新增 ${added} 个；输入能力：${inputModeText(input)}。`, "info");
+	ctx.ui.notify(`已处理 ${list.length} 个模型，新增 ${added} 个（默认未启用）；请到“启用模型”中勾选后使用。`, "info");
 }
 
 function parseContextWindowInput(value: string): number | undefined {
@@ -1479,7 +1529,9 @@ async function editModelContextFlow(ctx: any, entry: CommonEntry): Promise<void>
 		ctx.ui.notify("暂无模型，请先刷新或手动添加。", "info");
 		return;
 	}
-	const options = entry.models.map((model) => `${model.id}  [上下文 ${formatContextWindow(model.contextWindow)}]`);
+	const options = entry.models.map(
+		(model) => `${model.id}  [上下文 ${formatContextWindow(model.contextWindow)}]${isModelEnabled(model) ? "" : "  [已禁用]"}`,
+	);
 	options.push("取消");
 	const choice = await ctx.ui.select("选择要修改上下文窗口的模型", options);
 	if (!choice || choice === "取消") return;
@@ -1502,72 +1554,372 @@ async function editModelContextFlow(ctx: any, entry: CommonEntry): Promise<void>
 	ctx.ui.notify(`已更新 ${id}：上下文 ${formatContextWindow(contextWindow)}（${contextWindow.toLocaleString()}）`, "info");
 }
 
+/**
+ * 批量设置图片读取能力：勾选 = 支持图片输入（文本 + 图片），未勾选 = 仅文本。
+ * TUI 模式使用勾选组件，其它模式降级为 select 循环。
+ */
 async function editModelInputFlow(ctx: any, entry: CommonEntry): Promise<void> {
 	if (entry.models.length === 0) {
 		ctx.ui.notify("暂无模型，请先刷新或手动添加。", "info");
 		return;
 	}
-	const options = entry.models.map((model) => `${model.id}  [${inputModeText(model.input)}]`);
-	options.push("取消");
-	const choice = await ctx.ui.select("选择要修改输入能力的模型", options);
-	if (!choice || choice === "取消") return;
-	const id = choice.split(/\s+\[/)[0];
-	const model = entry.models.find((item) => item.id === id);
-	if (!model) return;
-	const inputChoice = await ctx.ui.select(`模型 ${id} 的输入能力`, ["文本 + 图片", "仅文本", "取消"]);
-	if (!inputChoice || inputChoice === "取消") return;
-	model.input = inputChoice === "文本 + 图片" ? ["text", "image"] : ["text"];
+	const supportsImage = (model: StoredModel) => (model.input ?? ["text", "image"]).includes("image");
+	let result: Set<string> | null | undefined;
+	if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
+		const ids = await ctx.ui.custom<string[] | null>(
+			(_tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+				new ModelToggleSelectorComponent(
+					{
+						title: `图片读取：${entry.name}`,
+						subtitle: "勾选表示支持图片输入（文本 + 图片），未勾选为仅文本",
+						countLabel: "支持图片",
+					},
+					entry.models,
+					entry.models.filter(supportsImage).map((m) => m.id),
+					keybindings,
+					theme,
+					done,
+				),
+		);
+		result = ids === null ? null : new Set(ids);
+	} else {
+		result = await toggleViaSelectFallback(ctx, entry, {
+			title: `图片读取：${entry.name}`,
+			countLabel: "支持图片",
+			isMarked: supportsImage,
+		});
+	}
+	if (result === null || result === undefined) return; // 取消
+	for (const model of entry.models) {
+		model.input = result.has(model.id) ? ["text", "image"] : ["text"];
+	}
 	if (api) unregisterAndReRegister(api, entry.name, entry);
 	await saveStore();
-	ctx.ui.notify(`已更新 ${id}：${inputModeText(model.input)}。`, "info");
+	ctx.ui.notify(`已更新 ${entry.name}：${result.size} / 共 ${entry.models.length} 个模型支持图片输入。`, "info");
 }
 
-async function deleteModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
-	while (entry.models.length > 0) {
-		const options = entry.models.map((model) => `${model.id}  [${inputModeText(model.input)}]`);
-		options.push("返回模型管理");
-		const choice = await ctx.ui.select(`删除模型：${entry.name}（剩余 ${entry.models.length} 个）`, options);
-		if (!choice || choice === "返回模型管理") return;
-		const id = choice.split(/\s+\[/)[0];
-		if (!(await ctx.ui.confirm("确认删除", `删除模型 ${id}？`))) continue;
-		entry.models = entry.models.filter((model) => model.id !== id);
-		if (api) unregisterAndReRegister(api, entry.name, entry);
-		await saveStore();
-		ctx.ui.notify(`已删除模型 ${id}。如需恢复，请手动执行“刷新模型”。`, "info");
+// =============================================================================
+// 模型勾选组件（样式与交互对齐内置 /scoped-models 选择器）
+// =============================================================================
+
+interface ToggleItem {
+	id: string;
+	model: StoredModel;
+	enabled: boolean;
+}
+
+/**
+ * 模型勾选组件：↑↓ 选择、enter 切换勾选、ctrl+a 全选、ctrl+x 清空、
+ * ctrl+s 保存、esc 取消；支持模糊搜索过滤；启用的模型始终排在列表最上面。
+ * 仅限 TUI 模式通过 ctx.ui.custom() 挂载；done(enabledIds) 保存，done(null) 取消。
+ */
+/** 勾选组件的文案配置。 */
+interface ModelToggleSelectorOptions {
+	/** 标题，如 "启用模型：my-provider" */
+	title: string;
+	/** 副标题说明（muted 提示行） */
+	subtitle: string;
+	/** footer 计数标签，如 "已启用" / "支持图片" */
+	countLabel: string;
+}
+
+class ModelToggleSelectorComponent extends Container {
+	private modelsById = new Map<string, StoredModel>();
+	private allIds: string[] = [];
+	private enabledIds: string[];
+	private filteredItems: ToggleItem[] = [];
+	private selectedIndex = 0;
+	private searchInput: Input;
+	private listContainer: Container;
+	private footerText: Text;
+	private readonly maxVisible = 8;
+	private isDirty = false;
+	private readonly options: ModelToggleSelectorOptions;
+	private readonly keybindings: any;
+	private readonly theme: any;
+	private readonly done: (result: string[] | null) => void;
+
+	constructor(
+		options: ModelToggleSelectorOptions,
+		models: StoredModel[],
+		initialEnabled: string[],
+		keybindings: any,
+		theme: any,
+		done: (result: string[] | null) => void,
+	) {
+		super();
+		this.options = options;
+		this.keybindings = keybindings;
+		this.theme = theme;
+		this.done = done;
+		this.enabledIds = [...initialEnabled];
+		for (const model of models) {
+			this.modelsById.set(model.id, model);
+			this.allIds.push(model.id);
+		}
+		const border = this.theme.fg("border", "─".repeat(56));
+		this.addChild(new Text(border, 0, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(this.theme.fg("accent", this.theme.bold(options.title)), 0, 0));
+		this.addChild(
+			new Text(this.theme.fg("muted", `${options.subtitle} · ${this.keyLabel("app.models.save")} 保存`), 0, 0),
+		);
+		this.addChild(new Spacer(1));
+		this.searchInput = new Input();
+		this.addChild(this.searchInput);
+		this.addChild(new Spacer(1));
+		this.listContainer = new Container();
+		this.addChild(this.listContainer);
+		this.addChild(new Spacer(1));
+		this.footerText = new Text("", 0, 0);
+		this.addChild(this.footerText);
+		this.addChild(new Text(border, 0, 0));
+		this.refresh();
 	}
-	ctx.ui.notify(`${entry.name} 已没有可删除的模型。`, "info");
+
+	private keyLabel(id: string): string {
+		try {
+			const keys = this.keybindings?.getKeys?.(id);
+			return Array.isArray(keys) && keys.length > 0 ? keys.join("/") : "";
+		} catch {
+			return "";
+		}
+	}
+
+	private buildItems(): ToggleItem[] {
+		// 启用的排最上（按勾选顺序），未启用的保持原顺序排在后面
+		const enabledSet = new Set(this.enabledIds);
+		const sorted = [
+			...this.enabledIds.filter((id) => this.modelsById.has(id)),
+			...this.allIds.filter((id) => !enabledSet.has(id)),
+		];
+		return sorted.map((id) => ({ id, model: this.modelsById.get(id) as StoredModel, enabled: enabledSet.has(id) }));
+	}
+
+	private getFooterText(): string {
+		const parts = [
+			`${this.keyLabel("tui.select.confirm")} 切换`,
+			`${this.keyLabel("app.models.enableAll")} 全选`,
+			`${this.keyLabel("app.models.clearAll")} 清空`,
+			`${this.keyLabel("app.models.save")} 保存`,
+			"esc 取消",
+			`${this.options.countLabel} ${this.enabledIds.length}/${this.allIds.length}`,
+		];
+		const text = `  ${parts.join(" · ")}`;
+		return this.isDirty ? this.theme.fg("dim", text) + this.theme.fg("warning", " （未保存）") : this.theme.fg("dim", text);
+	}
+
+	private refresh(): void {
+		const query = this.searchInput.getValue();
+		const items = this.buildItems();
+		this.filteredItems = query ? fuzzyFilter(items, query, (item) => item.id) : items;
+		if (this.selectedIndex >= this.filteredItems.length) {
+			this.selectedIndex = Math.max(0, this.filteredItems.length - 1);
+		}
+		this.updateList();
+		this.footerText.setText(this.getFooterText());
+	}
+
+	private updateList(): void {
+		this.listContainer.clear();
+		if (this.filteredItems.length === 0) {
+			this.listContainer.addChild(new Text(this.theme.fg("muted", "  没有匹配的模型"), 0, 0));
+			return;
+		}
+		const startIndex = Math.max(
+			0,
+			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
+		);
+		const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+		for (let i = startIndex; i < endIndex; i++) {
+			const item = this.filteredItems[i];
+			const isSelected = i === this.selectedIndex;
+			const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
+			const idText = isSelected ? this.theme.fg("accent", item.id) : item.id;
+			const badge = this.theme.fg("muted", ` [${formatContextWindow(item.model.contextWindow)}]`);
+			const status = item.enabled ? this.theme.fg("success", " ✓") : this.theme.fg("dim", " ✗");
+			this.listContainer.addChild(new Text(`${prefix}${idText}${badge}${status}`, 0, 0));
+		}
+		if (startIndex > 0 || endIndex < this.filteredItems.length) {
+			this.listContainer.addChild(
+				new Text(this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredItems.length})`), 0, 0),
+			);
+		}
+		const selected = this.filteredItems[this.selectedIndex];
+		this.listContainer.addChild(new Spacer(1));
+		const detail = `${selected.model.name ?? selected.id} · ${inputModeText(selected.model.input)}${selected.model.reasoning ? " · 支持思考" : ""}`;
+		this.listContainer.addChild(new Text(this.theme.fg("muted", `  ${detail}`), 0, 0));
+	}
+
+	handleInput(data: string): void {
+		const kb = this.keybindings;
+		if (kb.matches(data, "tui.select.up")) {
+			if (this.filteredItems.length === 0) return;
+			this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
+			this.updateList();
+			return;
+		}
+		if (kb.matches(data, "tui.select.down")) {
+			if (this.filteredItems.length === 0) return;
+			this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
+			this.updateList();
+			return;
+		}
+		if (kb.matches(data, "tui.select.confirm")) {
+			const item = this.filteredItems[this.selectedIndex];
+			if (item) {
+				const index = this.enabledIds.indexOf(item.id);
+				if (index >= 0) this.enabledIds.splice(index, 1);
+				else this.enabledIds.push(item.id);
+				this.isDirty = true;
+				this.refresh();
+			}
+			return;
+		}
+		if (kb.matches(data, "app.models.enableAll")) {
+			// 有搜索词时只全选过滤结果，否则全选全部
+			const targets = this.searchInput.getValue() ? this.filteredItems.map((i) => i.id) : this.allIds;
+			for (const id of targets) {
+				if (!this.enabledIds.includes(id)) this.enabledIds.push(id);
+			}
+			this.isDirty = true;
+			this.refresh();
+			return;
+		}
+		if (kb.matches(data, "app.models.clearAll")) {
+			// 有搜索词时只清空过滤结果，否则清空全部
+			if (this.searchInput.getValue()) {
+				const targets = new Set(this.filteredItems.map((i) => i.id));
+				this.enabledIds = this.enabledIds.filter((id) => !targets.has(id));
+			} else {
+				this.enabledIds = [];
+			}
+			this.isDirty = true;
+			this.refresh();
+			return;
+		}
+		if (kb.matches(data, "app.models.save")) {
+			this.done([...this.enabledIds]);
+			return;
+		}
+		if (matchesKey(data, Key.ctrl("c"))) {
+			if (this.searchInput.getValue()) {
+				this.searchInput.setValue("");
+				this.refresh();
+			} else {
+				this.done(null);
+			}
+			return;
+		}
+		if (matchesKey(data, Key.escape)) {
+			this.done(null);
+			return;
+		}
+		// 其余按键交给搜索框
+		this.searchInput.handleInput(data);
+		this.refresh();
+	}
+}
+
+/**
+ * 非 TUI 模式（rpc/print 等）的降级勾选方式：循环单选模拟多选框。
+ * 返回被勾选的模型 id 集合；null 表示取消。由调用方决定集合的含义与应用方式。
+ */
+async function toggleViaSelectFallback(
+	ctx: any,
+	entry: CommonEntry,
+	opts: { title: string; countLabel: string; isMarked: (model: StoredModel) => boolean },
+): Promise<Set<string> | null> {
+	const marked = new Set(entry.models.filter((m) => opts.isMarked(m)).map((m) => m.id));
+	while (true) {
+		entry.models = sortModels(entry.models);
+		const options = entry.models.map((model) => {
+			const mark = marked.has(model.id) ? "[✓]" : "[ ]";
+			return `${mark} ${model.id}  [上下文 ${formatContextWindow(model.contextWindow)}]  [${inputModeText(model.input)}]`;
+		});
+		options.push("保存并返回", "全部勾选", "全部取消", "取消（不保存）");
+		const title = `${opts.title}（${opts.countLabel} ${marked.size}/${entry.models.length}，选择条目即切换勾选）`;
+		const choice = await ctx.ui.select(title, options);
+		if (!choice || choice === "取消（不保存）") return null;
+		if (choice === "保存并返回") return marked;
+		if (choice === "全部勾选") {
+			for (const model of entry.models) marked.add(model.id);
+			continue;
+		}
+		if (choice === "全部取消") {
+			marked.clear();
+			continue;
+		}
+		const id = choice.replace(/^\[[✓ ]\]\s*/, "").split(/\s+\[/)[0];
+		if (marked.has(id)) marked.delete(id);
+		else marked.add(id);
+	}
+}
+
+/**
+ * 多选勾选入口：TUI 模式使用与内置 /scoped-models 一致的交互组件，
+ * 其它模式降级为 select 循环。保存后未勾选的模型不再注册到 pi。
+ */
+async function toggleModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
+	if (entry.models.length === 0) {
+		ctx.ui.notify("暂无模型，请先刷新或手动添加。", "info");
+		return;
+	}
+	entry.models = sortModels(entry.models);
+	let result: Set<string> | null | undefined;
+	if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
+		const ids = await ctx.ui.custom<string[] | null>(
+			(_tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+				new ModelToggleSelectorComponent(
+					{
+						title: `启用模型：${entry.name}`,
+						subtitle: "勾选的模型显示在 /model 中",
+						countLabel: "已启用",
+					},
+					entry.models,
+					entry.models.filter(isModelEnabled).map((m) => m.id),
+					keybindings,
+					theme,
+					done,
+				),
+		);
+		result = ids === null ? null : new Set(ids);
+	} else {
+		result = await toggleViaSelectFallback(ctx, entry, {
+			title: `勾选启用的模型：${entry.name}`,
+			countLabel: "已启用",
+			isMarked: isModelEnabled,
+		});
+	}
+	if (result === null || result === undefined) return; // 取消
+	entry.models = sortModels(entry.models.map((m) => ({ ...m, enabled: result!.has(m.id) })));
+	if (api) unregisterAndReRegister(api, entry.name, entry);
+	await saveStore();
+	ctx.ui.notify(
+		`已保存 ${entry.name}：启用 ${result!.size} / 共 ${entry.models.length} 个模型；未勾选的模型不再显示在 /model 中。`,
+		"info",
+	);
 }
 
 async function modelsMenu(ctx: any): Promise<void> {
 	const entry = await selectCommon(ctx, "选择供应商以管理模型");
 	if (!entry) return;
 	while (true) {
-		const action = await ctx.ui.select(`模型管理：${entry.name}（${entry.models.length} 个）`, [
+		const enabledCount = entry.models.filter(isModelEnabled).length;
+		const action = await ctx.ui.select(`模型管理：${entry.name}（启用 ${enabledCount} / 共 ${entry.models.length} 个）`, [
+			"启用模型",
 			"刷新模型",
-			"添加模型 id",
+			"新增模型",
 			"修改上下文窗口",
-			"修改图片输入能力",
-			"查看模型列表",
-			"删除模型",
+			"是否支持图片读取",
 			"返回",
 		]);
 		if (!action || action === "返回") return;
-		if (action === "刷新模型") await refreshCommonModels(ctx, entry);
-		else if (action === "添加模型 id") await addModelsFlow(ctx, entry);
+		if (action === "启用模型") await toggleModelsFlow(ctx, entry);
+		else if (action === "刷新模型") await refreshCommonModels(ctx, entry);
+		else if (action === "新增模型") await addModelsFlow(ctx, entry);
 		else if (action === "修改上下文窗口") await editModelContextFlow(ctx, entry);
-		else if (action === "修改图片输入能力") await editModelInputFlow(ctx, entry);
-		else if (action === "查看模型列表") {
-			const lines = entry.models.map(
-				(model) => `  ${model.id}  [上下文 ${formatContextWindow(model.contextWindow)}]  [${inputModeText(model.input)}]${model.reasoning ? "  [思考]" : ""}`,
-			);
-			ctx.ui.notify(lines.length ? `【${entry.name}】\n${lines.join("\n")}` : `${entry.name} 暂无模型。`, "info");
-		} else if (action === "删除模型") {
-			if (entry.models.length === 0) {
-				ctx.ui.notify("暂无模型可删除。", "info");
-				continue;
-			}
-			await deleteModelsFlow(ctx, entry);
-		}
+		else if (action === "是否支持图片读取") await editModelInputFlow(ctx, entry);
 	}
 }
 
