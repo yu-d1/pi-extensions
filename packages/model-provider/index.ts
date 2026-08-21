@@ -781,6 +781,116 @@ async function tryFetchJson(path: string, baseUrl: string, headers: Record<strin
 	}
 }
 
+type ConnectivityResult =
+	| { ok: true; status: number; modelCount: number; authRequired?: boolean }
+	| { ok: false; reason: "invalid-url" | "network" | "http" | "auth" | "response"; message: string };
+
+function buildModelsHeaders(apiType: string, apiKey?: string): Record<string, string> {
+	const headers: Record<string, string> = {};
+	if (apiType === "anthropic-messages") {
+		headers["anthropic-version"] = "2023-06-01";
+		if (apiKey) headers["x-api-key"] = apiKey;
+	} else if (apiKey) {
+		headers.Authorization = `Bearer ${apiKey}`;
+	}
+	return headers;
+}
+
+/** 保存新增或编辑的供应商前，确认 API 前缀和 /models 接口可访问。 */
+async function checkProviderConnectivity(apiType: string, baseUrl: string, apiKey?: string): Promise<ConnectivityResult> {
+	const base = baseUrl.trim().replace(/\/+$/, "");
+	let endpoint: URL;
+	try {
+		endpoint = new URL(`${base}/models`);
+		if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+			return { ok: false, reason: "invalid-url", message: "地址必须使用 http:// 或 https://。" };
+		}
+	} catch {
+		return { ok: false, reason: "invalid-url", message: `地址格式无效：${baseUrl}` };
+	}
+
+	try {
+		const res = await fetch(endpoint, {
+			method: "GET",
+			headers: { Accept: "application/json", ...buildModelsHeaders(apiType, apiKey) },
+			signal: AbortSignal.timeout(15000),
+		});
+		if (res.status === 401 || res.status === 403) {
+			// 新增供应商尚未保存时无法执行 /login，因此认证失败不能阻止保存；
+			// 401/403 已经证明地址可访问，保存后再登录并刷新模型即可。
+			return { ok: true, status: res.status, modelCount: 0, authRequired: true };
+		}
+		if (!res.ok) {
+			return {
+				ok: false,
+				reason: "http",
+				message: `请求 /models 失败（HTTP ${res.status}）。请检查 API 前缀和请求格式。`,
+			};
+		}
+		if (res.status === 204) return { ok: true, status: res.status, modelCount: 0 };
+
+		const text = await res.text();
+		let data: any;
+		try {
+			data = JSON.parse(text);
+		} catch {
+			return { ok: false, reason: "response", message: "接口已返回成功状态，但响应不是有效 JSON。" };
+		}
+		const list = [data?.data, data?.models, data?.ids, data?.list, data?.items].find(Array.isArray);
+		if (!list) {
+			return { ok: false, reason: "response", message: "接口已返回成功状态，但没有识别到模型列表。" };
+		}
+		return { ok: true, status: res.status, modelCount: list.length };
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { ok: false, reason: "network", message: `无法访问 /models：${message}` };
+	}
+}
+
+async function getProviderApiKey(ctx: any, providerNames: string[]): Promise<string | undefined> {
+	for (const providerName of providerNames) {
+		if (!providerName) continue;
+		try {
+			const key = extractCredentialKey(await (ctx.modelRegistry as any)?.getApiKeyForProvider(providerName));
+			if (key) return key;
+		} catch {
+			// 认证不存在时继续尝试其它名称。
+		}
+	}
+	return undefined;
+}
+
+/** 失败后重新回到地址输入，让用户修改后继续检查；按 Esc 才取消流程。 */
+async function promptVerifiedBaseUrl(
+	ctx: any,
+	apiType: string,
+	prompt: string,
+	initialValue: string,
+	providerNames: string[],
+): Promise<string | undefined> {
+	let value = initialValue;
+	while (true) {
+		const input = await ctx.ui.input(prompt, value);
+		if (!input?.trim()) return undefined;
+		value = input.trim().replace(/\/+$/, "");
+		if (/\/(models|messages|responses|chat\/completions)$/i.test(value)) {
+			ctx.ui.notify("这里只填写 API 前缀，不要填写具体接口路径。请修改后重试。", "error");
+			continue;
+		}
+
+		ctx.ui.setStatus("model-provider", `正在检查 ${value}/models 连通性...`);
+		let check: ConnectivityResult;
+		try {
+			const key = await getProviderApiKey(ctx, providerNames);
+			check = await checkProviderConnectivity(apiType, value, key);
+		} finally {
+			ctx.ui.setStatus("model-provider", undefined);
+		}
+		if (check.ok) return value;
+		ctx.ui.notify(`供应商地址检查失败：${check.message}\n请修改地址后重试，按 Esc 可取消。`, "error");
+	}
+}
+
 type ModelInput = ("text" | "image")[];
 
 /** 服务端没有返回上下文窗口时，通用模型使用 1M 默认值。 */
@@ -917,9 +1027,20 @@ function registerCommon(pi: ExtensionAPI, entry: CommonEntry): void {
 		baseUrl: entry.baseUrl,
 		api: entry.api,
 		models: entry.models.map(normalizeModel),
+		// 仅允许登录后的有网络刷新访问 /models；注册、注销、删除模型等本地变更
+		// 会触发 pi 的无网络同步，此时必须直接保留当前列表。
+		refreshModels: async (context: any) => {
+			if (context?.allowNetwork !== true || context?.signal?.aborted) {
+				return entry.models.map(normalizeModel);
+			}
+			const key = extractCredentialKey(context?.credential);
+			const fetched = await fetchModelsByApi(entry.api, entry.baseUrl, key);
+			const merged = mergeModels(entry.models, fetched);
+			entry.models = merged;
+			await saveStore();
+			return merged.map(normalizeModel);
+		},
 	};
-	// 不注册 pi 的自动刷新回调；只有“模型管理→刷新模型”才访问 /models。
-	// 删除模型后，后台状态刷新不会再次把它拉回来。
 	pi.registerProvider(entry.name, cfg);
 }
 
@@ -1188,15 +1309,14 @@ async function addCommonFlow(ctx: any): Promise<void> {
 	const selected = COMMON_API_OPTIONS.find((option) => apiChoice.startsWith(`${option.label}（`));
 	if (!selected) return;
 
-	const baseUrl = (await ctx.ui.input(`请求地址前缀（示例：${selected.example}）`, selected.example))?.trim().replace(/\/+$/, "");
-	if (!baseUrl) {
-		ctx.ui.notify("请求地址前缀不能为空。示例只填写到 /v1，不要填写 /models、/messages 或 /chat/completions。", "error");
-		return;
-	}
-	if (/\/(models|messages|responses|chat\/completions)$/i.test(baseUrl)) {
-		ctx.ui.notify("这里只填写 API 前缀，例如 https://api.openai.com/v1，不要填写具体接口路径。", "error");
-		return;
-	}
+	const baseUrl = await promptVerifiedBaseUrl(
+		ctx,
+		selected.api,
+		`请求地址前缀（示例：${selected.example}）`,
+		selected.example,
+		[cleanName],
+	);
+	if (!baseUrl) return;
 
 	const entry: CommonEntry = {
 		kind: "common",
@@ -1253,11 +1373,14 @@ async function editCommonFlow(ctx: any): Promise<void> {
 	const selected = COMMON_API_OPTIONS.find((option) => apiChoice.startsWith(`${option.label}（`));
 	if (!selected) return;
 
-	const newBase = (await ctx.ui.input(`请求地址前缀（当前：${entry.baseUrl}）`, entry.baseUrl))?.trim().replace(/\/+$/, "") || entry.baseUrl;
-	if (/\/(models|messages|responses|chat\/completions)$/i.test(newBase)) {
-		ctx.ui.notify("这里只填写 API 前缀，不要填写具体接口路径。", "error");
-		return;
-	}
+	const newBase = await promptVerifiedBaseUrl(
+		ctx,
+		selected.api,
+		`请求地址前缀（当前：${entry.baseUrl}）`,
+		entry.baseUrl,
+		[newName, oldName],
+	);
+	if (!newBase) return;
 	if (!/^[A-Za-z0-9_\-]+$/.test(newName)) {
 		ctx.ui.notify("供应商名称只能包含字母、数字、下划线、连字符。", "error");
 		return;
