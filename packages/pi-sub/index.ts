@@ -57,23 +57,37 @@ const PI_SUB_CONFIG_FILE = path.join(USER_EXTENSION_DIR, "config.json");
 const DEFAULT_PROGRESS_LINES = 5;
 /** 可配置显示行数上限 */
 const MAX_PROGRESS_LINES = 10;
-/** 子进程最长运行时间，避免不支持图片或网络异常时永久等待。 */
-const DEFAULT_SUBPROCESS_TIMEOUT_MS = 120_000;
+/** 子进程默认最长运行时间（秒），避免网络异常时永久等待。 */
+const DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 3600;
+/** 子进程超时时间允许配置的最大值（秒）。 */
+const MAX_SUBPROCESS_TIMEOUT_SECONDS = 86_400;
 
 interface PiSubConfig {
 	/** 子进程实时输出固定显示行数（最新 N 行滚动窗口） */
 	progressLines: number;
+	/** 子进程最长运行时间（秒） */
+	timeoutSeconds: number;
 }
 
 function loadPiSubConfig(): PiSubConfig {
 	try {
 		const raw = JSON.parse(fs.readFileSync(PI_SUB_CONFIG_FILE, "utf8")) as Partial<PiSubConfig>;
-		const n = Number(raw.progressLines);
-		if (Number.isInteger(n) && n >= 1 && n <= MAX_PROGRESS_LINES) return { progressLines: n };
+		const progressLines = Number(raw.progressLines);
+		const timeoutSeconds = Number(raw.timeoutSeconds);
+		return {
+			progressLines:
+				Number.isInteger(progressLines) && progressLines >= 1 && progressLines <= MAX_PROGRESS_LINES
+					? progressLines
+					: DEFAULT_PROGRESS_LINES,
+			timeoutSeconds:
+				Number.isInteger(timeoutSeconds) && timeoutSeconds >= 1 && timeoutSeconds <= MAX_SUBPROCESS_TIMEOUT_SECONDS
+					? timeoutSeconds
+					: DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
+		};
 	} catch {
 		// 配置缺失或损坏时回退默认值
 	}
-	return { progressLines: DEFAULT_PROGRESS_LINES };
+	return { progressLines: DEFAULT_PROGRESS_LINES, timeoutSeconds: DEFAULT_SUBPROCESS_TIMEOUT_SECONDS };
 }
 
 function savePiSubConfig(config: PiSubConfig): void {
@@ -684,7 +698,8 @@ async function runSub(ctx: ExtensionContext, agent: AgentDef, opts: RunOptions):
 	// 5. 运行并回收：固定显示最新 N 行（滚动窗口），不做合成状态文案；
 	//    最终 assistant message_end 到达即返回 true，立即结束子进程，避免收尾卡顿。
 	const progress = createProgressReporter(opts.onProgress);
-	const liveOutput: LiveOutputState = { text: "", lines: loadPiSubConfig().progressLines };
+	const piSubConfig = loadPiSubConfig();
+	const liveOutput: LiveOutputState = { text: "", lines: piSubConfig.progressLines };
 	let exitCode = -1;
 	let stdout = "";
 	let stderr = "";
@@ -692,7 +707,7 @@ async function runSub(ctx: ExtensionContext, agent: AgentDef, opts: RunOptions):
 		({ exitCode, stdout, stderr } = await runPiCli(args, {
 			cwd: ctx.cwd,
 			signal: opts.signal,
-			timeoutMs: DEFAULT_SUBPROCESS_TIMEOUT_MS,
+			timeoutMs: piSubConfig.timeoutSeconds * 1000,
 			onEvent: (event) => {
 				const text = realtimeSubOutput(event, liveOutput);
 				if (text) progress.report(text);
@@ -706,7 +721,7 @@ async function runSub(ctx: ExtensionContext, agent: AgentDef, opts: RunOptions):
 	}
 	const parsed = parseSubOutput(stdout);
 	if (exitCode === -2) {
-		throw new Error(`子进程执行超时（超过 ${Math.round(DEFAULT_SUBPROCESS_TIMEOUT_MS / 1000)} 秒），已终止，可能是模型不支持图片输入或网络无响应`);
+		throw new Error(`子进程执行超时（超过 ${piSubConfig.timeoutSeconds} 秒），已终止，可能是模型不支持图片输入或网络无响应`);
 	}
 	if (exitCode === -1) {
 		throw new Error("子进程已取消");
@@ -888,6 +903,7 @@ function listAgentsText(): string {
 		`用户配置目录：${USER_AGENTS_DIR_DISPLAY}`,
 		"新增子进程：通过 /sub 菜单把需求交给当前主模型，由主模型生成并写入配置；写入后执行 /reload",
 		`实时输出：固定显示最新 ${loadPiSubConfig().progressLines} 行（/sub 菜单「通用设置」可调整）`,
+		`超时时间：${loadPiSubConfig().timeoutSeconds} 秒（/sub 菜单「通用设置」可调整）`,
 	);
 	return lines.join("\n");
 }
@@ -911,25 +927,40 @@ async function openMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise
 	else if (choice.startsWith("删除子进程")) await flowDelete(ctx);
 }
 
-/** 通用设置：设置项列表（当前：实时输出显示行数），循环返回列表直到完成 */
+/** 通用设置：设置项列表，循环返回列表直到完成 */
 async function flowGeneralSettings(ctx: ExtensionCommandContext): Promise<void> {
 	for (;;) {
-		const cur = `实时输出显示行数：${loadPiSubConfig().progressLines} 行`;
+		const current = loadPiSubConfig();
+		const cur = `输出 ${current.progressLines} 行，超时 ${current.timeoutSeconds} 秒`;
 		const item = await ctx.ui.select(`通用设置（${cur}）`, [
 			"实时输出显示行数",
+			"子进程超时时间（秒）",
 			"完成",
 		]);
 		if (!item || item.startsWith("完成")) return; // 取消或完成退出
 		if (item.startsWith("实时输出显示行数")) {
-			const current = loadPiSubConfig().progressLines;
 			const options = Array.from({ length: MAX_PROGRESS_LINES }, (_, i) => String(i + 1));
-			const value = await ctx.ui.select(`实时输出显示行数（当前：${current}）`, options);
+			const value = await ctx.ui.select(`实时输出显示行数（当前：${current.progressLines}）`, options);
 			if (!value) continue;
 			const n = Number(value);
-			if (!Number.isInteger(n) || n < 1 || n > MAX_PROGRESS_LINES) return;
-			savePiSubConfig({ progressLines: n });
+			if (!Number.isInteger(n) || n < 1 || n > MAX_PROGRESS_LINES) continue;
+			savePiSubConfig({ progressLines: n, timeoutSeconds: current.timeoutSeconds });
 			ctx.ui.notify(`已设置实时输出显示行数为 ${n} 行；下次运行子进程即生效`, "info");
 			continue; // 返回设置项列表
+		}
+		if (item.startsWith("子进程超时时间")) {
+			const value = await ctx.ui.input(
+				`子进程超时时间（当前：${current.timeoutSeconds} 秒）`,
+				`请输入 1-${MAX_SUBPROCESS_TIMEOUT_SECONDS} 之间的整数秒数，默认 ${DEFAULT_SUBPROCESS_TIMEOUT_SECONDS}`,
+			);
+			if (!value?.trim()) continue;
+			const seconds = Number(value.trim());
+			if (!Number.isInteger(seconds) || seconds < 1 || seconds > MAX_SUBPROCESS_TIMEOUT_SECONDS) {
+				ctx.ui.notify(`超时时间必须是 1-${MAX_SUBPROCESS_TIMEOUT_SECONDS} 之间的整数秒数。`, "error");
+				continue;
+			}
+			savePiSubConfig({ progressLines: current.progressLines, timeoutSeconds: seconds });
+			ctx.ui.notify(`已设置子进程超时时间为 ${seconds} 秒；下次运行子进程即生效`, "info");
 		}
 	}
 }

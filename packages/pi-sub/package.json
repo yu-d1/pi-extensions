@@ -1,6 +1,6 @@
 {
   "name": "@liziy/pi-sub",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "pi 子进程调度扩展：内置文件探索、审查、调研和视觉子进程，支持主模型按需新增配置",
   "keywords": [
     "pi-extension",
