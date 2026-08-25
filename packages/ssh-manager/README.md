@@ -76,7 +76,11 @@ pi install npm:@liziy/ssh-manager
 - **只读模式**：只允许 50+ 种读命令（ls/cat/ps/df/git log 等）
 - **确认策略**：AI 执行写操作时需用户手动确认
 
-## 更新日志
+## 版本历史
+
+### 1.1.1
+
+- 删除连接前新增确认对话框，防止误删
 
 ### 1.1.0
 
@@ -94,6 +98,6 @@ pi install npm:@liziy/ssh-manager
 
 - 初始发布：SSH 连接管理，添加/编辑/删除/查看配置
 
-## 协议
+## 许可
 
 MIT

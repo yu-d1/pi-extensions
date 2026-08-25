@@ -57,7 +57,7 @@ pi install npm:@liziy/token-stats
 
 ### 1. 启用套餐用量
 
-切到任意模型后输入 `/stats`，从菜单选择一个套餐（MiniMax / GLM / Kimi / DeepSeek），footer 立刻多出 5h/周/倒计时三段。
+切到任意模型后输入 `/stats`，选 `📦 套餐配额配置`，从菜单选择一个套餐（MiniMax / GLM / Kimi / DeepSeek），footer 立刻多出 5h/周/倒计时三段。
 
 > 套餐用量按 provider 维度记忆，下次切回同一个 provider 自动恢复。
 
@@ -125,7 +125,7 @@ pi install npm:@liziy/token-stats
 ### `/stats` 命令一览
 
 ```bash
-/stats                       # 首次运行进入套餐配置向导
+/stats                       # 打开主菜单：今日/小时/周/月统计 + 套餐配额 + 状态栏配置
 /stats today                 # 等价于 day，今天的统计
 /stats day                   # 今天的统计
 /stats day 2026-07-07        # 指定日期
@@ -134,7 +134,7 @@ pi install npm:@liziy/token-stats
 /stats week                  # 最近 7 天汇总
 /stats month                 # 当月汇总
 /stats month 2026-07         # 指定月份
-/stats config                # 配置：显示项 / 刷新间隔
+/stats config                # 状态栏配置：显示项 / 样式 / 刷新间隔 / 联网搜索
 ```
 
 ### 输出示例：`/stats day`
@@ -230,7 +230,11 @@ jq -r '"\(.date) \(.avgCacheHitRate)"' \
 - 会话恢复（`session_start`）会从历史 assistant 消息重建累计统计，无需重启 pi 就能看到本会话完整账单
 - `message_end` 与 `turn_end` 通过 `responseId + provider + model + usage` 复合 key 去重，避免重复累加
 
-## 更新记录
+## 版本历史
+
+- **v1.5.1** — `/stats` 无参改为主菜单（今日/小时/周/月统计 + 套餐配额 + 状态栏配置），查询不再需要记参数；状态栏“显示内容”改为勾选组件，ctrl+s 实时保存并留在界面
+- **v1.5.0** — 状态栏“显示内容”等勾选界面改用批量勾选组件（对齐内置 /scoped-models 交互）
+
 
 - **v1.4.0** — 新增联网搜索：`/stats config` 可配置（默认开启），搜索后端跟随套餐（DeepSeek 套餐 → DeepSeek 服务端搜索，内嵌移植 pi-deepseek-search 核心逻辑，带 provider 守卫）
 
@@ -238,6 +242,6 @@ jq -r '"\(.date) \(.avgCacheHitRate)"' \
 - **v1.3.3** — 修复 `/new`、`/resume`、`/fork`、`/reload` 等 session 替换场景下旧实例配额刷新定时器未清理、访问失效 ctx 导致 pi 崩溃退出（`extension ctx is stale`）的问题：新增 `session_shutdown` 清理处理器，定时器/延迟回调/footer 渲染统一加 `sessionActive` 守卫与异常兜底
 - **v1.3.2** — `/stats` 启用套餐时不再误报“未知错误”
 
-## 协议
+## 许可
 
 MIT

@@ -183,30 +183,34 @@ export default function planGuardExtension(pi: ExtensionAPI) {
   // ── /plan config 配置菜单 ──────────────────────────
 
   const showConfigMenu = async (ctx: ExtensionContext) => {
-    const cfg = loadPlanGuardConfig();
-    const todoLabel = `📋 Todo 任务面板  (${cfg.features.todo ? "✅ 开启" : "⬜ 关闭"})`;
-    const aqLabel = `💬 提问对话框    (${cfg.features.askUserQuestion ? "✅ 开启" : "⬜ 关闭"})`;
-    const choice = await ctx.ui.select("Plan Guard 配置（重新加载后生效）", [
-      todoLabel,
-      aqLabel,
-      "🔙 返回",
-    ]);
-    if (!choice || choice === "🔙 返回") return;
+    // 循环菜单：切换后留在当前界面，可连续调整多个开关
+    while (true) {
+      const cfg = loadPlanGuardConfig();
+      const todoLabel = `📋 Todo 任务面板  (${cfg.features.todo ? "✅ 开启" : "⬜ 关闭"})`;
+      const aqLabel = `💬 提问对话框    (${cfg.features.askUserQuestion ? "✅ 开启" : "⬜ 关闭"})`;
+      const choice = await ctx.ui.select("Plan Guard 配置（重新加载后生效）", [
+        todoLabel,
+        aqLabel,
+        "🔙 返回",
+      ]);
+      if (!choice || choice === "🔙 返回") return;
 
-    const next: PlanGuardConfig = {
-      features: { ...cfg.features },
-    };
-    if (choice === todoLabel) next.features.todo = !cfg.features.todo;
-    else if (choice === aqLabel) next.features.askUserQuestion = !cfg.features.askUserQuestion;
+      const next: PlanGuardConfig = {
+        features: { ...cfg.features },
+      };
+      if (choice === todoLabel) next.features.todo = !cfg.features.todo;
+      else if (choice === aqLabel) next.features.askUserQuestion = !cfg.features.askUserQuestion;
+      else return;
 
-    const ok = saveJsonConfig(PLAN_GUARD_CONFIG_FILE, next);
-    if (ok) {
-      ctx.ui.notify(
-        `已保存（Todo ${next.features.todo ? "开" : "关"} · 提问 ${next.features.askUserQuestion ? "开" : "关"}）→ /reload 后生效`,
-        "info",
-      );
-    } else {
-      ctx.ui.notify("配置保存失败（磁盘错误？）", "error");
+      const ok = saveJsonConfig(PLAN_GUARD_CONFIG_FILE, next);
+      if (ok) {
+        ctx.ui.notify(
+          `已保存（Todo ${next.features.todo ? "开" : "关"} · 提问 ${next.features.askUserQuestion ? "开" : "关"}）→ /reload 后生效`,
+          "info",
+        );
+      } else {
+        ctx.ui.notify("配置保存失败（磁盘错误？）", "error");
+      }
     }
   };
 

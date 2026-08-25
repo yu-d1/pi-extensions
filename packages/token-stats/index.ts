@@ -764,24 +764,32 @@ class ToggleSelectorComponent extends Container {
   private footerText: Text;
   private readonly maxVisible = 10;
   private isDirty = false;
+  private saving = false;
+  private saveNote = "";
   private readonly options: ToggleSelectorOptions;
+  private readonly tui: any;
   private readonly keybindings: any;
   private readonly theme: any;
   private readonly done: (result: string[] | null) => void;
+  private readonly onSave?: (ids: string[]) => void | Promise<void>;
 
   constructor(
+    tui: any,
     options: ToggleSelectorOptions,
     entries: ToggleEntry[],
     initialMarked: string[],
     keybindings: any,
     theme: any,
     done: (result: string[] | null) => void,
+    onSave?: (ids: string[]) => void | Promise<void>,
   ) {
     super();
     this.options = options;
+    this.tui = tui;
     this.keybindings = keybindings;
     this.theme = theme;
     this.done = done;
+    this.onSave = onSave;
     this.markedIds = [...initialMarked];
     for (const entry of entries) {
       this.entriesById.set(entry.id, entry);
@@ -825,6 +833,34 @@ class ToggleSelectorComponent extends Container {
     return sorted.map((id) => ({ entry: this.entriesById.get(id) as ToggleEntry, marked: markedSet.has(id) }));
   }
 
+  /** ctrl+s：触发保存但不关闭组件，留在当前界面继续调整；esc 才退出。 */
+  private triggerSave(): void {
+    if (this.saving) return;
+    if (!this.onSave) {
+      this.done([...this.markedIds]);
+      return;
+    }
+    this.saving = true;
+    this.saveNote = "";
+    this.footerText.setText(this.theme.fg("dim", "  保存中..."));
+    const ids = [...this.markedIds];
+    Promise.resolve()
+      .then(() => this.onSave!(ids))
+      .then(() => {
+        this.saving = false;
+        this.isDirty = false;
+        this.saveNote = "已保存";
+        this.refresh();
+        this.tui?.requestRender?.();
+      })
+      .catch((e) => {
+        this.saving = false;
+        this.saveNote = `保存失败：${e instanceof Error ? e.message : String(e)}`;
+        this.refresh();
+        this.tui?.requestRender?.();
+      });
+  }
+
   private getFooterText(): string {
     const parts = [
       `${this.keyLabel("tui.select.confirm")} 切换`,
@@ -834,7 +870,7 @@ class ToggleSelectorComponent extends Container {
       "esc 取消",
       `${this.options.countLabel} ${this.markedIds.length}/${this.allIds.length}`,
     ];
-    const text = `  ${parts.join(" · ")}`;
+    const text = `  ${parts.join(" · ")}${this.saveNote ? ` · ${this.saveNote}` : ""}`;
     return this.isDirty ? this.theme.fg("dim", text) + this.theme.fg("warning", " （未保存）") : this.theme.fg("dim", text);
   }
 
@@ -927,7 +963,7 @@ class ToggleSelectorComponent extends Container {
       return;
     }
     if (kb.matches(data, "app.models.save")) {
-      this.done([...this.markedIds]);
+      this.triggerSave();
       return;
     }
     if (matchesKey(data, Key.ctrl("c"))) {
@@ -1957,12 +1993,44 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   // ── /stats 命令 ─────────────────────────────────────
 
   pi.registerCommand("stats", {
-    description: "Token 统计 (day | hour | week | month | config)  无参默认进入套餐配置",
+    description: "Token 统计：/stats 打开主菜单；/stats day|hour|week|month 查询；/stats config 状态栏配置",
     handler: async (args, ctx) => {
-      const arg = args.trim();
+      let arg = args.trim();
 
-      // 无参 → 套餐配置
+      // 无参 → 主菜单：统计查询不再需要记参数，套餐/配置入口也在这里
       if (!arg) {
+        const main = await ctx.ui.select("Token 统计", [
+          "📊 今日统计",
+          "📊 按小时分布（今日）",
+          "📊 本周汇总",
+          "📊 月度汇总",
+          "📦 套餐配额配置",
+          "⚙️ 状态栏配置",
+        ]);
+        if (!main) return;
+        if (main.startsWith("📊 今日")) {
+          await showDay(getDateStr(), ctx, pi);
+          return;
+        }
+        if (main.startsWith("📊 按小时")) {
+          await showHourly(getDateStr(), ctx, pi);
+          return;
+        }
+        if (main.startsWith("📊 本周")) {
+          await showWeek(ctx, pi);
+          return;
+        }
+        if (main.startsWith("📊 月度")) {
+          await showMonth(getMonthStr(), ctx, pi);
+          return;
+        }
+        if (main.startsWith("📦")) arg = "plan";
+        else if (main.startsWith("⚙️")) arg = "config";
+        else return;
+      }
+
+      // 套餐配额配置
+      if (arg === "plan") {
         const provider = ctx.model?.provider;
         if (!provider) {
           ctx.ui.notify("无法获取当前供应商，请先切换对话", "warning");
@@ -2034,7 +2102,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       }
 
       if (arg === "config") {
-        const subChoice = await ctx.ui.select("配置", [
+        const subChoice = await ctx.ui.select("Token 统计配置", [
           "显示样式",
           "显示内容",
           "刷新时间  (当前 " + (tokenConfig?.ttl || 60) + "s)",
@@ -2097,7 +2165,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
               }
             }
           }
-          ctx.ui.notify("显示样式已保存", "info");
         } else if (subChoice === "显示内容") {
           const itemLabels: DisplayKey[] = [
             "input", "output", "totalTokens", "cacheHit", "speed", "context",
@@ -2108,13 +2175,14 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             cacheHit: "缓存命中", speed: "速度", context: "容量",
             quota5h: "5h额度", quotaWeek: "周额度", quotaClock: "刷新时间",
           };
-          // TUI 模式：勾选组件批量编辑，ctrl+s 统一保存
+          // TUI 模式：勾选组件批量编辑，ctrl+s 实时保存并刷新 footer，留在界面继续调整
           if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
             const entries: ToggleEntry[] = itemLabels.map((k) => ({ id: k, primary: itemNames[k] }));
             const initialMarked = itemLabels.filter((k) => displayConfig.items[k]);
-            const ids = await ctx.ui.custom<string[] | null>(
-              (_tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+            await ctx.ui.custom<string[] | null>(
+              (tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
                 new ToggleSelectorComponent(
+                  tui,
                   {
                     title: "状态栏显示内容",
                     subtitle: "勾选 = 在 footer 中显示该项",
@@ -2125,17 +2193,17 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                   keybindings,
                   theme,
                   done,
+                  async (ids) => {
+                    const marked = new Set(ids);
+                    displayConfig = {
+                      ...displayConfig,
+                      items: Object.fromEntries(itemLabels.map((k) => [k, marked.has(k)])) as Record<DisplayKey, boolean>,
+                    };
+                    await saveDisplayConfig(displayConfig);
+                    requestFooterRender?.();
+                  },
                 ),
             );
-            if (ids !== null && ids !== undefined) {
-              const marked = new Set(ids);
-              displayConfig = {
-                ...displayConfig,
-                items: Object.fromEntries(itemLabels.map((k) => [k, marked.has(k)])) as Record<DisplayKey, boolean>,
-              };
-              await saveDisplayConfig(displayConfig);
-              requestFooterRender?.();
-            }
           } else {
             // 非 TUI：保留循环 select 切换
             while (true) {
@@ -2156,8 +2224,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 requestFooterRender?.();
               }
             }
+            ctx.ui.notify("状态栏显示配置已保存", "info");
           }
-          ctx.ui.notify("状态栏显示配置已保存", "info");
         } else if (subChoice === "刷新时间  (当前 " + (tokenConfig?.ttl || 60) + "s)") {
           const input = await ctx.ui.input("输入刷新间隔（秒）", String(tokenConfig?.ttl || 60));
           if (input) {

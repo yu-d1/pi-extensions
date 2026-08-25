@@ -643,6 +643,9 @@ export default function (pi: ExtensionAPI) {
     const target = map.get(choice);
     if (!target) return;
 
+    const ok = await ctx.ui.confirm("确认删除", `确定删除 SSH 连接 ${target.name}（${target.host}）？此操作不可恢复。`);
+    if (!ok) return;
+
     const all = loadConfigs();
     saveConfigs(all.filter((c) => c.id !== target.id));
     ctx.ui.notify(`已删除: ${target.name}`, "success");

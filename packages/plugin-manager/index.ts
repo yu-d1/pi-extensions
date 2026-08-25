@@ -642,24 +642,32 @@ class ToggleSelectorComponent extends Container {
   private footerText: Text;
   private readonly maxVisible = 10;
   private isDirty = false;
+  private saving = false;
+  private saveNote = "";
   private readonly options: ToggleSelectorOptions;
+  private readonly tui: any;
   private readonly keybindings: any;
   private readonly theme: any;
   private readonly done: (result: string[] | null) => void;
+  private readonly onSave?: (ids: string[]) => void | Promise<void>;
 
   constructor(
+    tui: any,
     options: ToggleSelectorOptions,
     entries: ToggleEntry[],
     initialMarked: string[],
     keybindings: any,
     theme: any,
     done: (result: string[] | null) => void,
+    onSave?: (ids: string[]) => void | Promise<void>,
   ) {
     super();
     this.options = options;
+    this.tui = tui;
     this.keybindings = keybindings;
     this.theme = theme;
     this.done = done;
+    this.onSave = onSave;
     this.markedIds = [...initialMarked];
     for (const entry of entries) {
       this.entriesById.set(entry.id, entry);
@@ -704,6 +712,34 @@ class ToggleSelectorComponent extends Container {
     return sorted.map((id) => ({ entry: this.entriesById.get(id) as ToggleEntry, marked: markedSet.has(id) }));
   }
 
+  /** ctrl+s：触发保存但不关闭组件，留在当前界面继续调整；esc 才退出。 */
+  private triggerSave(): void {
+    if (this.saving) return;
+    if (!this.onSave) {
+      this.done([...this.markedIds]);
+      return;
+    }
+    this.saving = true;
+    this.saveNote = "";
+    this.footerText.setText(this.theme.fg("dim", "  保存中..."));
+    const ids = [...this.markedIds];
+    Promise.resolve()
+      .then(() => this.onSave!(ids))
+      .then(() => {
+        this.saving = false;
+        this.isDirty = false;
+        this.saveNote = "已保存";
+        this.refresh();
+        this.tui?.requestRender?.();
+      })
+      .catch((e) => {
+        this.saving = false;
+        this.saveNote = `保存失败：${e instanceof Error ? e.message : String(e)}`;
+        this.refresh();
+        this.tui?.requestRender?.();
+      });
+  }
+
   private getFooterText(): string {
     const parts = [
       `${this.keyLabel("tui.select.confirm")} 切换`,
@@ -713,7 +749,7 @@ class ToggleSelectorComponent extends Container {
       "esc 取消",
       `${this.options.countLabel} ${this.markedIds.length}/${this.allIds.length}`,
     ];
-    const text = `  ${parts.join(" · ")}`;
+    const text = `  ${parts.join(" · ")}${this.saveNote ? ` · ${this.saveNote}` : ""}`;
     return this.isDirty ? this.theme.fg("dim", text) + this.theme.fg("warning", " （未保存）") : this.theme.fg("dim", text);
   }
 
@@ -808,7 +844,7 @@ class ToggleSelectorComponent extends Container {
       return;
     }
     if (kb.matches(data, "app.models.save")) {
-      this.done([...this.markedIds]);
+      this.triggerSave();
       return;
     }
     if (matchesKey(data, Key.ctrl("c"))) {
@@ -920,7 +956,7 @@ function applyPluginToggleDiff(
   return { changed, nonSkillChanged };
 }
 
-/** TUI 勾选组件入口：批量编辑启用状态，ctrl+s 统一保存并应用工具过滤 */
+/** TUI 勾选组件入口：批量编辑启用状态，ctrl+s 实时保存并应用工具过滤，留在界面继续调整 */
 async function runPluginToggleComponent(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
@@ -929,9 +965,10 @@ async function runPluginToggleComponent(
 ) {
   const { entries, meta } = collectPluginEntries(config, manifest);
   const initialMarked = entries.filter((e) => !isEntryDisabled(config, meta, e.id)).map((e) => e.id);
-  const ids = await ctx.ui.custom<string[] | null>(
-    (_tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+  await ctx.ui.custom<string[] | null>(
+    (tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
       new ToggleSelectorComponent(
+        tui,
         {
           title: "插件管理",
           subtitle: "勾选 = 启用该来源的工具；未勾选的不注入上下文",
@@ -942,19 +979,17 @@ async function runPluginToggleComponent(
         keybindings,
         theme,
         done,
+        async (ids) => {
+          const { changed, nonSkillChanged } = applyPluginToggleDiff(config, meta, new Set(ids));
+          if (changed > 0) {
+            cachedConfig = config;
+            await saveConfig(config);
+            if (nonSkillChanged > 0) applyToolFilter(pi, config);
+            ctx.ui.setStatus("plugin-manager", getFooterStatus());
+          }
+        },
       ),
   );
-  if (ids === null || ids === undefined) return; // 取消
-  const { changed, nonSkillChanged } = applyPluginToggleDiff(config, meta, new Set(ids));
-  if (changed === 0) {
-    ctx.ui.notify("没有变更", "info");
-    return;
-  }
-  cachedConfig = config;
-  await saveConfig(config);
-  if (nonSkillChanged > 0) applyToolFilter(pi, config);
-  const enabledCount = ids.length;
-  ctx.ui.notify(`已保存：启用 ${enabledCount} / 共 ${entries.length} 个来源（变更 ${changed} 处）。`, "info");
   ctx.ui.setStatus("plugin-manager", getFooterStatus());
 }
 

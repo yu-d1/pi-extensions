@@ -1279,6 +1279,14 @@ async function manageWorkspaces(ctx: any): Promise<boolean> {
   } else if (opChoice.startsWith("🗑️")) {
     // 删除：从 config 彻底移除，根据全局配置决定是否清数据
     const wasActive = activeWorkspace && path.resolve(selectedWs) === activeWorkspace;
+    const willClear = config.clearDataOnRemoveWorkspace;
+    const ok = await ctx.ui.confirm(
+      "确认删除工作区",
+      willClear
+        ? `确定删除 ${selectedWs}？将同时清除该工作区的队列与快照数据，不可恢复。`
+        : `确定从列表移除 ${selectedWs}？（数据保留）`,
+    );
+    if (!ok) return false;
     const result = removeWorkspace(selectedWs);
     if (wasActive) {
       activeWorkspace = null;

@@ -392,17 +392,19 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(`已删除: ${target.name}`, "success");
   };
 
-  // ── 选择数据库后操作菜单 ────────────────────────
+  // ── 选择数据库后操作菜单（循环，执行后留在当前界面）───
   const showDbActions = async (ctx: any, config: DbConfig) => {
+    while (true) {
     const actions = [
       "📝 执行查询",
       "📋 列出表",
       "🔍 查看详情",
       "✏️ 编辑",
       "🗑️ 删除",
+      "← 返回",
     ];
     const choice = await ctx.ui.select(`选择操作 - ${config.name}`, actions);
-    if (!choice) return;
+    if (!choice || choice === "← 返回") return;
 
     if (choice === "📝 执行查询") {
       const sql = (await ctx.ui.input("输入 SQL 语句", ""))?.trim();
@@ -454,10 +456,12 @@ export default function (pi: ExtensionAPI) {
       await editDbConfig(ctx, config);
     } else if (choice === "🗑️ 删除") {
       const ok = await ctx.ui.confirm("确认删除", `确定删除数据库连接 ${config.name}？`);
-      if (!ok) return;
+      if (!ok) continue;
       const all = loadConfigs();
       saveConfigs(all.filter((c) => c.id !== config.id));
       ctx.ui.notify(`已删除: ${config.name}`, "success");
+      return;
+    }
     }
   };
 
@@ -743,7 +747,7 @@ export default function (pi: ExtensionAPI) {
       if (!sub) {
         // 导航菜单：查看 / 编辑 / 新增 / 删除 / 设置
         const navActions = [
-          "📋 查看连接",
+          "📋 打开连接",
           "✏️ 编辑连接",
           "➕ 新增连接",
           "🗑️ 删除连接",
@@ -754,7 +758,7 @@ export default function (pi: ExtensionAPI) {
 
         if (navChoice === "⚙️ 设置") {
           await showPluginConfigMenu(ctx);
-        } else if (navChoice === "📋 查看连接") {
+        } else if (navChoice === "📋 打开连接") {
           const config = await selectDbConfig(ctx, configs, "选择连接");
           if (config) await showDbActions(ctx, config);
         } else if (navChoice === "✏️ 编辑连接") {

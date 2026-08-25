@@ -915,7 +915,7 @@ async function openMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise
 		return;
 	}
 	const choice = await ctx.ui.select("sub 子进程", [
-		"配置子进程（启用/模型/思考等级）",
+		"配置子进程",
 		"新增子进程",
 		"通用设置",
 		"删除子进程",
@@ -993,29 +993,26 @@ async function flowConfig(ctx: ExtensionCommandContext): Promise<void> {
 		if (!def) continue;
 
 		for (;;) {
-			const cur = `当前：${def.enabled ? "启用" : "停用"}，模型=${def.model || "未配置"}，思考=${def.thinking || "默认"}`;
 			const doneFields = "✅ 完成当前子进程";
-			const field = await ctx.ui.select(`配置「${def.name}」（${cur}）`, [
-				"enabled（是否启用）",
-				"model（后端模型）",
-				"thinking（思考等级）",
+			const field = await ctx.ui.select(`配置「${def.name}」`, [
+				`是否启用（当前：${def.enabled ? "启用" : "停用"}，选择即切换）`,
+				`后端模型（当前：${def.model || "未配置"}）`,
+				`思考等级（当前：${def.thinking || "默认"}）`,
 				doneFields,
 			]);
 			if (!field || field === doneFields) break;
 
-			if (field.startsWith("enabled")) {
-				const value = await ctx.ui.select(`是否启用「${def.name}」`, ["启用", "停用"]);
-				if (!value) continue;
-				const final = value === "启用" ? "true" : "false";
+			if (field.startsWith("是否启用")) {
+				const final = def.enabled ? "false" : "true";
 				if (!updateAgentField(def, "enabled", final)) {
 					ctx.ui.notify(`无法保存 ${def.name} 的启用状态`, "error");
 					continue;
 				}
-				ctx.ui.notify(`${def.name} 已${value}`, "info");
+				ctx.ui.notify(`${def.name} 已${final === "true" ? "启用" : "停用"}`, "info");
 				continue;
 			}
 
-			if (field.startsWith("model")) {
+			if (field.startsWith("后端模型")) {
 				const available = await loadAvailableModels(ctx);
 				if (available.length === 0) continue;
 				const options = available.map((m) => `${m.provider}/${m.id}`);

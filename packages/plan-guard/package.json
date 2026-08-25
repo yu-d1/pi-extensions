@@ -1,6 +1,6 @@
 {
   "name": "@liziy/plan-guard",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Tab 键切换计划/执行模式 + 内嵌 Todo 面板与提问对话框（/plan config 开关）",
   "keywords": [
     "pi-extension",

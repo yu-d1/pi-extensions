@@ -1,6 +1,6 @@
 {
   "name": "@liziy/plugin-manager",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "MCP/扩展/技能 启用状态管理 —— 按 source 自动发现工具集合，关闭不需要的能力以节省上下文 token",
   "keywords": [
     "pi-extension",

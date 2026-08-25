@@ -1341,7 +1341,7 @@ async function addCommonFlow(ctx: any): Promise<void> {
 	}
 
 	const apiOptions = COMMON_API_OPTIONS.map((option) =>
-		`${option.label}（${option.api}）  示例：${option.example}  ——  ${option.description}`,
+		`${option.label}（${option.api}）· ${option.description}`,
 	);
 	apiOptions.push("取消");
 	const apiChoice = await ctx.ui.select("选择请求格式", apiOptions);
@@ -1373,7 +1373,7 @@ async function addCommonFlow(ctx: any): Promise<void> {
 	}
 	await saveStore();
 	ctx.ui.notify(
-		`已添加供应商：${entry.name}\n请求格式：${selected.label}\n请求地址前缀：${entry.baseUrl}\n\n请先执行 /login ${entry.name} 完成认证，再到“模型管理→刷新拉取”获取模型。\n也可以直接手动添加模型 id。`,
+		`已添加供应商 ${entry.name}。${selected.label} · ${entry.baseUrl}\n下一步：/login ${entry.name} 认证后刷新模型，或直接新增模型。`,
 		"info",
 	);
 }
@@ -1403,7 +1403,7 @@ async function editCommonFlow(ctx: any): Promise<void> {
 
 	const newName = (await ctx.ui.input(`供应商名称（当前：${entry.name}）`, entry.name))?.trim() || entry.name;
 	const apiOptions = COMMON_API_OPTIONS.map((option) =>
-		`${option.label}（${option.api}）  示例：${option.example}  ——  ${option.description}`,
+		`${option.label}（${option.api}）· ${option.description}`,
 	);
 	apiOptions.push("取消");
 	const currentOption = COMMON_API_OPTIONS.find((option) => option.api === entry.api) ?? COMMON_API_OPTIONS[0];
@@ -1474,7 +1474,7 @@ async function refreshCommonModels(ctx: any, entry: CommonEntry): Promise<void> 
 		}
 		ctx.ui.notify(message, "info");
 	} catch (e) {
-		ctx.ui.notify(`刷新失败：${e instanceof Error ? e.message : String(e)}\n可直接手动添加模型 id。`, "error");
+		ctx.ui.notify(`刷新失败：${e instanceof Error ? e.message : String(e)}\n可在“新增模型”中手动添加。`, "error");
 	} finally {
 		ctx.ui.setStatus("model-provider", undefined);
 	}
@@ -1556,7 +1556,7 @@ async function editModelContextFlow(ctx: any, entry: CommonEntry): Promise<void>
 
 /**
  * 批量设置图片读取能力：勾选 = 支持图片输入（文本 + 图片），未勾选 = 仅文本。
- * TUI 模式使用勾选组件，其它模式降级为 select 循环。
+ * ctrl+s 保存后留在界面，esc 退出。
  */
 async function editModelInputFlow(ctx: any, entry: CommonEntry): Promise<void> {
 	if (entry.models.length === 0) {
@@ -1564,11 +1564,18 @@ async function editModelInputFlow(ctx: any, entry: CommonEntry): Promise<void> {
 		return;
 	}
 	const supportsImage = (model: StoredModel) => (model.input ?? ["text", "image"]).includes("image");
-	let result: Set<string> | null | undefined;
+	const apply = async (ids: Set<string>) => {
+		for (const model of entry.models) {
+			model.input = ids.has(model.id) ? ["text", "image"] : ["text"];
+		}
+		if (api) unregisterAndReRegister(api, entry.name, entry);
+		await saveStore();
+	};
 	if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
-		const ids = await ctx.ui.custom<string[] | null>(
-			(_tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+		await ctx.ui.custom<string[] | null>(
+			(tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
 				new ModelToggleSelectorComponent(
+					tui,
 					{
 						title: `图片读取：${entry.name}`,
 						subtitle: "勾选表示支持图片输入（文本 + 图片），未勾选为仅文本",
@@ -1579,23 +1586,17 @@ async function editModelInputFlow(ctx: any, entry: CommonEntry): Promise<void> {
 					keybindings,
 					theme,
 					done,
+					(ids) => apply(new Set(ids)),
 				),
 		);
-		result = ids === null ? null : new Set(ids);
 	} else {
-		result = await toggleViaSelectFallback(ctx, entry, {
+		await toggleViaSelectFallback(ctx, entry, {
 			title: `图片读取：${entry.name}`,
 			countLabel: "支持图片",
 			isMarked: supportsImage,
+			apply,
 		});
 	}
-	if (result === null || result === undefined) return; // 取消
-	for (const model of entry.models) {
-		model.input = result.has(model.id) ? ["text", "image"] : ["text"];
-	}
-	if (api) unregisterAndReRegister(api, entry.name, entry);
-	await saveStore();
-	ctx.ui.notify(`已更新 ${entry.name}：${result.size} / 共 ${entry.models.length} 个模型支持图片输入。`, "info");
 }
 
 // =============================================================================
@@ -1634,24 +1635,32 @@ class ModelToggleSelectorComponent extends Container {
 	private footerText: Text;
 	private readonly maxVisible = 8;
 	private isDirty = false;
+	private saving = false;
+	private saveNote = "";
 	private readonly options: ModelToggleSelectorOptions;
+	private readonly tui: any;
 	private readonly keybindings: any;
 	private readonly theme: any;
 	private readonly done: (result: string[] | null) => void;
+	private readonly onSave?: (ids: string[]) => void | Promise<void>;
 
 	constructor(
+		tui: any,
 		options: ModelToggleSelectorOptions,
 		models: StoredModel[],
 		initialEnabled: string[],
 		keybindings: any,
 		theme: any,
 		done: (result: string[] | null) => void,
+		onSave?: (ids: string[]) => void | Promise<void>,
 	) {
 		super();
 		this.options = options;
+		this.tui = tui;
 		this.keybindings = keybindings;
 		this.theme = theme;
 		this.done = done;
+		this.onSave = onSave;
 		this.enabledIds = [...initialEnabled];
 		for (const model of models) {
 			this.modelsById.set(model.id, model);
@@ -1696,6 +1705,34 @@ class ModelToggleSelectorComponent extends Container {
 		return sorted.map((id) => ({ id, model: this.modelsById.get(id) as StoredModel, enabled: enabledSet.has(id) }));
 	}
 
+	/** ctrl+s：触发保存但不关闭组件，留在当前界面继续调整；esc 才退出。 */
+	private triggerSave(): void {
+		if (this.saving) return;
+		if (!this.onSave) {
+			this.done([...this.enabledIds]);
+			return;
+		}
+		this.saving = true;
+		this.saveNote = "";
+		this.footerText.setText(this.theme.fg("dim", "  保存中..."));
+		const ids = [...this.enabledIds];
+		Promise.resolve()
+			.then(() => this.onSave!(ids))
+			.then(() => {
+				this.saving = false;
+				this.isDirty = false;
+				this.saveNote = "已保存";
+				this.refresh();
+				this.tui?.requestRender?.();
+			})
+			.catch((e) => {
+				this.saving = false;
+				this.saveNote = `保存失败：${e instanceof Error ? e.message : String(e)}`;
+				this.refresh();
+				this.tui?.requestRender?.();
+			});
+	}
+
 	private getFooterText(): string {
 		const parts = [
 			`${this.keyLabel("tui.select.confirm")} 切换`,
@@ -1705,7 +1742,7 @@ class ModelToggleSelectorComponent extends Container {
 			"esc 取消",
 			`${this.options.countLabel} ${this.enabledIds.length}/${this.allIds.length}`,
 		];
-		const text = `  ${parts.join(" · ")}`;
+		const text = `  ${parts.join(" · ")}${this.saveNote ? ` · ${this.saveNote}` : ""}`;
 		return this.isDirty ? this.theme.fg("dim", text) + this.theme.fg("warning", " （未保存）") : this.theme.fg("dim", text);
 	}
 
@@ -1799,7 +1836,7 @@ class ModelToggleSelectorComponent extends Container {
 			return;
 		}
 		if (kb.matches(data, "app.models.save")) {
-			this.done([...this.enabledIds]);
+			this.triggerSave();
 			return;
 		}
 		if (matchesKey(data, Key.ctrl("c"))) {
@@ -1823,13 +1860,13 @@ class ModelToggleSelectorComponent extends Container {
 
 /**
  * 非 TUI 模式（rpc/print 等）的降级勾选方式：循环单选模拟多选框。
- * 返回被勾选的模型 id 集合；null 表示取消。由调用方决定集合的含义与应用方式。
+ * “保存”后留在当前界面继续调整，“返回”才退出；由 apply 回调执行持久化。
  */
 async function toggleViaSelectFallback(
 	ctx: any,
 	entry: CommonEntry,
-	opts: { title: string; countLabel: string; isMarked: (model: StoredModel) => boolean },
-): Promise<Set<string> | null> {
+	opts: { title: string; countLabel: string; isMarked: (model: StoredModel) => boolean; apply: (ids: Set<string>) => void | Promise<void> },
+): Promise<void> {
 	const marked = new Set(entry.models.filter((m) => opts.isMarked(m)).map((m) => m.id));
 	while (true) {
 		entry.models = sortModels(entry.models);
@@ -1837,11 +1874,15 @@ async function toggleViaSelectFallback(
 			const mark = marked.has(model.id) ? "[✓]" : "[ ]";
 			return `${mark} ${model.id}  [上下文 ${formatContextWindow(model.contextWindow)}]  [${inputModeText(model.input)}]`;
 		});
-		options.push("保存并返回", "全部勾选", "全部取消", "取消（不保存）");
+		options.push("保存", "全部勾选", "全部取消", "返回");
 		const title = `${opts.title}（${opts.countLabel} ${marked.size}/${entry.models.length}，选择条目即切换勾选）`;
 		const choice = await ctx.ui.select(title, options);
-		if (!choice || choice === "取消（不保存）") return null;
-		if (choice === "保存并返回") return marked;
+		if (!choice || choice === "返回") return;
+		if (choice === "保存") {
+			await opts.apply(new Set(marked));
+			ctx.ui.notify(`已保存：${opts.countLabel} ${marked.size}/${entry.models.length}。`, "info");
+			continue;
+		}
 		if (choice === "全部勾选") {
 			for (const model of entry.models) marked.add(model.id);
 			continue;
@@ -1858,7 +1899,7 @@ async function toggleViaSelectFallback(
 
 /**
  * 多选勾选入口：TUI 模式使用与内置 /scoped-models 一致的交互组件，
- * 其它模式降级为 select 循环。保存后未勾选的模型不再注册到 pi。
+ * 其它模式降级为 select 循环。ctrl+s 保存后留在界面，esc 退出。
  */
 async function toggleModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 	if (entry.models.length === 0) {
@@ -1866,11 +1907,16 @@ async function toggleModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 		return;
 	}
 	entry.models = sortModels(entry.models);
-	let result: Set<string> | null | undefined;
+	const apply = async (ids: Set<string>) => {
+		entry.models = sortModels(entry.models.map((m) => ({ ...m, enabled: ids.has(m.id) })));
+		if (api) unregisterAndReRegister(api, entry.name, entry);
+		await saveStore();
+	};
 	if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
-		const ids = await ctx.ui.custom<string[] | null>(
-			(_tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+		await ctx.ui.custom<string[] | null>(
+			(tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
 				new ModelToggleSelectorComponent(
+					tui,
 					{
 						title: `启用模型：${entry.name}`,
 						subtitle: "勾选的模型显示在 /model 中",
@@ -1881,29 +1927,29 @@ async function toggleModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 					keybindings,
 					theme,
 					done,
+					(ids) => apply(new Set(ids)),
 				),
 		);
-		result = ids === null ? null : new Set(ids);
 	} else {
-		result = await toggleViaSelectFallback(ctx, entry, {
+		await toggleViaSelectFallback(ctx, entry, {
 			title: `勾选启用的模型：${entry.name}`,
 			countLabel: "已启用",
 			isMarked: isModelEnabled,
+			apply,
 		});
 	}
-	if (result === null || result === undefined) return; // 取消
-	entry.models = sortModels(entry.models.map((m) => ({ ...m, enabled: result!.has(m.id) })));
-	if (api) unregisterAndReRegister(api, entry.name, entry);
-	await saveStore();
-	ctx.ui.notify(
-		`已保存 ${entry.name}：启用 ${result!.size} / 共 ${entry.models.length} 个模型；未勾选的模型不再显示在 /model 中。`,
-		"info",
-	);
 }
 
+/** 模型管理：选供应商后进入操作循环；“返回供应商列表”回到选择，便于连续管理多个供应商 */
 async function modelsMenu(ctx: any): Promise<void> {
-	const entry = await selectCommon(ctx, "选择供应商以管理模型");
-	if (!entry) return;
+	while (true) {
+		const entry = await selectCommon(ctx, "管理模型：选择供应商");
+		if (!entry) return;
+		await modelOpsMenu(ctx, entry);
+	}
+}
+
+async function modelOpsMenu(ctx: any, entry: CommonEntry): Promise<void> {
 	while (true) {
 		const enabledCount = entry.models.filter(isModelEnabled).length;
 		const action = await ctx.ui.select(`模型管理：${entry.name}（启用 ${enabledCount} / 共 ${entry.models.length} 个）`, [
@@ -1912,9 +1958,9 @@ async function modelsMenu(ctx: any): Promise<void> {
 			"新增模型",
 			"修改上下文窗口",
 			"是否支持图片读取",
-			"返回",
+			"返回供应商列表",
 		]);
-		if (!action || action === "返回") return;
+		if (!action || action === "返回供应商列表") return;
 		if (action === "启用模型") await toggleModelsFlow(ctx, entry);
 		else if (action === "刷新模型") await refreshCommonModels(ctx, entry);
 		else if (action === "新增模型") await addModelsFlow(ctx, entry);
@@ -1923,32 +1969,24 @@ async function modelsMenu(ctx: any): Promise<void> {
 	}
 }
 
-async function providerMenu(ctx: any): Promise<void> {
-	while (true) {
-		const commons = getCommonEntries();
-		const options = commons.length > 0 ? ["管理模型", "添加供应商", "编辑供应商", "删除供应商"] : ["添加供应商"];
-		options.push("返回");
-		const action = await ctx.ui.select("Common 供应商", options);
-		if (!action || action === "返回") return;
-		if (action === "添加供应商") await addCommonFlow(ctx);
-		else if (action === "编辑供应商") await editCommonFlow(ctx);
-		else if (action === "删除供应商") await removeCommonFlow(ctx);
-		else if (action === "管理模型") await modelsMenu(ctx);
-	}
-}
-
 async function modelProviderCommand(_args: string, ctx: any): Promise<void> {
 	await loadStore();
 	while (true) {
 		const action = await ctx.ui.select("模型提供", [
-			"Common 供应商",
-			"MiniMax 内置配置",
+			"管理模型",
+			"添加供应商",
+			"编辑供应商",
+			"删除供应商",
+			"MiniMax 配置",
 			"查看全部供应商",
 			"返回",
 		]);
 		if (!action || action === "返回") return;
-		if (action === "Common 供应商") await providerMenu(ctx);
-		else if (action === "MiniMax 内置配置") await minimaxMenu(ctx);
+		if (action === "管理模型") await modelsMenu(ctx);
+		else if (action === "添加供应商") await addCommonFlow(ctx);
+		else if (action === "编辑供应商") await editCommonFlow(ctx);
+		else if (action === "删除供应商") await removeCommonFlow(ctx);
+		else if (action === "MiniMax 配置") await minimaxMenu(ctx);
 		else if (action === "查看全部供应商") ctx.ui.notify(listProvidersText(), "info");
 	}
 }

@@ -1,6 +1,6 @@
 {
   "name": "@liziy/ssh-manager",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "AI 远程操作服务器扩展 —— 添加/编辑/删除 SSH 连接，AI 通过 ssh_exec 远程执行命令，受权限控制",
   "keywords": [
     "pi-extension",
