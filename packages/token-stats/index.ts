@@ -127,6 +127,7 @@ interface QuotaCache {
 
 export type ContextStyle = "pct-window" | "used-window" | "pct" | "used" | "bar";
 export type SpeedStyle = "t/s" | "tok/s" | "T/s" | "liveAt";
+export type QuotaStyle = "compact" | "with-clock" | "nearest-clock" | "with-clock-short" | "nearest-clock-short";
 
 export type DisplayKey =
   | "input"       // 输入（累计输入数 ↑）
@@ -136,14 +137,14 @@ export type DisplayKey =
   | "speed"       // 速度（tok/s）
   | "context"     // 容量（🧠 ctx%）
   | "quota5h"     // 5h 额度
-  | "quotaWeek"   // 周额度
-  | "quotaClock"   // 刷新时间（⏱）
-  | "thinking";    // 思考强度（TH）
+  | "quotaWeek"   // 周额度（各自包含对应刷新倒计时）
+  | "thinking";   // 思考强度（TH）
 
 export interface DisplayConfig {
   items: Record<DisplayKey, boolean>;
   contextStyle: ContextStyle;
   speedStyle: SpeedStyle;
+  quotaStyle: QuotaStyle;
 }
 
 
@@ -470,27 +471,16 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
       const fullDisplay = quotaState.display;
       const filteredParts: string[] = [];
       if (cfg.quota5h) {
-      const m = fullDisplay.match(/\b5h:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
-      if (m) filteredParts.push(m[0]);
+        const m = fullDisplay.match(/\b5h:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
+        if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaWeek) {
-      const m = fullDisplay.match(/\bW:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
-      if (m) filteredParts.push(m[0]);
-      }
-      if (cfg.quotaClock) {
-        // 倒计时已随 5h/W 段显示；仅当对应段被关闭时才单独补出
-        if (!cfg.quota5h || !cfg.quotaWeek) {
-          for (const m of fullDisplay.matchAll(/⏱\s*\d+[dhm](?:\s*\d+[dhm])*/g)) {
-            const attached = cfg.quota5h && /5h/.test(fullDisplay.slice(Math.max(0, m.index! - 30), m.index!))
-              ? !cfg.quota5h : cfg.quotaWeek && /W:/.test(fullDisplay.slice(Math.max(0, m.index! - 30), m.index!))
-              ? !cfg.quotaWeek : true;
-            if (attached) filteredParts.push(m[0].trim());
-          }
-        }
+        const m = fullDisplay.match(/\bW:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
+        if (m) filteredParts.push(m[0]);
       }
       if (filteredParts.length > 0) {
         parts.push(qColor(prefix + filteredParts.join(" | ")));
-      } else if (cfg.quota5h || cfg.quotaWeek || cfg.quotaClock) {
+      } else if (cfg.quota5h || cfg.quotaWeek) {
         // 余额型套餐（DeepSeek ¥xx.x 等）不含 5h/W/⏱ 字段，
         // 子项过滤匹配不到任何内容时回退显示完整 display，避免配额段静默消失
         parts.push(qColor(prefix + fullDisplay));
@@ -739,11 +729,11 @@ const DEFAULT_DISPLAY_CONFIG: DisplayConfig = {
     context: true,
     quota5h: true,
     quotaWeek: true,
-    quotaClock: true,
     thinking: true,
   },
   contextStyle: "pct-window",
   speedStyle: "t/s",
+  quotaStyle: "with-clock",
 };
 
 let displayConfig: DisplayConfig = { ...DEFAULT_DISPLAY_CONFIG, items: { ...DEFAULT_DISPLAY_CONFIG.items } };
@@ -1015,15 +1005,49 @@ function formatDuration(ms: number): string {
   return `${mins}m`;
 }
 
-function formatTokenPlanDisplay(intervalRemaining: number, weeklyRemaining: number, nearestResetMs?: number | null): string {
-  let display = `5h: ${intervalRemaining.toFixed(2)}% W: ${weeklyRemaining.toFixed(2)}%`;
-  if (nearestResetMs && nearestResetMs > 0) {
-    const diff = nearestResetMs - Date.now();
-    if (diff > 0 && diff < 30 * 24 * 60 * 60 * 1000) {
-      display += ` ⏱  ${formatDuration(diff)}`;
-    }
+function formatShortDuration(ms: number): string {
+  if (ms <= 0) return "";
+  if (ms >= 24 * 60 * 60 * 1000) return `${Math.floor(ms / (24 * 60 * 60 * 1000))}d`;
+  if (ms >= 60 * 60 * 1000) return `${Math.floor(ms / (60 * 60 * 1000))}h`;
+  return `${Math.floor(ms / (60 * 1000))}m`;
+}
+
+function formatTokenPlanDisplay(
+  intervalRemaining: number,
+  weeklyRemaining: number,
+  intervalResetMs?: number | null,
+  weeklyResetMs?: number | null,
+  style: QuotaStyle = "with-clock",
+): string {
+  const formatPercent = (value: number) => `${value.toFixed(2)}%`;
+  const formatClock = (resetMs?: number | null) => {
+    if (!resetMs || resetMs <= 0) return "";
+    const diff = resetMs - Date.now();
+    return diff > 0 && diff < 30 * 24 * 60 * 60 * 1000
+      ? ` ⏱ ${formatDuration(diff)}`
+      : "";
+  };
+  const interval = `5h: ${formatPercent(intervalRemaining)}`;
+  const weekly = `W: ${formatPercent(weeklyRemaining)}`;
+  const shortClock = (resetMs?: number | null) => {
+    if (!resetMs || resetMs <= 0) return "";
+    const diff = resetMs - Date.now();
+    return diff > 0 && diff < 30 * 24 * 60 * 60 * 1000
+      ? ` ⏱ ${formatShortDuration(diff)}`
+      : "";
+  };
+  if (style === "compact") return `${interval} ${weekly}`;
+  if (style === "nearest-clock" || style === "nearest-clock-short") {
+    const resets = [intervalResetMs, weeklyResetMs].filter(
+      (value): value is number => typeof value === "number" && value > Date.now(),
+    );
+    const nearest = resets.length > 0 ? Math.min(...resets) : null;
+    const clock = style === "nearest-clock-short" ? shortClock(nearest) : formatClock(nearest);
+    return `${interval} ${weekly}${clock}`;
   }
-  return display;
+  const intervalClock = style === "with-clock-short" ? shortClock(intervalResetMs) : formatClock(intervalResetMs);
+  const weeklyClock = style === "with-clock-short" ? shortClock(weeklyResetMs) : formatClock(weeklyResetMs);
+  return `${interval}${intervalClock} ${weekly}${weeklyClock}`;
 }
 
 const BUILTIN_PLANS: TokenPlan[] = [
@@ -1059,11 +1083,11 @@ const BUILTIN_PLANS: TokenPlan[] = [
       const intervalRemaining = m.current_interval_remaining_percent ?? 0;
       const weeklyRemaining = m.current_weekly_remaining_percent ?? 0;
       const now = Date.now();
-      const resets = [m.end_time, m.weekly_end_time].filter((t: any) => typeof t === "number" && t > now);
-      const nearestReset = resets.length > 0 ? Math.min(...resets) : null;
+      const intervalReset = typeof m.end_time === "number" && m.end_time > now ? m.end_time : null;
+      const weeklyReset = typeof m.weekly_end_time === "number" && m.weekly_end_time > now ? m.weekly_end_time : null;
       return {
         modelPrefix: "",
-        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, nearestReset),
+        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, displayConfig.quotaStyle),
         color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
       };
     },
@@ -1095,13 +1119,11 @@ const BUILTIN_PLANS: TokenPlan[] = [
       const intervalRemaining = 100 - (fiveHour?.percentage ?? 0);
       const weeklyRemaining = 100 - (weekly?.percentage ?? 0);
       const now = Date.now();
-      const resets = tokenLimits
-        .map((x: any) => x.nextResetTime)
-        .filter((t: any) => typeof t === "number" && t > now);
-      const nearestReset = resets.length > 0 ? Math.min(...resets) : null;
+      const intervalReset = typeof fiveHour?.nextResetTime === "number" && fiveHour.nextResetTime > now ? fiveHour.nextResetTime : null;
+      const weeklyReset = typeof weekly?.nextResetTime === "number" && weekly.nextResetTime > now ? weekly.nextResetTime : null;
       return {
         modelPrefix: "",
-        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, nearestReset),
+        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, displayConfig.quotaStyle),
         color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
       };
     },
@@ -1152,14 +1174,9 @@ const BUILTIN_PLANS: TokenPlan[] = [
         }
       }
       if (intervalRemaining >= 100 && weeklyRemaining >= 100) return { modelPrefix: "", display: "无数据", color: "err" as const };
-      const cd = (ms: number | null) => {
-        if (!ms) return "";
-        const diff = ms - Date.now();
-        return diff > 0 && diff < 30 * 24 * 60 * 60 * 1000 ? ` ⏱  ${formatDuration(diff)}` : "";
-      };
       return {
         modelPrefix: "",
-        display: `5h: ${intervalRemaining.toFixed(2)}%${cd(intervalReset)} W: ${weeklyRemaining.toFixed(2)}%${cd(weeklyReset)}`,
+        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, displayConfig.quotaStyle),
         color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
       };
     },
@@ -1238,6 +1255,7 @@ async function loadDisplayConfig(): Promise<DisplayConfig> {
       }
       if (isContextStyle(saved.contextStyle)) merged.contextStyle = saved.contextStyle;
       if (isSpeedStyle(saved.speedStyle)) merged.speedStyle = saved.speedStyle;
+      if (isQuotaStyle(saved.quotaStyle)) merged.quotaStyle = saved.quotaStyle;
       return merged;
     }
   } catch {}
@@ -1249,6 +1267,9 @@ function isContextStyle(v: unknown): v is ContextStyle {
 }
 function isSpeedStyle(v: unknown): v is SpeedStyle {
   return typeof v === "string" && ["t/s", "tok/s", "T/s", "liveAt"].includes(v);
+}
+function isQuotaStyle(v: unknown): v is QuotaStyle {
+  return typeof v === "string" && ["compact", "with-clock", "nearest-clock", "with-clock-short", "nearest-clock-short"].includes(v);
 }
 
 async function saveDisplayConfig(cfg: DisplayConfig) {
@@ -1276,14 +1297,12 @@ async function writeQuotaCache(cache: QuotaCache) {
 // ── 匹配逻辑 ───────────────────────────────────────────
 
 function resolveActivePlan(provider?: string): TokenPlan | null {
-  if (!tokenConfig) return null;
-  const planId = provider ? (tokenConfig.providerPlans[provider] ?? null) : null;
-  if (planId) return BUILTIN_PLANS.find(p => p.id === planId) || null;
-  // ponytail: 无显式映射时按 matchProviders 模糊兜底（如 kimi-coding 命中 kimi 套餐），扩展更新后需重打此补丁
-  if (provider) {
-    return BUILTIN_PLANS.find(p => p.matchProviders.some(m => provider === m || provider.startsWith(m + "-") || provider.startsWith(m))) || null;
-  }
-  return null;
+  if (!tokenConfig || !provider) return null;
+  // 套餐必须按当前 provider 显式选择；保留 matchProviders 仅用于旧配置兼容，
+  // 不再根据 provider 名称自动推断，避免误匹配或绕过用户明确关闭的配置。
+  const planId = tokenConfig.providerPlans[provider];
+  if (!planId) return null;
+  return BUILTIN_PLANS.find((p) => p.id === planId) ?? null;
 }
 
 function readAuthEntry(providerId: string): any | null {
@@ -2119,28 +2138,28 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       // 无参 → 主菜单：统计查询不再需要记参数，套餐/配置入口也在这里
       if (!arg) {
         const main = await ctx.ui.select("Token 统计", [
-          "📊 今日统计",
-          "📊 按小时分布（今日）",
-          "📊 本周汇总",
-          "📊 月度汇总",
+          "⚙️  状态栏配置",
           "📦 套餐配额配置",
-          "⚙️ 状态栏配置",
+          "📊 统计查询",
         ]);
         if (!main) return;
-        if (main.startsWith("📊 今日")) {
-          await showDay(getDateStr(), ctx, pi);
-          return;
-        }
-        if (main.startsWith("📊 按小时")) {
-          await showHourly(getDateStr(), ctx, pi);
-          return;
-        }
-        if (main.startsWith("📊 本周")) {
-          await showWeek(ctx, pi);
-          return;
-        }
-        if (main.startsWith("📊 月度")) {
-          await showMonth(getMonthStr(), ctx, pi);
+        if (main.startsWith("📊")) {
+          const report = await ctx.ui.select("📊 统计查询", [
+            "📊 今日统计",
+            "📊 按小时分布（今日）",
+            "📊 本周汇总",
+            "📊 月度汇总",
+          ]);
+          if (!report) return;
+          if (report.startsWith("📊 今日")) {
+            await showDay(getDateStr(), ctx, pi);
+          } else if (report.startsWith("📊 按小时")) {
+            await showHourly(getDateStr(), ctx, pi);
+          } else if (report.startsWith("📊 本周")) {
+            await showWeek(ctx, pi);
+          } else if (report.startsWith("📊 月度")) {
+            await showMonth(getMonthStr(), ctx, pi);
+          }
           return;
         }
         if (main.startsWith("📦")) arg = "plan";
@@ -2221,20 +2240,23 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       }
 
       if (arg === "config") {
+        configMenu: while (true) {
         const subChoice = await ctx.ui.select("Token 统计配置", [
           "显示样式",
           "显示内容",
-          "刷新时间  (当前 " + (tokenConfig?.ttl || 60) + "s)",
+          "查询间隔  (当前 " + (tokenConfig?.ttl || 60) + "s)",
           "🔍 联网搜索",
         ]);
         if (!subChoice) return;
 
         if (subChoice === "显示样式") {
+          styleCategoryMenu: while (true) {
           const catChoice = await ctx.ui.select("选择要配置的样式类别", [
             "🧠 上下文样式",
             "⚡ 速率样式",
+            "📦 配额样式",
           ]);
-          if (!catChoice) return;
+          if (!catChoice) break styleCategoryMenu;
 
           if (catChoice === "🧠 上下文样式") {
             const items: { label: string; value: ContextStyle; preview: string }[] = [
@@ -2260,7 +2282,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 requestFooterRender?.();
               }
             }
-          } else {
+          } else if (catChoice === "⚡ 速率样式") {
             const items: { label: string; value: SpeedStyle; preview: string }[] = [
               { label: "t/s", value: "t/s", preview: `⚡77.7 t/s` },
               { label: "tok/s", value: "tok/s", preview: `⚡77.7 tok/s` },
@@ -2283,16 +2305,43 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 requestFooterRender?.();
               }
             }
+          } else {
+            const items: { label: string; value: QuotaStyle; preview: string }[] = [
+              { label: "compact", value: "compact", preview: `5h: 89% W: 72%` },
+              { label: "with-clock", value: "with-clock", preview: `5h: 89% ⏱ 4h 15m W: 72% ⏱ 2d` },
+              { label: "nearest-clock", value: "nearest-clock", preview: `5h: 89% W: 72% ⏱ 4h 15m` },
+              { label: "with-clock-short", value: "with-clock-short", preview: `5h: 89% ⏱ 4h W: 72% ⏱ 2d` },
+              { label: "nearest-clock-short", value: "nearest-clock-short", preview: `5h: 89% W: 72% ⏱ 4h` },
+            ];
+            const choice = await ctx.ui.select(
+              "📦 配额样式（当前: " + displayConfig.quotaStyle + "）",
+              items.map(i =>
+                (displayConfig.quotaStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview
+              ),
+            );
+            if (choice) {
+              const idx = items.findIndex(i =>
+                (displayConfig.quotaStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview === choice
+              );
+              if (idx >= 0) {
+                displayConfig = { ...displayConfig, quotaStyle: items[idx].value };
+                await saveDisplayConfig(displayConfig);
+                await forceRefreshQuota(ctx);
+                requestFooterRender?.();
+              }
+            }
+          }
+          continue styleCategoryMenu;
           }
         } else if (subChoice === "显示内容") {
           const itemLabels: DisplayKey[] = [
             "input", "output", "totalTokens", "cacheHit", "speed", "context",
-            "quota5h", "quotaWeek", "quotaClock", "thinking",
+            "quota5h", "quotaWeek", "thinking",
           ];
           const itemNames: Record<DisplayKey, string> = {
             input: "输入", output: "输出", totalTokens: "总token",
             cacheHit: "缓存命中", speed: "速度", context: "容量",
-            quota5h: "5h额度", quotaWeek: "周额度", quotaClock: "刷新时间",
+            quota5h: "5h额度（含倒计时）", quotaWeek: "周额度（含倒计时）",
             thinking: "思考强度",
           };
           // TUI 模式：勾选组件批量编辑，ctrl+s 实时保存并刷新 footer，留在界面继续调整
@@ -2346,12 +2395,12 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             }
             ctx.ui.notify("状态栏显示配置已保存", "info");
           }
-        } else if (subChoice === "刷新时间  (当前 " + (tokenConfig?.ttl || 60) + "s)") {
+        } else if (subChoice === "查询间隔  (当前 " + (tokenConfig?.ttl || 60) + "s)") {
           const input = await ctx.ui.input("输入刷新间隔（秒）", String(tokenConfig?.ttl || 60));
           if (input) {
             const sec = parseInt(input, 10);
             if (Number.isNaN(sec) || sec < 10) {
-              ctx.ui.notify("刷新时间必须 >= 10 秒", "warning");
+              ctx.ui.notify("查询间隔必须 >= 10 秒", "warning");
             } else {
               tokenConfig = tokenConfig
                 ? { ...tokenConfig, ttl: sec }
@@ -2366,7 +2415,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 } catch { /* ctx 已失效（session 被替换），忽略 */ }
                 requestFooterRender?.();
               }, sec * 1000);
-              ctx.ui.notify("刷新时间已设为 " + sec + " 秒", "info");
+              ctx.ui.notify("查询间隔已设为 " + sec + " 秒", "info");
             }
           }
         } else if (subChoice === "🔍 联网搜索") {
@@ -2396,6 +2445,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             requestFooterRender?.();
             ctx.ui.notify(next ? "联网搜索已开启" : "联网搜索已关闭", "info");
           }
+        }
+        continue configMenu;
         }
         return;
       }
