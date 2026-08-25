@@ -463,11 +463,11 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
       const fullDisplay = quotaState.display;
       const filteredParts: string[] = [];
       if (cfg.quota5h) {
-      const m = fullDisplay.match(/\b5h:\s+\d+%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
+      const m = fullDisplay.match(/\b5h:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
       if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaWeek) {
-      const m = fullDisplay.match(/\bW:\s+\d+%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
+      const m = fullDisplay.match(/\bW:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
       if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaClock) {
@@ -1008,7 +1008,7 @@ function formatDuration(ms: number): string {
 }
 
 function formatTokenPlanDisplay(intervalRemaining: number, weeklyRemaining: number, nearestResetMs?: number | null): string {
-  let display = `5h: ${Math.round(intervalRemaining)}% W: ${Math.round(weeklyRemaining)}%`;
+  let display = `5h: ${intervalRemaining.toFixed(2)}% W: ${weeklyRemaining.toFixed(2)}%`;
   if (nearestResetMs && nearestResetMs > 0) {
     const diff = nearestResetMs - Date.now();
     if (diff > 0 && diff < 30 * 24 * 60 * 60 * 1000) {
@@ -1151,7 +1151,7 @@ const BUILTIN_PLANS: TokenPlan[] = [
       };
       return {
         modelPrefix: "",
-        display: `5h: ${Math.round(intervalRemaining)}%${cd(intervalReset)} W: ${Math.round(weeklyRemaining)}%${cd(weeklyReset)}`,
+        display: `5h: ${intervalRemaining.toFixed(2)}%${cd(intervalReset)} W: ${weeklyRemaining.toFixed(2)}%${cd(weeklyReset)}`,
         color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
       };
     },
