@@ -28,7 +28,7 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createDeepseekBackend, type SearchBackend } from "./search";
 
 // ── 路径 ──────────────────────────────────────────────────
@@ -1288,6 +1288,57 @@ function readAuthEntry(providerId: string): any | null {
   return null;
 }
 
+// ── OAuth token 自刷新 ───────────────────────────────
+// pi 对 OAuth 凭证惰性刷新（真正发起模型调用时才刷），启动时扩展若直接用旧
+// access 查配额会必败 401。此处用 refresh_token 自行刷新，与 pi 内置
+// kimi-coding 实现同端点同参数（见 pi 包 bundle/chunks/kimi-coding.js）。
+const KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
+const refreshedOAuthAccess = new Map<string, { access: string; expires: number }>();
+
+function persistAuthEntry(providerId: string, entry: any): void {
+  // best-effort 回写 auth.json：refresh_token 可能轮换，不回写会导致 pi 里存的旧
+  // refresh_token 失效；pi 的 AuthStorage.modify 加锁重读文件再合并，不会覆盖丢数据。
+  try {
+    const authPath = join(homedir(), ".pi/agent/auth.json");
+    if (!existsSync(authPath)) return;
+    const data = JSON.parse(readFileSync(authPath, "utf-8"));
+    if (JSON.stringify(data[providerId]) === JSON.stringify(entry)) return;
+    data[providerId] = entry;
+    // ponytail: 无锁读改写，极端并发下可能丢 pi 同刻的其它字段写入；tmp+rename 保证不损坏文件
+    const tmp = authPath + ".token-stats.tmp";
+    writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
+    renameSync(tmp, authPath);
+  } catch {}
+}
+
+async function ensureFreshOAuth(providerId: string, entry: any): Promise<string | null> {
+  const mem = refreshedOAuthAccess.get(providerId);
+  if (mem && mem.expires > Date.now() + 60_000) return mem.access;
+  if (!(providerId === "kimi" || providerId.startsWith("kimi"))) return null;
+  if (typeof entry?.refresh !== "string") return null;
+  try {
+    const host = (process.env.KIMI_CODE_OAUTH_HOST || process.env.KIMI_OAUTH_HOST || "https://auth.kimi.com").replace(/\/+$/, "");
+    const r = await fetch(host + "/api/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: new URLSearchParams({
+        client_id: KIMI_OAUTH_CLIENT_ID,
+        grant_type: "refresh_token",
+        refresh_token: entry.refresh,
+      }).toString(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) return null;
+    const j: any = await r.json().catch(() => null);
+    if (typeof j?.access_token !== "string" || typeof j?.refresh_token !== "string" || typeof j?.expires_in !== "number") return null;
+    const tok = { access: j.access_token as string, expires: Date.now() + j.expires_in * 1000 };
+    refreshedOAuthAccess.set(providerId, tok);
+    persistAuthEntry(providerId, { ...entry, access: j.access_token, refresh: j.refresh_token, expires: tok.expires });
+    return tok.access;
+  } catch {}
+  return null;
+}
+
 function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
   // 1. 环境变量优先
   if (plan.apiKeyEnv && process.env[plan.apiKeyEnv]) {
@@ -1444,15 +1495,21 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   }
 
   // 2.5 OAuth 凭证可能已过期（pi 惰性刷新，仅在真正发起模型调用时才刷新并
-  //     回写 auth.json），启动时立即查配额会必败 401。过期时不发请求，
-  //     改用缓存（无缓存则静默隐藏）；pi 刷新后 expires 更新，自动恢复查询。
+  //     回写 auth.json），启动时立即查配额会必败 401。先自行用 refresh_token
+  //     刷新；刷新失败仍过期时不发请求，改用缓存（无缓存则静默隐藏）。
   const authEntry = curProvider ? readAuthEntry(curProvider) : null;
-  const oauthExpired = authEntry?.type === "oauth"
+  let freshAccess: string | null = null;
+  let oauthExpired = false;
+  if (authEntry?.type === "oauth"
     && typeof authEntry.expires === "number"
-    && Date.now() >= authEntry.expires - 60_000;
+    && Date.now() >= authEntry.expires - 60_000 && curProvider) {
+    freshAccess = await ensureFreshOAuth(curProvider, authEntry);
+    const mem = freshAccess ? refreshedOAuthAccess.get(curProvider) : null;
+    oauthExpired = !mem || Date.now() >= mem.expires - 60_000;
+  }
 
   // 3. 解析 key
-  const key = resolveApiKey(plan, curProvider);
+  const key = freshAccess ?? resolveApiKey(plan, curProvider);
   if (!key) {
     quotaState = buildErrorState(curProvider, plan.id, {
       kind: "key_missing",
