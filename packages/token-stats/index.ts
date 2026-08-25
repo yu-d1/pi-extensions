@@ -360,7 +360,7 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
       const chColor = cumCH >= 80 ? ok
         : cumCH >= 50 ? (s: string) => s
         : warn;
-      segParts.push(`${dim("CH")}${chColor(`${cumCH.toFixed(0)}%`)}`);
+      segParts.push(`${dim("CH")} ${chColor(`${cumCH.toFixed(0)}%`)}`);
     }
     if (segParts.length > 0) parts.push(segParts.join(" "));
   }
@@ -463,19 +463,26 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
       const fullDisplay = quotaState.display;
       const filteredParts: string[] = [];
       if (cfg.quota5h) {
-      const m = fullDisplay.match(/\b5h:\s+\d+%/);
+      const m = fullDisplay.match(/\b5h:\s+\d+%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
       if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaWeek) {
-      const m = fullDisplay.match(/\bW:\s+\d+%/);
+      const m = fullDisplay.match(/\bW:\s+\d+%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
       if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaClock) {
-      const m = fullDisplay.match(/⏱\s*\d+[hm]/);
-      if (m) filteredParts.push(m[0]);
+        // 倒计时已随 5h/W 段显示；仅当对应段被关闭时才单独补出
+        if (!cfg.quota5h || !cfg.quotaWeek) {
+          for (const m of fullDisplay.matchAll(/⏱\s*\d+[dhm](?:\s*\d+[dhm])*/g)) {
+            const attached = cfg.quota5h && /5h/.test(fullDisplay.slice(Math.max(0, m.index! - 30), m.index!))
+              ? !cfg.quota5h : cfg.quotaWeek && /W:/.test(fullDisplay.slice(Math.max(0, m.index! - 30), m.index!))
+              ? !cfg.quotaWeek : true;
+            if (attached) filteredParts.push(m[0].trim());
+          }
+        }
       }
       if (filteredParts.length > 0) {
-        parts.push(qColor(prefix + filteredParts.join(" ")));
+        parts.push(qColor(prefix + filteredParts.join(" | ")));
       } else if (cfg.quota5h || cfg.quotaWeek || cfg.quotaClock) {
         // 余额型套餐（DeepSeek ¥xx.x 等）不含 5h/W/⏱ 字段，
         // 子项过滤匹配不到任何内容时回退显示完整 display，避免配额段静默消失
@@ -1005,7 +1012,7 @@ function formatTokenPlanDisplay(intervalRemaining: number, weeklyRemaining: numb
   if (nearestResetMs && nearestResetMs > 0) {
     const diff = nearestResetMs - Date.now();
     if (diff > 0 && diff < 30 * 24 * 60 * 60 * 1000) {
-      display += ` ⏱ ${formatDuration(diff)}`;
+      display += ` ⏱  ${formatDuration(diff)}`;
     }
   }
   return display;
@@ -1109,9 +1116,10 @@ const BUILTIN_PLANS: TokenPlan[] = [
       return await r.json();
     },
     format: (data: any) => {
+      // ponytail: 5h 窗口与周配额分开计时，各自显示倒计时（原逻辑只显示二者较早的一个，易误导）
       const limits = data.limits || [];
       let intervalRemaining = 100;
-      let nearestReset: number | null = null;
+      let intervalReset: number | null = null;
       if (limits.length > 0) {
         const d = limits[0].detail || {};
         const limit = d.limit || 1;
@@ -1120,24 +1128,30 @@ const BUILTIN_PLANS: TokenPlan[] = [
         const rt = d.resetTime;
         if (rt) {
           const ms = typeof rt === "string" ? new Date(rt).getTime() : rt;
-          if (ms > Date.now()) nearestReset = ms;
+          if (ms > Date.now()) intervalReset = ms;
         }
       }
       const usage = data.usage || {};
       let weeklyRemaining = 100;
+      let weeklyReset: number | null = null;
       if (usage.limit) {
         const remaining = Math.max(usage.remaining ?? 0, 0);
         weeklyRemaining = (remaining / usage.limit) * 100;
         const rt = usage.resetTime;
         if (rt) {
           const ms = typeof rt === "string" ? new Date(rt).getTime() : rt;
-          if (nearestReset === null || ms < nearestReset) nearestReset = ms;
+          if (ms > Date.now()) weeklyReset = ms;
         }
       }
       if (intervalRemaining >= 100 && weeklyRemaining >= 100) return { modelPrefix: "", display: "无数据", color: "err" as const };
+      const cd = (ms: number | null) => {
+        if (!ms) return "";
+        const diff = ms - Date.now();
+        return diff > 0 && diff < 30 * 24 * 60 * 60 * 1000 ? ` ⏱  ${formatDuration(diff)}` : "";
+      };
       return {
         modelPrefix: "",
-        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, nearestReset),
+        display: `5h: ${Math.round(intervalRemaining)}%${cd(intervalReset)} W: ${Math.round(weeklyRemaining)}%${cd(weeklyReset)}`,
         color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
       };
     },
@@ -1256,8 +1270,12 @@ async function writeQuotaCache(cache: QuotaCache) {
 function resolveActivePlan(provider?: string): TokenPlan | null {
   if (!tokenConfig) return null;
   const planId = provider ? (tokenConfig.providerPlans[provider] ?? null) : null;
-  if (!planId) return null;
-  return BUILTIN_PLANS.find(p => p.id === planId) || null;
+  if (planId) return BUILTIN_PLANS.find(p => p.id === planId) || null;
+  // ponytail: 无显式映射时按 matchProviders 模糊兜底（如 kimi-coding 命中 kimi 套餐），扩展更新后需重打此补丁
+  if (provider) {
+    return BUILTIN_PLANS.find(p => p.matchProviders.some(m => provider === m || provider.startsWith(m + "-") || provider.startsWith(m))) || null;
+  }
+  return null;
 }
 
 function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
@@ -1275,6 +1293,8 @@ function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
       //     避免 provider 映射到套餐后盗用套餐原生 provider 的 key（如
       //     opencode-go 映射 deepseek 套餐时误用 deepseek 官方 key 查余额）。
       if (provider && auth[provider]?.key) return auth[provider].key;
+      // ponytail: OAuth 登录的 provider（如 kimi-coding）只有 access 字段，复用其 token 查配额；扩展更新后需重打此补丁
+      if (provider && auth[provider]?.access) return auth[provider].access;
       // 2b. 回退：套餐原生 provider 的 key
       for (const providerId of plan.matchProviders) {
         const entry = auth[providerId];
