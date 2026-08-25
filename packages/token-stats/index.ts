@@ -127,7 +127,7 @@ interface QuotaCache {
 
 export type ContextStyle = "pct-window" | "used-window" | "pct" | "used" | "bar";
 export type SpeedStyle = "t/s" | "tok/s" | "T/s" | "liveAt";
-export type QuotaStyle = "compact" | "with-clock" | "nearest-clock" | "with-clock-short" | "nearest-clock-short";
+export type QuotaStyle = "compact" | "with-clock-7d" | "nearest-clock-7d";
 
 export type DisplayKey =
   | "input"       // 输入（累计输入数 ↑）
@@ -475,7 +475,7 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
         if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaWeek) {
-        const m = fullDisplay.match(/\bW:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
+        const m = fullDisplay.match(/\b(?:W|7d):\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
         if (m) filteredParts.push(m[0]);
       }
       if (filteredParts.length > 0) {
@@ -721,19 +721,19 @@ const DEFAULT_TOKEN_CONFIG: TokenConfig = {
 const DISPLAY_CONFIG_FILE = join(TOKEN_CONFIG_DIR, "display-config.json");
 const DEFAULT_DISPLAY_CONFIG: DisplayConfig = {
   items: {
-    input: true,
+    input: false,
     output: true,
     totalTokens: false,
-    cacheHit: true,
+    cacheHit: false,
     speed: true,
     context: true,
     quota5h: true,
     quotaWeek: true,
-    thinking: true,
+    thinking: false,
   },
   contextStyle: "pct-window",
   speedStyle: "t/s",
-  quotaStyle: "with-clock",
+  quotaStyle: "with-clock-7d",
 };
 
 let displayConfig: DisplayConfig = { ...DEFAULT_DISPLAY_CONFIG, items: { ...DEFAULT_DISPLAY_CONFIG.items } };
@@ -1005,21 +1005,14 @@ function formatDuration(ms: number): string {
   return `${mins}m`;
 }
 
-function formatShortDuration(ms: number): string {
-  if (ms <= 0) return "";
-  if (ms >= 24 * 60 * 60 * 1000) return `${Math.floor(ms / (24 * 60 * 60 * 1000))}d`;
-  if (ms >= 60 * 60 * 1000) return `${Math.floor(ms / (60 * 60 * 1000))}h`;
-  return `${Math.floor(ms / (60 * 1000))}m`;
-}
-
 function formatTokenPlanDisplay(
   intervalRemaining: number,
   weeklyRemaining: number,
   intervalResetMs?: number | null,
   weeklyResetMs?: number | null,
-  style: QuotaStyle = "with-clock",
+  style: QuotaStyle = "with-clock-7d",
 ): string {
-  const formatPercent = (value: number) => `${value.toFixed(2)}%`;
+  const formatPercent = (value: number) => `${Math.round(value)}%`;
   const formatClock = (resetMs?: number | null) => {
     if (!resetMs || resetMs <= 0) return "";
     const diff = resetMs - Date.now();
@@ -1028,25 +1021,19 @@ function formatTokenPlanDisplay(
       : "";
   };
   const interval = `5h: ${formatPercent(intervalRemaining)}`;
-  const weekly = `W: ${formatPercent(weeklyRemaining)}`;
-  const shortClock = (resetMs?: number | null) => {
-    if (!resetMs || resetMs <= 0) return "";
-    const diff = resetMs - Date.now();
-    return diff > 0 && diff < 30 * 24 * 60 * 60 * 1000
-      ? ` ⏱ ${formatShortDuration(diff)}`
-      : "";
-  };
+  const weeklyLabel = "7d";
+  const weekly = `${weeklyLabel}: ${formatPercent(weeklyRemaining)}`;
   if (style === "compact") return `${interval} ${weekly}`;
-  if (style === "nearest-clock" || style === "nearest-clock-short") {
+  if (style === "nearest-clock-7d") {
     const resets = [intervalResetMs, weeklyResetMs].filter(
       (value): value is number => typeof value === "number" && value > Date.now(),
     );
     const nearest = resets.length > 0 ? Math.min(...resets) : null;
-    const clock = style === "nearest-clock-short" ? shortClock(nearest) : formatClock(nearest);
+    const clock = formatClock(nearest);
     return `${interval} ${weekly}${clock}`;
   }
-  const intervalClock = style === "with-clock-short" ? shortClock(intervalResetMs) : formatClock(intervalResetMs);
-  const weeklyClock = style === "with-clock-short" ? shortClock(weeklyResetMs) : formatClock(weeklyResetMs);
+  const intervalClock = formatClock(intervalResetMs);
+  const weeklyClock = formatClock(weeklyResetMs);
   return `${interval}${intervalClock} ${weekly}${weeklyClock}`;
 }
 
@@ -1269,7 +1256,7 @@ function isSpeedStyle(v: unknown): v is SpeedStyle {
   return typeof v === "string" && ["t/s", "tok/s", "T/s", "liveAt"].includes(v);
 }
 function isQuotaStyle(v: unknown): v is QuotaStyle {
-  return typeof v === "string" && ["compact", "with-clock", "nearest-clock", "with-clock-short", "nearest-clock-short"].includes(v);
+  return typeof v === "string" && ["compact", "with-clock-7d", "nearest-clock-7d"].includes(v);
 }
 
 async function saveDisplayConfig(cfg: DisplayConfig) {
@@ -2305,13 +2292,11 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 requestFooterRender?.();
               }
             }
-          } else {
+          } else if (catChoice === "📦 配额样式") {
             const items: { label: string; value: QuotaStyle; preview: string }[] = [
-              { label: "compact", value: "compact", preview: `5h: 89% W: 72%` },
-              { label: "with-clock", value: "with-clock", preview: `5h: 89% ⏱ 4h 15m W: 72% ⏱ 2d` },
-              { label: "nearest-clock", value: "nearest-clock", preview: `5h: 89% W: 72% ⏱ 4h 15m` },
-              { label: "with-clock-short", value: "with-clock-short", preview: `5h: 89% ⏱ 4h W: 72% ⏱ 2d` },
-              { label: "nearest-clock-short", value: "nearest-clock-short", preview: `5h: 89% W: 72% ⏱ 4h` },
+              { label: "compact", value: "compact", preview: `5h: 89% 7d: 72%` },
+              { label: "with-clock-7d", value: "with-clock-7d", preview: `5h: 89% ⏱ 4h 15m 7d: 72% ⏱ 2d` },
+              { label: "nearest-clock-7d", value: "nearest-clock-7d", preview: `5h: 89% 7d: 72% ⏱ 4h 15m` },
             ];
             const choice = await ctx.ui.select(
               "📦 配额样式（当前: " + displayConfig.quotaStyle + "）",
