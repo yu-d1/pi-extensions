@@ -137,7 +137,8 @@ export type DisplayKey =
   | "context"     // 容量（🧠 ctx%）
   | "quota5h"     // 5h 额度
   | "quotaWeek"   // 周额度
-  | "quotaClock"; // 刷新时间（⏱）
+  | "quotaClock"   // 刷新时间（⏱）
+  | "thinking";    // 思考强度（TH）
 
 export interface DisplayConfig {
   items: Record<DisplayKey, boolean>;
@@ -389,6 +390,12 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
         parts.push(`⚡${speedNum} t/s`);
         break;
     }
+  }
+
+  // ── 思考强度 TH ────────────────────────────────
+  if (cfg.thinking && ctx.thinkingLevel) {
+    const level = ctx.thinkingLevel;
+    parts.push(level === "off" ? dim("TH off") : theme.fg("accent", `TH ${level}`));
   }
 
   // ── 容量 🧠 ────────────────────────────────────────
@@ -733,6 +740,7 @@ const DEFAULT_DISPLAY_CONFIG: DisplayConfig = {
     quota5h: true,
     quotaWeek: true,
     quotaClock: true,
+    thinking: true,
   },
   contextStyle: "pct-window",
   speedStyle: "t/s",
@@ -1824,6 +1832,11 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   // ── turn_start: 记录时间 + 检测供应商切换 ──────────
 
+  // 思考强度切换时立即刷新 footer
+  pi.on("thinking_level_select", async () => {
+    requestFooterRender?.();
+  });
+
   pi.on("turn_start", async (_event, ctx) => {
     stats.turnStartTime = Date.now();
     stats.firstTokenTime = 0;
@@ -2274,12 +2287,13 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         } else if (subChoice === "显示内容") {
           const itemLabels: DisplayKey[] = [
             "input", "output", "totalTokens", "cacheHit", "speed", "context",
-            "quota5h", "quotaWeek", "quotaClock",
+            "quota5h", "quotaWeek", "quotaClock", "thinking",
           ];
           const itemNames: Record<DisplayKey, string> = {
             input: "输入", output: "输出", totalTokens: "总token",
             cacheHit: "缓存命中", speed: "速度", context: "容量",
             quota5h: "5h额度", quotaWeek: "周额度", quotaClock: "刷新时间",
+            thinking: "思考强度",
           };
           // TUI 模式：勾选组件批量编辑，ctrl+s 实时保存并刷新 footer，留在界面继续调整
           if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
