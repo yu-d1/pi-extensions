@@ -227,12 +227,11 @@ function normalizeStore(raw: any): Store {
 								.map((m: any) => ({
 									id: m.id,
 									...(m.name ? { name: m.name } : {}),
-									...(typeof m.reasoning === "boolean" ? { reasoning: m.reasoning } : {}),
+									reasoning: inferModelReasoning(m),
 									input: normalizeInput(m.input),
 									...(typeof m.contextWindow === "number" ? { contextWindow: m.contextWindow } : {}),
 									...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}),
 									...(m.cost ? { cost: m.cost } : {}),
-									...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
 									...(typeof m.enabled === "boolean" ? { enabled: m.enabled } : {}),
 								}))
 						: [],
@@ -943,6 +942,23 @@ function inferModelInput(raw: any): ModelInput {
 	return ["text", "image"];
 }
 
+/**
+ * 通用供应商统一使用 pi 的请求格式和 /settings 思考等级。
+ * 只有服务端明确声明不支持思考时才关闭，避免依赖易过时的模型名称规则。
+ */
+function inferModelReasoning(raw: any): boolean {
+	const values = [
+		raw?.reasoning,
+		raw?.supports_reasoning,
+		raw?.supportsReasoning,
+		raw?.thinking,
+		raw?.capabilities?.reasoning,
+		raw?.capabilities?.thinking,
+	];
+	const declared = values.find((value) => typeof value === "boolean");
+	return declared === false ? false : true;
+}
+
 function extractModels(data: any, api: string): StoredModel[] {
 	let arr = data?.data ?? data?.models ?? data?.ids ?? data?.list ?? data?.items;
 	if (!Array.isArray(arr)) arr = [];
@@ -950,7 +966,7 @@ function extractModels(data: any, api: string): StoredModel[] {
 	for (const m of arr) {
 		if (m === undefined || m === null) continue;
 		if (typeof m === "string") {
-			out.push({ id: m, input: ["text", "image"], enabled: false });
+			out.push({ id: m, reasoning: inferModelReasoning({ id: m }), input: ["text", "image"], enabled: false });
 			continue;
 		}
 		const rawId = m?.id ?? m?.name ?? m?.model ?? m?.key ?? (typeof m === "object" ? Object.keys(m)[0] : undefined);
@@ -965,6 +981,7 @@ function extractModels(data: any, api: string): StoredModel[] {
 		out.push({
 			id,
 			name: typeof display === "string" ? display : id,
+			reasoning: inferModelReasoning({ ...m, id }),
 			input: inferModelInput(m),
 			enabled: false,
 			...(contextWindow ? { contextWindow } : {}),
@@ -1023,6 +1040,9 @@ function normalizeModel(m: StoredModel): any {
 		contextWindow: m.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
 		maxTokens: m.maxTokens ?? 16384,
 		cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		compat: {
+			supportsReasoningEffort: true,
+		},
 	};
 	if (m.thinkingLevelMap) base.thinkingLevelMap = m.thinkingLevelMap;
 	return base;
@@ -1497,8 +1517,9 @@ async function addModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 		if (old) {
 			old.input = input;
 		} else {
-			// 手动添加的模型同样默认未勾选，需在“启用模型”中挑选。
-			entry.models.push({ id, input, contextWindow: DEFAULT_CONTEXT_WINDOW, enabled: false });
+			// 仅对明确属于思考模型的模型启用 reasoning，避免普通模型收到不兼容的思考参数。
+			const reasoning = inferModelReasoning({ id });
+			entry.models.push({ id, ...(reasoning ? { reasoning: true } : {}), input, contextWindow: DEFAULT_CONTEXT_WINDOW, enabled: false });
 			added++;
 		}
 	}
