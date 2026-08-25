@@ -84,8 +84,9 @@ pi install npm:@liziy/token-stats
 │   5h额度      ✓ │
 │   周额度      ✓ │
 │   刷新时间    ✓ │   ← ⏱ 倒计时
+│   思考强度    ✓ │   ← TH 当前模型思考档位
 │                 │
-│  enter 切换 · ctrl+a 全选 · ctrl+x 清空 · ctrl+s 保存 · esc 取消 · 显示 8/9 │
+│  enter 切换 · ctrl+a 全选 · ctrl+x 清空 · ctrl+s 保存 · esc 取消 · 显示 9/10 │
 └─────────────────┘
 ```
 

@@ -28,7 +28,7 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createDeepseekBackend, type SearchBackend } from "./search";
 
 // ── 路径 ──────────────────────────────────────────────────
@@ -137,7 +137,8 @@ export type DisplayKey =
   | "context"     // 容量（🧠 ctx%）
   | "quota5h"     // 5h 额度
   | "quotaWeek"   // 周额度
-  | "quotaClock"; // 刷新时间（⏱）
+  | "quotaClock"   // 刷新时间（⏱）
+  | "thinking";    // 思考强度（TH）
 
 export interface DisplayConfig {
   items: Record<DisplayKey, boolean>;
@@ -360,7 +361,7 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
       const chColor = cumCH >= 80 ? ok
         : cumCH >= 50 ? (s: string) => s
         : warn;
-      segParts.push(`${dim("CH")}${chColor(`${cumCH.toFixed(0)}%`)}`);
+      segParts.push(`${dim("CH")} ${chColor(`${cumCH.toFixed(0)}%`)}`);
     }
     if (segParts.length > 0) parts.push(segParts.join(" "));
   }
@@ -389,6 +390,12 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
         parts.push(`⚡${speedNum} t/s`);
         break;
     }
+  }
+
+  // ── 思考强度 TH ────────────────────────────────
+  if (cfg.thinking && ctx.thinkingLevel) {
+    const level = ctx.thinkingLevel;
+    parts.push(level === "off" ? dim("TH off") : theme.fg("accent", `TH ${level}`));
   }
 
   // ── 容量 🧠 ────────────────────────────────────────
@@ -463,19 +470,26 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
       const fullDisplay = quotaState.display;
       const filteredParts: string[] = [];
       if (cfg.quota5h) {
-      const m = fullDisplay.match(/\b5h:\s+\d+%/);
+      const m = fullDisplay.match(/\b5h:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
       if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaWeek) {
-      const m = fullDisplay.match(/\bW:\s+\d+%/);
+      const m = fullDisplay.match(/\bW:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
       if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaClock) {
-      const m = fullDisplay.match(/⏱\s*\d+[hm]/);
-      if (m) filteredParts.push(m[0]);
+        // 倒计时已随 5h/W 段显示；仅当对应段被关闭时才单独补出
+        if (!cfg.quota5h || !cfg.quotaWeek) {
+          for (const m of fullDisplay.matchAll(/⏱\s*\d+[dhm](?:\s*\d+[dhm])*/g)) {
+            const attached = cfg.quota5h && /5h/.test(fullDisplay.slice(Math.max(0, m.index! - 30), m.index!))
+              ? !cfg.quota5h : cfg.quotaWeek && /W:/.test(fullDisplay.slice(Math.max(0, m.index! - 30), m.index!))
+              ? !cfg.quotaWeek : true;
+            if (attached) filteredParts.push(m[0].trim());
+          }
+        }
       }
       if (filteredParts.length > 0) {
-        parts.push(qColor(prefix + filteredParts.join(" ")));
+        parts.push(qColor(prefix + filteredParts.join(" | ")));
       } else if (cfg.quota5h || cfg.quotaWeek || cfg.quotaClock) {
         // 余额型套餐（DeepSeek ¥xx.x 等）不含 5h/W/⏱ 字段，
         // 子项过滤匹配不到任何内容时回退显示完整 display，避免配额段静默消失
@@ -726,6 +740,7 @@ const DEFAULT_DISPLAY_CONFIG: DisplayConfig = {
     quota5h: true,
     quotaWeek: true,
     quotaClock: true,
+    thinking: true,
   },
   contextStyle: "pct-window",
   speedStyle: "t/s",
@@ -1001,11 +1016,11 @@ function formatDuration(ms: number): string {
 }
 
 function formatTokenPlanDisplay(intervalRemaining: number, weeklyRemaining: number, nearestResetMs?: number | null): string {
-  let display = `5h: ${Math.round(intervalRemaining)}% W: ${Math.round(weeklyRemaining)}%`;
+  let display = `5h: ${intervalRemaining.toFixed(2)}% W: ${weeklyRemaining.toFixed(2)}%`;
   if (nearestResetMs && nearestResetMs > 0) {
     const diff = nearestResetMs - Date.now();
     if (diff > 0 && diff < 30 * 24 * 60 * 60 * 1000) {
-      display += ` ⏱ ${formatDuration(diff)}`;
+      display += ` ⏱  ${formatDuration(diff)}`;
     }
   }
   return display;
@@ -1109,9 +1124,10 @@ const BUILTIN_PLANS: TokenPlan[] = [
       return await r.json();
     },
     format: (data: any) => {
+      // ponytail: 5h 窗口与周配额分开计时，各自显示倒计时（原逻辑只显示二者较早的一个，易误导）
       const limits = data.limits || [];
       let intervalRemaining = 100;
-      let nearestReset: number | null = null;
+      let intervalReset: number | null = null;
       if (limits.length > 0) {
         const d = limits[0].detail || {};
         const limit = d.limit || 1;
@@ -1120,24 +1136,30 @@ const BUILTIN_PLANS: TokenPlan[] = [
         const rt = d.resetTime;
         if (rt) {
           const ms = typeof rt === "string" ? new Date(rt).getTime() : rt;
-          if (ms > Date.now()) nearestReset = ms;
+          if (ms > Date.now()) intervalReset = ms;
         }
       }
       const usage = data.usage || {};
       let weeklyRemaining = 100;
+      let weeklyReset: number | null = null;
       if (usage.limit) {
         const remaining = Math.max(usage.remaining ?? 0, 0);
         weeklyRemaining = (remaining / usage.limit) * 100;
         const rt = usage.resetTime;
         if (rt) {
           const ms = typeof rt === "string" ? new Date(rt).getTime() : rt;
-          if (nearestReset === null || ms < nearestReset) nearestReset = ms;
+          if (ms > Date.now()) weeklyReset = ms;
         }
       }
       if (intervalRemaining >= 100 && weeklyRemaining >= 100) return { modelPrefix: "", display: "无数据", color: "err" as const };
+      const cd = (ms: number | null) => {
+        if (!ms) return "";
+        const diff = ms - Date.now();
+        return diff > 0 && diff < 30 * 24 * 60 * 60 * 1000 ? ` ⏱  ${formatDuration(diff)}` : "";
+      };
       return {
         modelPrefix: "",
-        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, nearestReset),
+        display: `5h: ${intervalRemaining.toFixed(2)}%${cd(intervalReset)} W: ${weeklyRemaining.toFixed(2)}%${cd(weeklyReset)}`,
         color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
       };
     },
@@ -1256,8 +1278,73 @@ async function writeQuotaCache(cache: QuotaCache) {
 function resolveActivePlan(provider?: string): TokenPlan | null {
   if (!tokenConfig) return null;
   const planId = provider ? (tokenConfig.providerPlans[provider] ?? null) : null;
-  if (!planId) return null;
-  return BUILTIN_PLANS.find(p => p.id === planId) || null;
+  if (planId) return BUILTIN_PLANS.find(p => p.id === planId) || null;
+  // ponytail: 无显式映射时按 matchProviders 模糊兜底（如 kimi-coding 命中 kimi 套餐），扩展更新后需重打此补丁
+  if (provider) {
+    return BUILTIN_PLANS.find(p => p.matchProviders.some(m => provider === m || provider.startsWith(m + "-") || provider.startsWith(m))) || null;
+  }
+  return null;
+}
+
+function readAuthEntry(providerId: string): any | null {
+  try {
+    const authPath = join(homedir(), ".pi/agent/auth.json");
+    if (!existsSync(authPath)) return null;
+    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    return auth[providerId] ?? null;
+  } catch {}
+  return null;
+}
+
+// ── OAuth token 自刷新 ───────────────────────────────
+// pi 对 OAuth 凭证惰性刷新（真正发起模型调用时才刷），启动时扩展若直接用旧
+// access 查配额会必败 401。此处用 refresh_token 自行刷新，与 pi 内置
+// kimi-coding 实现同端点同参数（见 pi 包 bundle/chunks/kimi-coding.js）。
+const KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
+const refreshedOAuthAccess = new Map<string, { access: string; expires: number }>();
+
+function persistAuthEntry(providerId: string, entry: any): void {
+  // best-effort 回写 auth.json：refresh_token 可能轮换，不回写会导致 pi 里存的旧
+  // refresh_token 失效；pi 的 AuthStorage.modify 加锁重读文件再合并，不会覆盖丢数据。
+  try {
+    const authPath = join(homedir(), ".pi/agent/auth.json");
+    if (!existsSync(authPath)) return;
+    const data = JSON.parse(readFileSync(authPath, "utf-8"));
+    if (JSON.stringify(data[providerId]) === JSON.stringify(entry)) return;
+    data[providerId] = entry;
+    // ponytail: 无锁读改写，极端并发下可能丢 pi 同刻的其它字段写入；tmp+rename 保证不损坏文件
+    const tmp = authPath + ".token-stats.tmp";
+    writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
+    renameSync(tmp, authPath);
+  } catch {}
+}
+
+async function ensureFreshOAuth(providerId: string, entry: any): Promise<string | null> {
+  const mem = refreshedOAuthAccess.get(providerId);
+  if (mem && mem.expires > Date.now() + 60_000) return mem.access;
+  if (!(providerId === "kimi" || providerId.startsWith("kimi"))) return null;
+  if (typeof entry?.refresh !== "string") return null;
+  try {
+    const host = (process.env.KIMI_CODE_OAUTH_HOST || process.env.KIMI_OAUTH_HOST || "https://auth.kimi.com").replace(/\/+$/, "");
+    const r = await fetch(host + "/api/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: new URLSearchParams({
+        client_id: KIMI_OAUTH_CLIENT_ID,
+        grant_type: "refresh_token",
+        refresh_token: entry.refresh,
+      }).toString(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) return null;
+    const j: any = await r.json().catch(() => null);
+    if (typeof j?.access_token !== "string" || typeof j?.refresh_token !== "string" || typeof j?.expires_in !== "number") return null;
+    const tok = { access: j.access_token as string, expires: Date.now() + j.expires_in * 1000 };
+    refreshedOAuthAccess.set(providerId, tok);
+    persistAuthEntry(providerId, { ...entry, access: j.access_token, refresh: j.refresh_token, expires: tok.expires });
+    return tok.access;
+  } catch {}
+  return null;
 }
 
 function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
@@ -1265,23 +1352,20 @@ function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
   if (plan.apiKeyEnv && process.env[plan.apiKeyEnv]) {
     return process.env[plan.apiKeyEnv]!;
   }
-  // 2. 读取 pi 的 auth.json
-  try {
-    const authPath = join(homedir(), ".pi/agent/auth.json");
-    if (existsSync(authPath)) {
-      const raw = readFileSync(authPath, "utf-8");
-      const auth = JSON.parse(raw);
-      // 2a. 优先取「当前 provider」自己的 key：
-      //     避免 provider 映射到套餐后盗用套餐原生 provider 的 key（如
-      //     opencode-go 映射 deepseek 套餐时误用 deepseek 官方 key 查余额）。
-      if (provider && auth[provider]?.key) return auth[provider].key;
-      // 2b. 回退：套餐原生 provider 的 key
-      for (const providerId of plan.matchProviders) {
-        const entry = auth[providerId];
-        if (entry?.key) return entry.key;
-      }
-    }
-  } catch {}
+  // 2a. 优先取「当前 provider」自己的 key：
+  //     避免 provider 映射到套餐后盗用套餐原生 provider 的 key（如
+  //     opencode-go 映射 deepseek 套餐时误用 deepseek 官方 key 查余额）。
+  if (provider) {
+    const entry = readAuthEntry(provider);
+    if (entry?.key) return entry.key;
+    // ponytail: OAuth 登录的 provider（如 kimi-coding）只有 access 字段，复用其 token 查配额；扩展更新后需重打此补丁
+    if (entry?.access) return entry.access;
+  }
+  // 2b. 回退：套餐原生 provider 的 key
+  for (const providerId of plan.matchProviders) {
+    const entry = readAuthEntry(providerId);
+    if (entry?.key) return entry.key;
+  }
   return null;
 }
 
@@ -1418,8 +1502,22 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
     return;
   }
 
+  // 2.5 OAuth 凭证可能已过期（pi 惰性刷新，仅在真正发起模型调用时才刷新并
+  //     回写 auth.json），启动时立即查配额会必败 401。先自行用 refresh_token
+  //     刷新；刷新失败仍过期时不发请求，改用缓存（无缓存则静默隐藏）。
+  const authEntry = curProvider ? readAuthEntry(curProvider) : null;
+  let freshAccess: string | null = null;
+  let oauthExpired = false;
+  if (authEntry?.type === "oauth"
+    && typeof authEntry.expires === "number"
+    && Date.now() >= authEntry.expires - 60_000 && curProvider) {
+    freshAccess = await ensureFreshOAuth(curProvider, authEntry);
+    const mem = freshAccess ? refreshedOAuthAccess.get(curProvider) : null;
+    oauthExpired = !mem || Date.now() >= mem.expires - 60_000;
+  }
+
   // 3. 解析 key
-  const key = resolveApiKey(plan, curProvider);
+  const key = freshAccess ?? resolveApiKey(plan, curProvider);
   if (!key) {
     quotaState = buildErrorState(curProvider, plan.id, {
       kind: "key_missing",
@@ -1432,6 +1530,22 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   // 4. 读缓存（force 时跳过）
   const cache = await readQuotaCache();
   const cached = cache[plan.id];
+  if (oauthExpired) {
+    if (cached) {
+      const fmt = plan.format(cached.data);
+      quotaState = {
+        planId: plan.id,
+        provider: curProvider,
+        display: fmt.display,
+        modelPrefix: fmt.modelPrefix,
+        color: fmt.color,
+        fetchedAt: cached.fetchedAt,
+      };
+    } else {
+      quotaState = null;
+    }
+    return;
+  }
   const ttlMs = (tokenConfig?.ttl || 60) * 1000;
   if (!force && cached && (Date.now() - cached.fetchedAt) < cached.ttl) {
     const fmt = plan.format(cached.data);
@@ -1717,6 +1831,11 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   });
 
   // ── turn_start: 记录时间 + 检测供应商切换 ──────────
+
+  // 思考强度切换时立即刷新 footer
+  pi.on("thinking_level_select", async () => {
+    requestFooterRender?.();
+  });
 
   pi.on("turn_start", async (_event, ctx) => {
     stats.turnStartTime = Date.now();
@@ -2168,12 +2287,13 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         } else if (subChoice === "显示内容") {
           const itemLabels: DisplayKey[] = [
             "input", "output", "totalTokens", "cacheHit", "speed", "context",
-            "quota5h", "quotaWeek", "quotaClock",
+            "quota5h", "quotaWeek", "quotaClock", "thinking",
           ];
           const itemNames: Record<DisplayKey, string> = {
             input: "输入", output: "输出", totalTokens: "总token",
             cacheHit: "缓存命中", speed: "速度", context: "容量",
             quota5h: "5h额度", quotaWeek: "周额度", quotaClock: "刷新时间",
+            thinking: "思考强度",
           };
           // TUI 模式：勾选组件批量编辑，ctrl+s 实时保存并刷新 footer，留在界面继续调整
           if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
