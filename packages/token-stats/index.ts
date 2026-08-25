@@ -1278,30 +1278,35 @@ function resolveActivePlan(provider?: string): TokenPlan | null {
   return null;
 }
 
+function readAuthEntry(providerId: string): any | null {
+  try {
+    const authPath = join(homedir(), ".pi/agent/auth.json");
+    if (!existsSync(authPath)) return null;
+    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    return auth[providerId] ?? null;
+  } catch {}
+  return null;
+}
+
 function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
   // 1. 环境变量优先
   if (plan.apiKeyEnv && process.env[plan.apiKeyEnv]) {
     return process.env[plan.apiKeyEnv]!;
   }
-  // 2. 读取 pi 的 auth.json
-  try {
-    const authPath = join(homedir(), ".pi/agent/auth.json");
-    if (existsSync(authPath)) {
-      const raw = readFileSync(authPath, "utf-8");
-      const auth = JSON.parse(raw);
-      // 2a. 优先取「当前 provider」自己的 key：
-      //     避免 provider 映射到套餐后盗用套餐原生 provider 的 key（如
-      //     opencode-go 映射 deepseek 套餐时误用 deepseek 官方 key 查余额）。
-      if (provider && auth[provider]?.key) return auth[provider].key;
-      // ponytail: OAuth 登录的 provider（如 kimi-coding）只有 access 字段，复用其 token 查配额；扩展更新后需重打此补丁
-      if (provider && auth[provider]?.access) return auth[provider].access;
-      // 2b. 回退：套餐原生 provider 的 key
-      for (const providerId of plan.matchProviders) {
-        const entry = auth[providerId];
-        if (entry?.key) return entry.key;
-      }
-    }
-  } catch {}
+  // 2a. 优先取「当前 provider」自己的 key：
+  //     避免 provider 映射到套餐后盗用套餐原生 provider 的 key（如
+  //     opencode-go 映射 deepseek 套餐时误用 deepseek 官方 key 查余额）。
+  if (provider) {
+    const entry = readAuthEntry(provider);
+    if (entry?.key) return entry.key;
+    // ponytail: OAuth 登录的 provider（如 kimi-coding）只有 access 字段，复用其 token 查配额；扩展更新后需重打此补丁
+    if (entry?.access) return entry.access;
+  }
+  // 2b. 回退：套餐原生 provider 的 key
+  for (const providerId of plan.matchProviders) {
+    const entry = readAuthEntry(providerId);
+    if (entry?.key) return entry.key;
+  }
   return null;
 }
 
@@ -1438,6 +1443,14 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
     return;
   }
 
+  // 2.5 OAuth 凭证可能已过期（pi 惰性刷新，仅在真正发起模型调用时才刷新并
+  //     回写 auth.json），启动时立即查配额会必败 401。过期时不发请求，
+  //     改用缓存（无缓存则静默隐藏）；pi 刷新后 expires 更新，自动恢复查询。
+  const authEntry = curProvider ? readAuthEntry(curProvider) : null;
+  const oauthExpired = authEntry?.type === "oauth"
+    && typeof authEntry.expires === "number"
+    && Date.now() >= authEntry.expires - 60_000;
+
   // 3. 解析 key
   const key = resolveApiKey(plan, curProvider);
   if (!key) {
@@ -1452,6 +1465,22 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   // 4. 读缓存（force 时跳过）
   const cache = await readQuotaCache();
   const cached = cache[plan.id];
+  if (oauthExpired) {
+    if (cached) {
+      const fmt = plan.format(cached.data);
+      quotaState = {
+        planId: plan.id,
+        provider: curProvider,
+        display: fmt.display,
+        modelPrefix: fmt.modelPrefix,
+        color: fmt.color,
+        fetchedAt: cached.fetchedAt,
+      };
+    } else {
+      quotaState = null;
+    }
+    return;
+  }
   const ttlMs = (tokenConfig?.ttl || 60) * 1000;
   if (!force && cached && (Date.now() - cached.fetchedAt) < cached.ttl) {
     const fmt = plan.format(cached.data);
