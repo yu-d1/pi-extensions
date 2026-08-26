@@ -11,6 +11,7 @@
 // 套餐用量内置：MiniMax / GLM / Kimi / DeepSeek
 // 配置持久化：~/.pi/agent/extensions/token-stats/
 // 日志输出：   ~/.pi/agent/extensions/token-stats-logs/
+// 日统计 / 小时统计 / 周统计 / 月统计 / 年度按月统计
 //
 // 安装：pi install npm:@liziy/token-stats
 
@@ -471,11 +472,11 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
       const fullDisplay = quotaState.display;
       const filteredParts: string[] = [];
       if (cfg.quota5h) {
-        const m = fullDisplay.match(/\b5h:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
+        const m = fullDisplay.match(/\b5h:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[wdhm](?:\s*\d+[wdhm](?!:))?)?/);
         if (m) filteredParts.push(m[0]);
       }
       if (cfg.quotaWeek) {
-        const m = fullDisplay.match(/\b(?:W|7d):\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[dhm](?:\s*\d+[dhm])?)?/);
+        const m = fullDisplay.match(/\b(?:W|7d):\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[wdhm](?:\s*\d+[wdhm](?!:))?)?/);
         if (m) filteredParts.push(m[0]);
       }
       if (filteredParts.length > 0) {
@@ -1764,6 +1765,92 @@ function getMonthStr(date: Date = new Date()): string {
   return `${y}-${m}`;
 }
 
+async function showYear(year: string, ctx: ExtensionContext, pi: ExtensionAPI) {
+  let records: DailyRecord[] = [];
+  try {
+    records = (await readFile(DAILY_FILE, "utf-8")).trim().split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+  } catch {
+    // nothing
+  }
+
+  const monthlyMap = new Map<string, DailyRecord>();
+  for (const record of records) {
+    if (!record.date.startsWith(`${year}-`)) continue;
+    const month = record.date.slice(0, 7);
+    const current = monthlyMap.get(month);
+    if (current) {
+      current.count += record.count;
+      current.sumInput += record.sumInput;
+      current.sumCacheRead += record.sumCacheRead;
+      current.sumCacheWrite += record.sumCacheWrite;
+      current.sumOutput += record.sumOutput;
+      current.sumTokensPerSec += record.sumTokensPerSec;
+    } else {
+      monthlyMap.set(month, {
+        date: month,
+        count: record.count,
+        sumInput: record.sumInput,
+        sumOutput: record.sumOutput,
+        sumCacheRead: record.sumCacheRead,
+        sumCacheWrite: record.sumCacheWrite,
+        sumTokensPerSec: record.sumTokensPerSec,
+        avgCacheHitRate: record.avgCacheHitRate,
+      });
+    }
+  }
+
+  const monthlyRecords = [...monthlyMap.values()].sort((a, b) => a.date.localeCompare(b.date));
+  if (monthlyRecords.length === 0) {
+    ctx.ui.notify(`${year} 年暂无统计数据`, "info");
+    return;
+  }
+
+  const total = monthlyRecords.reduce(
+    (acc, r) => {
+      acc.count += r.count;
+      acc.sumInput += r.sumInput;
+      acc.sumCacheRead += r.sumCacheRead;
+      acc.sumCacheWrite += r.sumCacheWrite;
+      acc.sumOutput += r.sumOutput;
+      acc.sumTokensPerSec += r.sumTokensPerSec;
+      return acc;
+    },
+    { count: 0, sumInput: 0, sumCacheRead: 0, sumCacheWrite: 0, sumOutput: 0, sumTokensPerSec: 0 },
+  );
+  const totalPrompt = total.sumInput + total.sumCacheRead + total.sumCacheWrite;
+  const cacheHitRate = weightedCacheHitRate(total);
+
+  const lines = [
+    "月份        次数  新增输入  缓存输入  输出      总token   命中率  速率",
+    "─".repeat(70),
+    ...monthlyRecords.map((r) => {
+      const totalPromptForMonth = r.sumInput + r.sumCacheRead + r.sumCacheWrite;
+      return (
+        `${r.date}      ` +
+        `${String(r.count).padStart(3)}  ` +
+        `${formatTokens(r.sumInput).padStart(7)}  ` +
+        `${formatTokens(r.sumCacheRead).padStart(7)}  ` +
+        `${formatTokens(r.sumOutput).padStart(7)}  ` +
+        `${formatTokens(totalPromptForMonth).padStart(7)}  ` +
+        `${weightedCacheHitRate(r).toFixed(1).padStart(5)}%  ` +
+        `${(r.sumTokensPerSec / r.count).toFixed(1).padStart(5)}`
+      );
+    }),
+    "",
+    `合计      ${String(total.count).padStart(3)}  ` +
+    `${formatTokens(total.sumInput).padStart(7)}  ` +
+    `${formatTokens(total.sumCacheRead).padStart(7)}  ` +
+    `${formatTokens(total.sumOutput).padStart(7)}  ` +
+    `${formatTokens(totalPrompt).padStart(7)}  ` +
+    `${cacheHitRate.toFixed(1).padStart(5)}%  ` +
+    `${(total.sumTokensPerSec / total.count).toFixed(1).padStart(5)}`,
+  ];
+
+  await showStats(lines, `${year} 年度汇总（按月）`, ctx, pi);
+}
+
 async function showMonth(month: string, ctx: ExtensionContext, pi: ExtensionAPI) {
   let records: DailyRecord[] = [];
   try {
@@ -2118,43 +2205,48 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   // ── /stats 命令 ─────────────────────────────────────
 
   pi.registerCommand("stats", {
-    description: "Token 统计：/stats 打开主菜单；/stats day|hour|week|month 查询；/stats config 状态栏配置",
+    description: "Token 统计：/stats 打开主菜单；/stats day|hour|week|month|year 查询；/stats config 状态栏配置",
     handler: async (args, ctx) => {
       let arg = args.trim();
+      const fromMainMenu = !arg;
 
-      // 无参 → 主菜单：统计查询不再需要记参数，套餐/配置入口也在这里
-      if (!arg) {
-        const main = await ctx.ui.select("Token 统计", [
-          "⚙️  状态栏配置",
-          "📦 套餐配额配置",
-          "📊 统计查询",
-        ]);
-        if (!main) return;
-        if (main.startsWith("📊")) {
-          const report = await ctx.ui.select("📊 统计查询", [
-            "📊 今日统计",
-            "📊 按小时分布（今日）",
-            "📊 本周汇总",
-            "📊 月度汇总",
+      mainMenu: while (true) {
+        // 无参 → 主菜单：统计查询不再需要记参数，套餐/配置入口也在这里
+        if (!arg) {
+          const main = await ctx.ui.select("Token 统计", [
+            "⚙️  状态栏配置",
+            "📦 套餐配额配置",
+            "📊 统计查询",
           ]);
-          if (!report) return;
-          if (report.startsWith("📊 今日")) {
-            await showDay(getDateStr(), ctx, pi);
-          } else if (report.startsWith("📊 按小时")) {
-            await showHourly(getDateStr(), ctx, pi);
-          } else if (report.startsWith("📊 本周")) {
-            await showWeek(ctx, pi);
-          } else if (report.startsWith("📊 月度")) {
-            await showMonth(getMonthStr(), ctx, pi);
+          if (!main) return;
+          if (main.startsWith("📊")) {
+            const report = await ctx.ui.select("📊 统计查询", [
+              "📊 今日统计",
+              "📊 按小时分布（今日）",
+              "📊 本周汇总",
+              "📊 月度汇总",
+              "📊 年度汇总（按月）",
+            ]);
+            if (!report) continue mainMenu;
+            if (report.startsWith("📊 今日")) {
+              await showDay(getDateStr(), ctx, pi);
+            } else if (report.startsWith("📊 按小时")) {
+              await showHourly(getDateStr(), ctx, pi);
+            } else if (report.startsWith("📊 本周")) {
+              await showWeek(ctx, pi);
+            } else if (report.startsWith("📊 月度")) {
+              await showMonth(getMonthStr(), ctx, pi);
+            } else if (report.startsWith("📊 年度")) {
+              await showYear(String(new Date().getFullYear()), ctx, pi);
+            }
+            continue mainMenu;
           }
-          return;
+          if (main.startsWith("📦")) arg = "plan";
+          else if (main.startsWith("⚙️")) arg = "config";
+          else return;
         }
-        if (main.startsWith("📦")) arg = "plan";
-        else if (main.startsWith("⚙️")) arg = "config";
-        else return;
-      }
 
-      // 套餐配额配置
+        // 套餐配额配置
       if (arg === "plan") {
         const provider = ctx.model?.provider;
         if (!provider) {
@@ -2164,9 +2256,18 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         // 套餐用量选择菜单
         const options = ["关闭", ...BUILTIN_PLANS.map(p => p.name)];
         const choice = await ctx.ui.select(
-          "选择 " + provider + " 要显示配额的套餐（选中后退出）",
+          "选择 " + provider + " 要显示配额的套餐（选中后返回）",
           options,
         );
+
+        // Esc 只返回主菜单，不改变当前套餐配置。
+        if (!choice) {
+          if (fromMainMenu) {
+            arg = "";
+            continue mainMenu;
+          }
+          return;
+        }
 
         const defaults: TokenConfig = {
           providerPlans: {},
@@ -2174,7 +2275,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           search: { ...DEFAULT_TOKEN_CONFIG.search! },
         };
 
-        if (!choice || choice === "关闭") {
+        if (choice === "关闭") {
           tokenConfig = tokenConfig
             ? { ...tokenConfig, providerPlans: { ...tokenConfig.providerPlans, [provider]: null } }
             : { ...defaults, providerPlans: { [provider]: null } };
@@ -2193,6 +2294,10 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           }, (tokenConfig?.ttl || 60) * 1000);
           requestFooterRender?.();
           ctx.ui.notify(provider + " 的套餐用量已关闭", "info");
+          if (fromMainMenu) {
+            arg = "";
+            continue mainMenu;
+          }
           return;
         }
         const plan = BUILTIN_PLANS.find(p => p.name === choice);
@@ -2223,6 +2328,10 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             ctx.ui.notify(plan.name + " 配额已启用", "info");
           }
         }
+        if (fromMainMenu) {
+          arg = "";
+          continue mainMenu;
+        }
         return;
       }
 
@@ -2234,7 +2343,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           "查询间隔  (当前 " + (tokenConfig?.ttl || 60) + "s)",
           "🔍 联网搜索",
         ]);
-        if (!subChoice) return;
+        if (!subChoice) break configMenu;
 
         if (subChoice === "显示样式") {
           styleCategoryMenu: while (true) {
@@ -2433,6 +2542,10 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         }
         continue configMenu;
         }
+        if (fromMainMenu) {
+          arg = "";
+          continue mainMenu;
+        }
         return;
       }
 
@@ -2465,11 +2578,26 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         } else {
           ctx.ui.notify("用法: /stats month YYYY-MM", "warning");
         }
+      } else if (arg === "year") {
+        await showYear(String(new Date().getFullYear()), ctx, pi);
+      } else if (arg.startsWith("year ")) {
+        const year = arg.slice(5).trim();
+        if (/^\d{4}$/.test(year)) {
+          await showYear(year, ctx, pi);
+        } else {
+          ctx.ui.notify("用法: /stats year YYYY", "warning");
+        }
       } else {
         ctx.ui.notify(
-          "用法: /stats [day [date] | hour [date] | week | month [YYYY-MM] | config]",
+          "用法: /stats [day [date] | hour [date] | week | month [YYYY-MM] | year [YYYY] | config]",
           "warning",
         );
+      }
+      if (fromMainMenu) {
+        arg = "";
+        continue mainMenu;
+      }
+      return;
       }
     },
   });

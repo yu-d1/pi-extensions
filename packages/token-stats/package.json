@@ -1,6 +1,6 @@
 {
   "name": "@liziy/token-stats",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "pi 的 Token 用量与配额监控扩展 —— Footer 实时显示 5h/周 配额剩余、缓存命中率、输出速率，跑到一半不再被限流中断；JSONL 记录 + /stats 日/小时/周/月多维查询",
   "keywords": [
     "pi-extension",
