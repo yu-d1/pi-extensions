@@ -41,6 +41,10 @@ export class SessionQueueService {
   private userParentMap = new Map<string, string | null>();
   /** 最近一次切换/导航应用的语义（before = 操作前，after = 操作后） */
   private lastAppliedMode: NodeMode | null = null;
+  /** 宿主 /tree 即将跳转的目标 entry，由 session_before_tree 提供。 */
+  private pendingTreeTargetId: string | null = null;
+  /** /rollback 主动导航时，session_tree 事件只需确认，不要重复应用文件。 */
+  private pendingRollbackNavigation: { targetLeafId: string | null } | null = null;
 
   private processing = false;
   // 并发边界：本地单项目使用，保持简单锁；turn_end 与回滚冲突时直接跳过。
@@ -177,6 +181,7 @@ export class SessionQueueService {
         changes: [],
       });
       queue.currentIndex = 0;
+      queue.currentMode = "after";
     }
 
     const collected = this.changeTracker.collect();
@@ -203,6 +208,7 @@ export class SessionQueueService {
       const assistant = currentAssistantText(ctx);
       if (assistant) lastEntry.resultText = assistant;
       queue.currentIndex = queue.entries.length - 1;
+      queue.currentMode = "after";
       this.ensureParentIds(queue);
       this.queueStore.save(workspace, queue);
       return true;
@@ -221,6 +227,7 @@ export class SessionQueueService {
       resultText: currentAssistantText(ctx) || undefined,
     });
     queue.currentIndex = queue.entries.length - 1;
+    queue.currentMode = "after";
     this.ensureParentIds(queue);
     this.queueStore.save(workspace, queue);
 
@@ -261,21 +268,53 @@ export class SessionQueueService {
   // Session Tree 同步
   // ---------------------------------------------------------------------
 
+  prepareSessionTreeNavigation(event: any): void {
+    const targetId = event?.preparation?.targetId;
+    this.pendingTreeTargetId = typeof targetId === "string" ? targetId : null;
+  }
+
   handleSessionTreeNavigation(event: any, ctx: any): void {
-    if (event.fromExtension) return;
+    if (event.fromExtension) {
+      this.pendingTreeTargetId = null;
+      return;
+    }
     if (!this.activeWorkspace || !this.sessionId) return;
+    if (event.newLeafId === event.oldLeafId) {
+      this.pendingTreeTargetId = null;
+      return;
+    }
+
+    // /rollback 已经先恢复文件，再调用宿主导航；这里只确认目标 leaf，避免重复应用。
+    if (this.pendingRollbackNavigation) {
+      const target = this.pendingRollbackNavigation;
+      this.pendingRollbackNavigation = null;
+      this.pendingTreeTargetId = null;
+      if (event.newLeafId === target.targetLeafId) return;
+    }
     if (!this.followSessionTree) return;
-    if (event.newLeafId === event.oldLeafId) return;
     if (this.processing) return;
 
     try {
+      try {
+        this.userParentMap = buildUserParentMap(ctx.sessionManager?.getEntries?.() ?? []);
+      } catch {
+        // 保留已有拓扑，兼容宿主暂时无法读取会话树的情况。
+      }
       const queue = this.queueStore.load(this.activeWorkspace, this.sessionId);
       if (queue.entries.length === 0) return;
 
-      // 优先直接用 session_tree 的 newLeafId 匹配检查点（树形直连）；
-      // 匹配不到再回退到旧的"沿 branch 找最后一条 user 消息"逻辑。
+      // session_before_tree 提供用户实际选中的 entry；选择 user 时，宿主会把 leaf 放到该 user 的 parent。
+      // 没有 preparation 信息时，再使用 newLeafId 和当前 branch 兼容旧事件。
+      const targetId = this.pendingTreeTargetId;
+      this.pendingTreeTargetId = null;
       let idx = -1;
-      if (event.newLeafId) {
+      let targetIsUser = false;
+      if (targetId) {
+        const selectedEntry = ctx.sessionManager?.getEntry?.(targetId);
+        targetIsUser = selectedEntry?.type === "message" && selectedEntry?.message?.role === "user";
+        idx = queue.entries.findIndex((entry) => entry.sessionEntryId === targetId && !entry.residual);
+      }
+      if (idx < 0 && event.newLeafId) {
         idx = queue.entries.findIndex(
           (entry) => entry.sessionEntryId === event.newLeafId && !entry.residual,
         );
@@ -284,12 +323,14 @@ export class SessionQueueService {
         const navUserMsgId = this.findNavigationUserMessageId(event, ctx);
         if (!navUserMsgId) return;
         idx = queue.entries.findIndex((entry) => entry.sessionEntryId === navUserMsgId && !entry.residual);
+        if (!targetId) targetIsUser = true;
       }
       if (idx < 0 || idx >= queue.entries.length) return;
 
-      // 语义：leaf 是 user 节点 → 停在操作前（before）；leaf 在 user 之后（assistant/edit/工具）→ 操作后（after）。
-      const leafIsUser = event.newLeafId ? this.userParentMap.has(event.newLeafId) : false;
-      const mode: NodeMode = leafIsUser ? "before" : "after";
+      // 选择 user 对话时，pi 已将 leaf 放到 user 发送前；选择其他节点时使用节点完成后的状态。
+      const mode: NodeMode = targetIsUser || (!targetId && event.newLeafId && this.userParentMap.has(event.newLeafId))
+        ? "before"
+        : "after";
 
       this.processing = true;
       try {
@@ -330,6 +371,7 @@ export class SessionQueueService {
     const result = applyNodeState(queue, targetIdx, this.snapshotStore, this.logger, force, mode);
     queue.currentIndex = targetIdx;
     this.ensureParentIds(queue);
+    queue.currentMode = mode;
     this.queueStore.save(workspace, queue);
     this.lastFlushedUserMsgId = null;
     this.lastAppliedMode = mode;
@@ -361,6 +403,37 @@ export class SessionQueueService {
       return this.executeNodeSwitchUnlocked(queue, targetIdx, force, mode);
     } finally {
       this.processing = false;
+    }
+  }
+
+  /**
+   * 回滚到指定 user 对话发送前，并同步移动 pi 的 session leaf。
+   * navigateTree 接收 user entry id，宿主会自动将 leaf 放到其 parent。
+   */
+  async rollbackToConversation(targetIdx: number, ctx: any, force = false): Promise<NodeSwitchExecution> {
+    if (!this.activeWorkspace || !this.sessionId) throw new Error("无活跃工作区或 session");
+    const sessionEntries = ctx.sessionManager?.getEntries?.() ?? [];
+    const queue = this.loadCurrentQueue();
+    if (!queue || targetIdx < 0 || targetIdx >= queue.entries.length) throw new Error("目标节点不存在");
+    const targetEntry = queue.entries[targetIdx];
+    const user = sessionEntries.find((entry: any) =>
+      entry?.id === targetEntry.sessionEntryId && entry?.type === "message" && entry?.message?.role === "user",
+    );
+    if (!user?.id) throw new Error("找不到目标对话节点");
+
+    const targetLeafId = typeof user.parentId === "string" ? user.parentId : null;
+    try {
+      // 先恢复目标 user 发送前的文件状态，再移动会话 leaf。
+      const execution = this.switchToNode(targetIdx, force, "before");
+      // 即使当前 leaf 已经位于 user 的 parent，也必须调用 navigateTree(user.id)，
+      // 这样宿主才会把原始 user 文本放回编辑器。
+      this.pendingRollbackNavigation = { targetLeafId };
+      const navigation = await ctx.navigateTree(user.id);
+      if (navigation?.cancelled) throw new Error("会话导航已取消");
+      return execution;
+    } catch (err) {
+      this.pendingRollbackNavigation = null;
+      throw err;
     }
   }
 
@@ -408,6 +481,9 @@ export class SessionQueueService {
     if (!this.activeWorkspace || !this.sessionId) return;
     this.queueStore.clear(this.activeWorkspace, this.sessionId);
     this.lastFlushedUserMsgId = null;
+    this.lastAppliedMode = null;
+    this.pendingTreeTargetId = null;
+    this.pendingRollbackNavigation = null;
     this.changeTracker.reset();
   }
 

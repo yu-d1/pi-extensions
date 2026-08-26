@@ -120,21 +120,9 @@ function getStatusText(): string | undefined {
   return `${ANSI.cyan}●${ANSI.reset} 记录`;
 }
 
-// 让 emoji 前缀视觉对齐：按视觉宽度算（不是码点数）
-// 2 格宽 emoji (📋✅📂⚙️🗑️🧹❌🔗📊) 补 2 空格 → 总 4 格
-// 1 格宽符号 (⏸⏭←) 补 3 空格 → 总 4 格
-function padPrefix(s: string): string {
-  let width = 0;
-  for (const ch of s) {
-    const code = ch.codePointAt(0)!;
-    if (code === 0xFE0F) continue;  // 变体选择符不占位
-    if (code >= 0x1F000) width += 2;                       // 多数 emoji 区段
-    else if (code >= 0x2600 && code <= 0x27FF) width += 2;  // misc + dingbats (✅❌⚙️)
-    else if (code === 0x23F8 || code === 0x23ED) width += 1;  // ⏸⏭ 走文本样式
-    else width += 1;
-  }
-  const pad = Math.max(1, 4 - width);
-  return s + " ".repeat(pad);
+// 旧实现兼容：语义化菜单图标统一使用一个空格分隔文字。
+function padPrefix(icon: string): string {
+  return `${icon} `;
 }
 
 // =============================================================================
@@ -1100,13 +1088,13 @@ async function showRollbackUI(pi: ExtensionAPI, ctx: any): Promise<void> {
       .map((p) => "  ⚠ " + path.relative(activeWorkspace, p))
       .join("\n");
     confirmTitle += `\n⚠ ${plan.conflictPaths.length} 个文件被外部修改：\n` + conflictList;
-    confirmButtons = [padPrefix("✅") + "强制覆盖并回滚", padPrefix("⏭") + "跳过冲突，回滚其他", padPrefix("❌") + "取消"];
+    confirmButtons = [padPrefix("🛡️") + "强制覆盖并回滚", padPrefix("⏭️") + "跳过冲突，回滚其他", padPrefix("🚫") + "取消"];
   } else {
-    confirmButtons = [padPrefix("✅") + "确定回滚", padPrefix("❌") + "取消"];
+    confirmButtons = [padPrefix("🛡️") + "确定回滚", padPrefix("🚫") + "取消"];
   }
 
   const confirm = await ctx.ui.select(confirmTitle, confirmButtons);
-  if (!confirm || confirm === "❌ 取消") return;
+  if (!confirm || confirm.startsWith("🚫")) return;
   if (hasConflict && confirm.includes("强制")) {
     plan.conflictPaths = [];
   }
@@ -1172,15 +1160,15 @@ async function showGlobalConfigUI(ctx: any): Promise<void> {
   while (true) {
     const cfg = loadConfig();
     const opts = [
-      padPrefix("📊") + `每工作区保留队列数: ${cfg.keepQueueCountPerWorkspace}`,
-      padPrefix("🗑️") + `删除工作区时清除数据: ${cfg.clearDataOnRemoveWorkspace ? "是" : "否"}`,
-      padPrefix("🔗") + `跟随 Session Tree: ${cfg.followSessionTree ? "开" : "关"}`,
-      padPrefix("←") + "返回",
+      padPrefix("🔢") + `每工作区保留队列数: ${cfg.keepQueueCountPerWorkspace}`,
+      "🗑️  删除工作区时清除数据: " + (cfg.clearDataOnRemoveWorkspace ? "是" : "否"),
+      padPrefix("🌳") + `跟随 Session Tree: ${cfg.followSessionTree ? "开" : "关"}`,
+      padPrefix("🔙") + "返回",
     ];
     const c = await ctx.ui.select("全局配置", opts);
-    if (!c || c === "← 返回") return;
+    if (!c || c.startsWith("🔙")) return;
 
-    if (c.startsWith("📊")) {
+    if (c.startsWith("🔢")) {
       const presets = ["5", "10", "20", "50"];
       const p = await ctx.ui.select("选择每工作区保留的队列数（当前：" + cfg.keepQueueCountPerWorkspace + "）", presets);
       if (p) {
@@ -1197,7 +1185,7 @@ async function showGlobalConfigUI(ctx: any): Promise<void> {
           : "✅ 删除工作区时保留数据（仅从列表移除）",
         "info",
       );
-    } else if (c.startsWith("🔗")) {
+    } else if (c.startsWith("🌳")) {
       cfg.followSessionTree = !cfg.followSessionTree;
       saveConfig(cfg);
       followSessionTreeEnabled = cfg.followSessionTree;
@@ -1233,10 +1221,10 @@ async function manageWorkspaces(ctx: any): Promise<boolean> {
     } catch {}
     return `${ws}  (${count} queue)${tag}`;
   });
-  wsOptions.push(padPrefix("←") + "返回");
+  wsOptions.push(padPrefix("🔙") + "返回");
 
   const wsChoice = await ctx.ui.select(`已启用的工作区 (${config.workspaces.length})`, wsOptions);
-  if (!wsChoice || wsChoice === "← 返回") return false;
+  if (!wsChoice || wsChoice.startsWith("🔙")) return false;
 
   const selectedWs = config.workspaces.find((ws) => wsChoice.startsWith(ws));
   if (!selectedWs) return false;
@@ -1244,17 +1232,17 @@ async function manageWorkspaces(ctx: any): Promise<boolean> {
   const isCurrent = activeWorkspace && path.resolve(selectedWs) === activeWorkspace;
   const opOptions: string[] = [];
   if (isCurrent) {
-    opOptions.push(padPrefix("⏸") + "停用工作区");
+    opOptions.push(padPrefix("⏸️") + "停用工作区");
   } else {
     opOptions.push(padPrefix("✅") + "启用此工作区");
   }
   opOptions.push(padPrefix("🗑️") + "删除工作区");
-  opOptions.push(padPrefix("←") + "返回");
+  opOptions.push(padPrefix("🔙") + "返回");
 
   const opChoice = await ctx.ui.select(`工作区: ${selectedWs}`, opOptions);
-  if (!opChoice || opChoice === "← 返回") return false;
+  if (!opChoice || opChoice.startsWith("🔙")) return false;
 
-  if (opChoice.startsWith("⏸")) {
+  if (opChoice.startsWith("⏸️")) {
     // 停用：仅清 activeWorkspace，保留在 config 列表里，后续可重新启用
     if (activeWorkspace && path.resolve(selectedWs) === activeWorkspace) {
       activeWorkspace = null;
@@ -1430,12 +1418,12 @@ function __legacyDisabled(pi: ExtensionAPI) {
           padPrefix("📂") + "管理工作区",
           padPrefix("⚙️") + "全局配置",
           padPrefix("🗑️") + "清空当前队列",
-          padPrefix("🧹") + "回收孤儿快照",
-          padPrefix("❌") + "退出菜单",
+          padPrefix("♻️") + "回收孤儿快照",
+          padPrefix("🚪") + "退出菜单",
         ];
 
         const mainChoice = await ctx.ui.select("会话队列回滚", mainOptions);
-        if (!mainChoice || mainChoice.startsWith("❌")) return;
+        if (!mainChoice || mainChoice.startsWith("🚪")) return;
 
         if (mainChoice.startsWith("📋")) {
           await showRollbackUI(pi, ctx);
@@ -1479,7 +1467,7 @@ function __legacyDisabled(pi: ExtensionAPI) {
           ctx.ui.setStatus("session-queue", getStatusText());
           ctx.ui.notify(`✅ 已启用变更记录：${resolved}`, "success");
           return;
-        } else if (mainChoice.startsWith("🧹")) {
+        } else if (mainChoice.startsWith("♻️")) {
           const gc = runGc();
           ctx.ui.notify(
             `🧹 扫描 ${gc.snapScanned} 个快照，删除 ${gc.snapDeleted} 个孤儿，存活 ${gc.live} 个${gc.queueDeleted ? `；清理 ${gc.queueDeleted} 个旧 queue 文件，保留 ${gc.queueKept} 个` : ""}`,

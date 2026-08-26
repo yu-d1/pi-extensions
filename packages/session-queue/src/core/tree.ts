@@ -209,10 +209,12 @@ export function globalBaselineOf(entries: QueueEntry[]): Map<string, NodeStateEn
   return result;
 }
 
-/** 计算"当前磁盘状态"映射（当前检查点的 after + 基线兜底），用于冲突检测。 */
+/** 计算当前磁盘状态映射，用于冲突检测。旧队列按 after 兼容。 */
 export function currentDiskExpectation(queue: QueueData): Map<string, NodeStateEntry> {
   const current = queue.entries[queue.currentIndex];
-  const currentState = nodeStateOf(current, queue.entries);
+  const currentState = queue.currentMode === "before" && current
+    ? targetStateFor(queue, queue.currentIndex, "before")
+    : nodeStateOf(current, queue.entries);
   const baseline = globalBaselineOf(queue.entries);
   const result = new Map(currentState);
   for (const [key, entry] of baseline) {

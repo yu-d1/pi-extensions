@@ -50,6 +50,11 @@ export default function sessionQueueExtension(pi: ExtensionAPI): void {
   });
 
   // ── session_tree ──
+  pi.on("session_before_tree", (event: any, ctx: any) => {
+    if (!service.active || !ctx.hasUI) return;
+    service.prepareSessionTreeNavigation(event, ctx);
+  });
+
   pi.on("session_tree", (event: any, ctx: any) => {
     if (!service.active || !ctx.hasUI) return;
     service.handleSessionTreeNavigation(event, ctx);

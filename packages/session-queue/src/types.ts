@@ -43,6 +43,8 @@ export interface QueueData {
   sessionId: string;
   entries: QueueEntry[];
   currentIndex: number;
+  /** 当前文件状态对应的会话位置；旧数据缺省为 after。 */
+  currentMode?: "before" | "after";
 }
 
 export interface Config {

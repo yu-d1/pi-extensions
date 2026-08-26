@@ -31,6 +31,7 @@ export class QueueStore {
         sessionId,
         entries: parsed.entries,
         currentIndex: typeof parsed.currentIndex === "number" ? parsed.currentIndex : -1,
+        currentMode: parsed.currentMode === "before" || parsed.currentMode === "after" ? parsed.currentMode : undefined,
       };
     } catch (err) {
       // 损坏文件先备份，避免 flushTurn 用空队列覆盖掉全部历史。
@@ -54,6 +55,7 @@ export class QueueStore {
       sessionId: data.sessionId,
       entries: data.entries,
       currentIndex: data.currentIndex,
+      ...(data.currentMode ? { currentMode: data.currentMode } : {}),
     };
     const primaryPath = this.layout.queueFilePath(workspace, data.sessionId);
     atomicWriteFile(primaryPath, JSON.stringify(normalized, null, 2));
@@ -63,6 +65,7 @@ export class QueueStore {
     const data = this.load(workspace, sessionId);
     data.entries = [];
     data.currentIndex = -1;
+    data.currentMode = undefined;
     this.save(workspace, data);
   }
 
