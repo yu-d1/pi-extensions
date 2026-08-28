@@ -232,6 +232,7 @@ function normalizeStore(raw: any): Store {
 									...(typeof m.contextWindow === "number" ? { contextWindow: m.contextWindow } : {}),
 									...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}),
 									...(m.cost ? { cost: m.cost } : {}),
+									...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
 									...(typeof m.enabled === "boolean" ? { enabled: m.enabled } : {}),
 								}))
 						: [],
@@ -959,6 +960,36 @@ function inferModelReasoning(raw: any): boolean {
 	return declared === false ? false : true;
 }
 
+/** pi 官方全档思考等级（off 映射 none，其余恒等），对齐 pi 内置 OpenAI 模型的惯例。 */
+const FULL_THINKING_LEVEL_MAP: Record<string, string> = {
+	off: "none",
+	minimal: "minimal",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+};
+
+/**
+ * 推断模型思考能力 + 思考等级映射。
+ * 服务端能获取到能力声明就使用声明（明确不支持思考 → 只有 off，不补全）；
+ * 获取不到时补全全部等级（含 xhigh/max），使 /settings 中可配置全部档位。
+ */
+function inferModelThinking(raw: any): { reasoning: boolean; thinkingLevelMap?: Record<string, string> } {
+	const values = [
+		raw?.reasoning,
+		raw?.supports_reasoning,
+		raw?.supportsReasoning,
+		raw?.thinking,
+		raw?.capabilities?.reasoning,
+		raw?.capabilities?.thinking,
+	];
+	const declared = values.find((value) => typeof value === "boolean");
+	if (declared === false) return { reasoning: false };
+	return { reasoning: true, thinkingLevelMap: { ...FULL_THINKING_LEVEL_MAP } };
+}
+
 function extractModels(data: any, api: string): StoredModel[] {
 	let arr = data?.data ?? data?.models ?? data?.ids ?? data?.list ?? data?.items;
 	if (!Array.isArray(arr)) arr = [];
@@ -966,7 +997,14 @@ function extractModels(data: any, api: string): StoredModel[] {
 	for (const m of arr) {
 		if (m === undefined || m === null) continue;
 		if (typeof m === "string") {
-			out.push({ id: m, reasoning: inferModelReasoning({ id: m }), input: ["text", "image"], enabled: false });
+			const thinking = inferModelThinking({ id: m });
+			out.push({
+				id: m,
+				reasoning: thinking.reasoning,
+				...(thinking.thinkingLevelMap ? { thinkingLevelMap: thinking.thinkingLevelMap } : {}),
+				input: ["text", "image"],
+				enabled: false,
+			});
 			continue;
 		}
 		const rawId = m?.id ?? m?.name ?? m?.model ?? m?.key ?? (typeof m === "object" ? Object.keys(m)[0] : undefined);
@@ -978,10 +1016,12 @@ function extractModels(data: any, api: string): StoredModel[] {
 			.find((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
 		const maxTokens = [m?.maxTokens, m?.max_tokens, m?.max_output_tokens, m?.limit?.output]
 			.find((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
+		const thinking = inferModelThinking({ ...m, id });
 		out.push({
 			id,
 			name: typeof display === "string" ? display : id,
-			reasoning: inferModelReasoning({ ...m, id }),
+			reasoning: thinking.reasoning,
+			...(thinking.thinkingLevelMap ? { thinkingLevelMap: thinking.thinkingLevelMap } : {}),
 			input: inferModelInput(m),
 			enabled: false,
 			...(contextWindow ? { contextWindow } : {}),
@@ -1517,9 +1557,15 @@ async function addModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 		if (old) {
 			old.input = input;
 		} else {
-			// 仅对明确属于思考模型的模型启用 reasoning，避免普通模型收到不兼容的思考参数。
-			const reasoning = inferModelReasoning({ id });
-			entry.models.push({ id, ...(reasoning ? { reasoning: true } : {}), input, contextWindow: DEFAULT_CONTEXT_WINDOW, enabled: false });
+			// 服务端未声明能力时自动补全全部思考等级（含 xhigh/max），使 /settings 可配置全部档位。
+			const thinking = inferModelThinking({ id });
+			entry.models.push({
+				id,
+				...(thinking.reasoning ? { reasoning: true, thinkingLevelMap: thinking.thinkingLevelMap } : {}),
+				input,
+				contextWindow: DEFAULT_CONTEXT_WINDOW,
+				enabled: false,
+			});
 			added++;
 		}
 	}
