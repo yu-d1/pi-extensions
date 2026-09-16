@@ -178,8 +178,13 @@ max       需要模型声明支持的扩展档位
 - 新增或编辑供应商时会检查 `{baseUrl}/models`。网络失败、地址错误或返回格式无法识别时，会停留在地址输入步骤，修改后可以继续重试。
 - 模型的 `thinkingLevelMap` 映射值会作为对应协议的思考参数发送；服务端未声明能力时扩展自动补全全部档位，如需自定义映射或关闭某档位，可编辑 `config.json`（值为 `null` 的档位在 `/settings` 中不可见）。
 - `openai-codex-responses` 要求 OpenAI 官方 ChatGPT/Codex OAuth JWT，不适用于普通 `sk-...` API 密钥。
+- 通用供应商的系统提示词统一以 `system` 角色发送。pi 默认会在推理模型上改用 `developer` 角色，而多数第三方网关只接受 `system` / `user` / `assistant` / `tool`，会把请求拒为 `400 unknown variant developer`。
 
 ## 版本历史
+
+### 0.2.4
+
+- 通用供应商统一以 `system` 角色发送系统提示词，修复各类中转/代理网关报 `400 unknown variant developer` 的问题
 
 ### 0.2.3
 

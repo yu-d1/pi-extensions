@@ -1082,6 +1082,10 @@ function normalizeModel(m: StoredModel): any {
 		cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		compat: {
 			supportsReasoningEffort: true,
+			// 第三方网关（cctq、各类中转/代理）普遍只接受 system/user/assistant/tool，
+			// pi-ai 默认会在 reasoning 模型上把系统提示词发成 developer 角色，导致 400
+			// “unknown variant `developer`”。这里统一退回 system 角色。
+			supportsDeveloperRole: false,
 		},
 	};
 	if (m.thinkingLevelMap) base.thinkingLevelMap = m.thinkingLevelMap;
