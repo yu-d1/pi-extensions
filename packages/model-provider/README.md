@@ -181,38 +181,14 @@ max       需要模型声明支持的扩展档位
 
 ## 版本历史
 
-### 0.2.6
-
-- 模型管理新增 `删除模型`：选中 → 确认 → 删除，支持连续删除
-
-### 0.2.5
-
-- MiniMax 改为内置固定供应商：移除 `/minimax` 命令与主菜单入口，经 `管理模型` → `配置管理` 进入参数菜单
-- 内置 MiniMax 支持统一的模型管理（启用/刷新/上下文/图片）
-- MiniMax 专属代码拆分到 `minimax.ts`
-
-### 0.2.4
-
-- 通用供应商统一以 `system` 角色发送系统提示词，修复各类中转/代理网关报 `400 unknown variant developer` 的问题
-
-### 0.2.3
-
-- 思考等级自动补全：`/models` 能获取到能力声明时按声明处理（明确返回 `false` 的模型仅保留 `off`）；未声明时自动补全全部思考等级（`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`），`/settings` 可配置全部档位
-- 修复 `normalizeStore` 丢弃 `thinkingLevelMap` 的问题，重启后配置不丢失
-
-- **v0.2.2** — 通用模型同步思考等级，支持发送 `reasoning_effort`。
-
-### 0.2.1
-
-- `/model-provider` 菜单扁平化：移除“Common 供应商”中间层，添加/编辑/删除供应商与 MiniMax 配置一级直达
-- 管理模型：选择供应商后进入操作循环，返回可连续切换供应商；勾选组件 ctrl+s 保存后留在当前界面（footer 显示已保存）
-- 修复异步保存后界面不刷新的问题（一直显示“保存中...”）
-- API 格式选择与通知文案精简
-
-### 0.2.0
-
-- 模型管理改为勾选式（对齐内置 /scoped-models 交互：搜索过滤、enter 切换、ctrl+a 全选、ctrl+x 清空、ctrl+s 保存）
-- 新增/刷新拉取的模型默认不勾选，未勾选的不显示在 `/model`；图片读取支持批量勾选；移除“删除模型”
+- **v0.2.7** — 修复 MiniMax 工具与系统提示词丢失（适配 pi 新 transcript 协议）、思考回传规范（Interleaved 多段保留）、reasoning_effort 档位
+- **v0.2.6** — 模型管理新增删除模型
+- **v0.2.5** — MiniMax 改为内置固定供应商，专属代码拆分至 `minimax.ts`
+- **v0.2.4** — 通用供应商统一 `system` 角色发送系统提示词，修复网关 `400 unknown variant developer`
+- **v0.2.3** — 思考等级自动补全；修复 `thinkingLevelMap` 重启丢失
+- **v0.2.2** — 通用模型同步思考等级，支持发送 `reasoning_effort`
+- **v0.2.1** — `/model-provider` 菜单扁平化；修复保存后界面不刷新
+- **v0.2.0** — 模型管理改为勾选式（对齐 `/scoped-models` 交互），未勾选不显示在 `/model`
 
 ## 许可
 

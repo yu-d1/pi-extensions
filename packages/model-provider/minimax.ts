@@ -263,6 +263,47 @@ function sanitizeOrphanToolCalls(messages: any[]): any[] {
 	return out;
 }
 
+interface ResolvedTranscript {
+	systemPrompt: string | undefined;
+	tools: Tool[];
+	messages: Message[];
+}
+
+/**
+ * 从 transcript 还原 system prompt 与工具集。
+ * pi 的 normalizeContext 会把 Context.systemPrompt / Context.tools 折叠进消息流的
+ * system 消息（content + toolsAdded/toolsRemoved），返回值只有 { messages }；
+ * 若仍按旧字段读 context.tools/systemPrompt 将永远拿到 undefined（工具与系统提示全丢）。
+ * 兼容：旧调用方直接携带顶层字段时优先使用。
+ */
+function resolveTranscript(context: Context): ResolvedTranscript {
+	const tools = new Map<string, Tool>();
+	const systemParts: string[] = [];
+	const messages: Message[] = [];
+	for (const msg of context.messages) {
+		const raw = msg as any;
+		if (raw.role === "system") {
+			const content = raw.content;
+			const text = typeof content === "string"
+				? content
+				: Array.isArray(content)
+					? content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n")
+					: "";
+			if (text.trim()) systemParts.push(text);
+			for (const t of raw.toolsRemoved ?? []) tools.delete(t.name);
+			for (const t of raw.toolsAdded ?? []) tools.set(t.name, t);
+			continue;
+		}
+		messages.push(msg);
+	}
+	for (const t of context.tools ?? []) tools.set(t.name, t);
+	return {
+		systemPrompt: context.systemPrompt ?? (systemParts.length > 0 ? systemParts.join("\n\n") : undefined),
+		tools: [...tools.values()],
+		messages,
+	};
+}
+
 function convertMessages(messages: Message[]): any[] {
 	const result: any[] = [];
 	let pendingToolCallIds = new Set<string>();
@@ -282,13 +323,14 @@ function convertMessages(messages: Message[]): any[] {
 			const blocks: any[] = [];
 			let text = "";
 			const toolCalls: any[] = [];
+			const thinkingParts: string[] = [];
 			for (const block of msg.content) {
 				if (block.type === "text" && block.text.trim()) {
 					text += block.text;
 				} else if (block.type === "thinking") {
-					if (!text.startsWith(" thinking")) {
-						text = ` thinking\n${(block as ThinkingContent).thinking}\n response\n\n${text}`;
-					}
+					// 保留每一段思考（含 Interleaved Thinking 的多段）；丢弃任意一段都会打断思维链。
+					const t = (block as ThinkingContent).thinking;
+					if (t && t.trim()) thinkingParts.push(t);
 				} else if (block.type === "toolCall") {
 					toolCalls.push({
 						id: block.id,
@@ -301,8 +343,26 @@ function convertMessages(messages: Message[]): any[] {
 				}
 			}
 			const assistantMsg: any = { role: "assistant" };
-			if (text) assistantMsg.content = text;
-			else assistantMsg.content = "";
+			if (thinkingParts.length === 0) {
+				assistantMsg.content = text;
+			} else if (getMiniMax().reasoningSplit) {
+				// Interleaved Thinking 友好格式（reasoning_split=true）：思考必须完整回传（官方要求）。
+				// 实测响应字段在 reasoning_content / reasoning_details 间不一致（国内外站差异），
+				// 两个字段都带上，服务端认哪个都能接住。
+				assistantMsg.content = text;
+				assistantMsg.reasoning_content = thinkingParts.join("\n\n");
+				assistantMsg.reasoning_details = thinkingParts.map((t, i) => ({
+					type: "reasoning.text",
+					index: i,
+					format: "MiniMax-response-v1",
+					text: t,
+				}));
+			} else {
+				// 原生格式：思考以 <reasoning_content> 标签嵌入 content，历史中不得修改。
+				assistantMsg.content =
+					thinkingParts.map((t) => `<reasoning_content>${t}</reasoning_content>`).join("\n") +
+					(text ? "\n" + text : "");
+			}
 			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
 			result.push(assistantMsg);
 			for (const tc of toolCalls) pendingToolCallIds.add(tc.id);
@@ -356,6 +416,18 @@ function resolveThinkingType(model: Model<Api>, options?: SimpleStreamOptions): 
 	const mapped = model.thinkingLevelMap?.[options.reasoning];
 	if (mapped === "disabled") return "disabled";
 	return "adaptive";
+}
+
+/**
+ * 思考深度档位：仅 MiniMax-M3.1-Flash-Preview 支持 reasoning_effort
+ * （low/medium/high/xhigh/max，省略时官方默认 max；不支持 none/off）。
+ */
+function resolveReasoningEffort(model: Model<Api>, options?: SimpleStreamOptions): string | undefined {
+	if (!model.reasoning || !model.id.includes("M3.1")) return undefined;
+	const level = options?.reasoning as string | undefined;
+	if (!level || level === "off") return undefined;
+	const mapped = (model.thinkingLevelMap as any)?.[level];
+	return mapped && ["low", "medium", "high", "xhigh", "max"].includes(mapped) ? mapped : undefined;
 }
 
 // =============================================================================
@@ -415,31 +487,34 @@ export function streamMiniMaxChat(
 			const apiKey = options?.apiKey ?? "";
 
 			const thinkingType = resolveThinkingType(model, options);
+			const reasoningEffort = resolveReasoningEffort(model, options);
+			const requestedMaxTokens = cfg.maxCompletionTokens ?? options?.maxTokens ?? model.maxTokens;
+			const maxTokensLimit = getMaxTokensLimit(model.id);
+			const { systemPrompt, tools: callableTools, messages: chatMessages } = resolveTranscript(context);
 			const body: any = {
 				model: model.id,
-				messages: convertMessages(context.messages),
+				messages: convertMessages(chatMessages),
 				service_tier: cfg.serviceTier,
 				reasoning_split: cfg.reasoningSplit,
 				stream: true,
 				stream_options: { include_usage: true },
 				temperature: cfg.temperature,
 				top_p: cfg.topP,
-				max_completion_tokens: Math.max(
-					1,
-					Math.min(
-						cfg.maxCompletionTokens ?? options?.maxTokens ?? model.maxTokens,
-						getMaxTokensLimit(model.id),
-					),
-				),
+				max_completion_tokens: Number.isFinite(requestedMaxTokens as number)
+					? Math.max(1, Math.min(requestedMaxTokens as number, maxTokensLimit))
+					: maxTokensLimit,
 			};
 			if (thinkingType) {
 				body.thinking = { type: thinkingType };
 			}
-			if (context.systemPrompt) {
-				body.messages = [{ role: "system", content: context.systemPrompt }, ...body.messages];
+			if (reasoningEffort) {
+				body.reasoning_effort = reasoningEffort;
 			}
-			if (context.tools && context.tools.length > 0) {
-				body.tools = convertTools(context.tools);
+			if (systemPrompt) {
+				body.messages = [{ role: "system", content: systemPrompt }, ...body.messages];
+			}
+			if (callableTools.length > 0) {
+				body.tools = convertTools(callableTools);
 			}
 
 			const url = `${(model.baseUrl ?? "https://api.minimaxi.com/v1").replace(/\/+$/, "")}/chat/completions`;
