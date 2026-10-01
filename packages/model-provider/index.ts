@@ -898,6 +898,35 @@ async function addModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 	ctx.ui.notify(`已处理 ${list.length} 个模型，新增 ${added} 个（默认未启用）；请到“启用模型”中勾选后使用。`, "info");
 }
 
+/**
+ * 循环删除模型：选中 → 确认 → 删除，可连续删除；返回退出。
+ * 删除的是保存在配置中的模型（含手动新增与刷新拉取的），刷新模型可重新拉取。
+ */
+async function removeModelFlow(ctx: any, entry: ProviderEntry): Promise<void> {
+	if (entry.models.length === 0) {
+		ctx.ui.notify("暂无模型。", "info");
+		return;
+	}
+	while (true) {
+		const options = entry.models.map(
+			(model) => `${model.id}  [上下文 ${formatContextWindow(model.contextWindow)}]${isModelEnabled(model) ? "" : "  [已禁用]"}`,
+		);
+		options.push("返回");
+		const choice = await ctx.ui.select(`删除模型：${entry.name}（共 ${entry.models.length} 个，选中即删除）`, options);
+		if (!choice || choice === "返回") return;
+		const id = choice.split(/\s+\[/)[0];
+		const model = entry.models.find((m) => m.id === id);
+		if (!model) continue;
+		const ok = await ctx.ui.confirm("确认删除", `删除模型 ${id}？\n配置将移除（“刷新模型”可重新拉取，手动新增的需重新添加）。`);
+		if (!ok) continue;
+		entry.models = entry.models.filter((m) => m !== model);
+		reRegisterEntry(entry);
+		await saveStore();
+		ctx.ui.notify(`已删除 ${id}：启用 ${entry.models.filter(isModelEnabled).length} / 共 ${entry.models.length} 个。`, "info");
+		if (entry.models.length === 0) return;
+	}
+}
+
 function parseContextWindowInput(value: string): number | undefined {
 	const match = value.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*(k|m|g)?$/);
 	if (!match) return undefined;
@@ -1349,6 +1378,7 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 			"启用模型",
 			"刷新模型",
 			"新增模型",
+			"删除模型",
 			"修改上下文窗口",
 			"是否支持图片读取",
 			"返回供应商列表",
@@ -1359,6 +1389,7 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 		else if (action === "启用模型") await toggleModelsFlow(ctx, entry);
 		else if (action === "刷新模型") await refreshCommonModels(ctx, entry);
 		else if (action === "新增模型") await addModelsFlow(ctx, entry);
+		else if (action === "删除模型") await removeModelFlow(ctx, entry);
 		else if (action === "修改上下文窗口") await editModelContextFlow(ctx, entry);
 		else if (action === "是否支持图片读取") await editModelInputFlow(ctx, entry);
 	}
