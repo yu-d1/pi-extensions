@@ -30,6 +30,9 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { BUILTIN_PLANS, bindMimoFeedback, checkLoginPlanPrereq, mimoLog, resetMimoLoginBackoff } from "./plans";
+import type { QuotaStyle, TokenPlan } from "./plans";
+export type { QuotaStyle } from "./plans";
 
 // ── 路径 ──────────────────────────────────────────────────
 
@@ -89,20 +92,6 @@ interface DailyRecord {
   sumTokensPerSec: number;
   avgCacheHitRate: number;
 }
-// ── 套餐用量类型 ──────────────────────────────────────────
-
-interface TokenPlan {
-  id: string;
-  name: string;
-  matchProviders: string[];
-  apiKeyEnv: string;
-  baseUrl: string;
-  quotaPath: string;
-  authHeader: (key: string) => Record<string, string>;
-  fetchQuota: (plan: TokenPlan, key: string) => Promise<any>;
-  format: (data: any) => { modelPrefix: string; display: string; color: 'ok' | 'warn' | 'err' };
-}
-
 interface TokenConfig {
   providerPlans: Record<string, string | null>;
   ttl: number;
@@ -118,7 +107,6 @@ interface QuotaCache {
 
 export type ContextStyle = "pct-window" | "used-window" | "pct" | "used" | "bar";
 export type SpeedStyle = "t/s" | "tok/s" | "T/s" | "liveAt";
-export type QuotaStyle = "compact" | "with-clock-7d" | "nearest-clock-7d";
 
 export type DisplayKey =
   | "input"       // 输入（累计输入数 ↑）
@@ -329,7 +317,7 @@ function resetLiveState() {
   stats.liveTokenSamples = [];
 }
 
-function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ctx: ExtensionContext): string[] {
+function buildMetricParts(theme: ExtensionContext["ui"]["theme"], ctx: ExtensionContext): string[] {
   const dim = (s: string) => theme.fg("dim", s);
   const warn = (s: string) => theme.fg("warning", s);
   const ok = (s: string) => theme.fg("success", s);
@@ -439,7 +427,7 @@ function buildMetricParts(theme: ReturnType<ExtensionContext["ui"]["theme"]>, ct
     if (lastQuotaProvider !== null || curProvider !== null) {
       setTimeout(() => {
         if (!sessionActive) return;
-        refreshQuota(ctx, true)
+        refreshQuotaOnce(ctx, true)
           .then(() => requestFooterRender?.())
           .catch(() => { /* ctx 已失效（session 被替换），忽略 */ });
       }, 0);
@@ -699,6 +687,72 @@ function rebuildFromHistory(ctx: ExtensionContext) {
 }
 // ── 套餐用量工具 ─────────────────────────────────────────
 
+/**
+ * 套餐选择：TUI 走带搜索的单选组件（↑↓ 选择、输入即过滤、enter 选中即关闭），
+ * 非 TUI 环境退回 select。返回 null = 用户取消。
+ */
+async function pickQuotaPlan(ctx: ExtensionContext, provider: string): Promise<string | null> {
+  const options = ["关闭", ...BUILTIN_PLANS.map((p) => p.name)];
+  if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
+    const entries: ToggleEntry[] = options.map((name) => ({ id: name, primary: name }));
+    const ids = await ctx.ui.custom<string[] | null>(
+      (tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
+        new ToggleSelectorComponent(
+          tui,
+          {
+            title: "选择 " + provider + " 的配额套餐",
+            subtitle: "enter 选中即生效并关闭弹窗 · 直接输入可搜索过滤",
+            countLabel: "套餐",
+            mode: "single",
+          },
+          entries,
+          [],
+          keybindings,
+          theme,
+          done,
+        ),
+    );
+    if (!ids || ids.length === 0) return null;
+    return ids[0];
+  }
+  return (await ctx.ui.select("选择 " + provider + " 要显示配额的套餐（选中后关闭）", options)) ?? null;
+}
+
+/** 保存套餐选择（plan=null 表示关闭），刷新 footer 并提示结果。 */
+async function applyQuotaPlan(ctx: ExtensionContext, provider: string, plan: TokenPlan | null): Promise<void> {
+  const defaults: TokenConfig = { providerPlans: {}, ttl: 60 };
+  const planId = plan ? plan.id : null;
+  tokenConfig = tokenConfig
+    ? { ...tokenConfig, providerPlans: { ...tokenConfig.providerPlans, [provider]: planId } }
+    : { ...defaults, providerPlans: { [provider]: planId } };
+  await saveTokenConfig(tokenConfig);
+  lastQuotaProvider = provider;
+  quotaState = null;
+  if (plan) await forceRefreshQuota(ctx);
+  if (quotaTimerId) clearInterval(quotaTimerId);
+  quotaTimerId = setInterval(async () => {
+    if (!sessionActive) return;
+    try {
+      await refreshQuotaOnce(ctx);
+    } catch { /* ctx 已失效（session 被替换），忽略 */ }
+    requestFooterRender?.();
+  }, (tokenConfig?.ttl || 60) * 1000);
+  requestFooterRender?.();
+  if (!plan) {
+    ctx.ui.notify(provider + " 的套餐用量已关闭", "info");
+    return;
+  }
+  // forceRefreshQuota 在上面同步改写了 quotaState，这里重新读取（TS 看不到跨 await 的副作用）
+  const st = quotaState as { error?: unknown; [k: string]: unknown } | null;
+  if (st?.error) {
+    // 仅当 quotaState 带有 error 字段时（key 缺失 / API 错误 / 网络错误 / 无数据）才提示"查询失败"
+    // 不能用 color === "err" 判断，因为 5h 剩余 < 20% 的正常状态也会用 err 颜色（仅用于 footer 高亮）
+    ctx.ui.notify(`${plan.name} 配额查询失败：${formatQuotaError(quotaState)}`, "info");
+  } else {
+    ctx.ui.notify(plan.name + " 配额已启用", "info");
+  }
+}
+
 const TOKEN_CONFIG_DIR = join(homedir(), ".pi/agent/extensions/token-stats");
 const TOKEN_CONFIG_FILE = join(TOKEN_CONFIG_DIR, "config.json");
 const QUOTA_CACHE_FILE = join(LOGS_DIR, "quota-cache.json");
@@ -741,6 +795,8 @@ interface ToggleSelectorOptions {
   title: string;
   subtitle: string;
   countLabel: string;
+  /** single：enter 选中即返回（单选，如套餐选择）；toggle：勾选 + ctrl+s 保存（默认）。 */
+  mode?: "toggle" | "single";
 }
 
 /**
@@ -795,7 +851,13 @@ class ToggleSelectorComponent extends Container {
     this.addChild(new Spacer(1));
     this.addChild(new Text(this.theme.fg("accent", this.theme.bold(options.title)), 0, 0));
     this.addChild(
-      new Text(this.theme.fg("muted", `${options.subtitle} · ${this.keyLabel("app.models.save")} 保存`), 0, 0),
+      new Text(
+        this.theme.fg(
+          "muted",
+          options.mode === "single" ? options.subtitle : `${options.subtitle} · ${this.keyLabel("app.models.save")} 保存`,
+        ),
+        0, 0,
+      ),
     );
     this.addChild(new Spacer(1));
     this.searchInput = new Input();
@@ -857,14 +919,22 @@ class ToggleSelectorComponent extends Container {
   }
 
   private getFooterText(): string {
-    const parts = [
-      `${this.keyLabel("tui.select.confirm")} 切换`,
-      `${this.keyLabel("app.models.enableAll")} 全选`,
-      `${this.keyLabel("app.models.clearAll")} 清空`,
-      `${this.keyLabel("app.models.save")} 保存`,
-      "esc 取消",
-      `${this.options.countLabel} ${this.markedIds.length}/${this.allIds.length}`,
-    ];
+    const single = this.options.mode === "single";
+    const parts = single
+      ? [
+          `${this.keyLabel("tui.select.confirm")} 选中并关闭`,
+          "直接输入可搜索过滤",
+          "esc 取消",
+          `共 ${this.filteredItems.length} 项`,
+        ]
+      : [
+          `${this.keyLabel("tui.select.confirm")} 切换`,
+          `${this.keyLabel("app.models.enableAll")} 全选`,
+          `${this.keyLabel("app.models.clearAll")} 清空`,
+          `${this.keyLabel("app.models.save")} 保存`,
+          "esc 取消",
+          `${this.options.countLabel} ${this.markedIds.length}/${this.allIds.length}`,
+        ];
     const text = `  ${parts.join(" · ")}${this.saveNote ? ` · ${this.saveNote}` : ""}`;
     return this.isDirty ? this.theme.fg("dim", text) + this.theme.fg("warning", " （未保存）") : this.theme.fg("dim", text);
   }
@@ -897,7 +967,7 @@ class ToggleSelectorComponent extends Container {
       const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
       const primary = isSelected ? this.theme.fg("accent", item.entry.primary) : item.entry.primary;
       const badge = item.entry.badge ? this.theme.fg("muted", ` ${item.entry.badge}`) : "";
-      const status = item.marked ? this.theme.fg("success", " ✓") : this.theme.fg("dim", " ✗");
+      const status = this.options.mode === "single" ? "" : item.marked ? this.theme.fg("success", " ✓") : this.theme.fg("dim", " ✗");
       this.listContainer.addChild(new Text(`${prefix}${primary}${badge}${status}`, 0, 0));
     }
     if (startIndex > 0 || endIndex < this.filteredItems.length) {
@@ -928,6 +998,10 @@ class ToggleSelectorComponent extends Container {
     }
     if (kb.matches(data, "tui.select.confirm")) {
       const item = this.filteredItems[this.selectedIndex];
+      if (this.options.mode === "single") {
+        if (item) this.done([item.entry.id]);
+        return;
+      }
       if (item) {
         const index = this.markedIds.indexOf(item.entry.id);
         if (index >= 0) this.markedIds.splice(index, 1);
@@ -938,6 +1012,7 @@ class ToggleSelectorComponent extends Container {
       return;
     }
     if (kb.matches(data, "app.models.enableAll")) {
+      if (this.options.mode === "single") return;
       const targets = this.searchInput.getValue() ? this.filteredItems.map((i) => i.entry.id) : this.allIds;
       for (const id of targets) {
         if (!this.markedIds.includes(id)) this.markedIds.push(id);
@@ -947,6 +1022,7 @@ class ToggleSelectorComponent extends Container {
       return;
     }
     if (kb.matches(data, "app.models.clearAll")) {
+      if (this.options.mode === "single") return;
       if (this.searchInput.getValue()) {
         const targets = new Set(this.filteredItems.map((i) => i.entry.id));
         this.markedIds = this.markedIds.filter((id) => !targets.has(id));
@@ -958,6 +1034,7 @@ class ToggleSelectorComponent extends Container {
       return;
     }
     if (kb.matches(data, "app.models.save")) {
+      if (this.options.mode === "single") return;
       this.triggerSave();
       return;
     }
@@ -980,214 +1057,6 @@ class ToggleSelectorComponent extends Container {
 }
 
 // ── 内置套餐定义 ─────────────────────────────────────────
-
-function formatDuration(ms: number): string {
-  if (ms <= 0) return "";
-  if (ms >= 24 * 60 * 60 * 1000) {
-    const days = Math.floor(ms / (24 * 60 * 60 * 1000));
-    const hours = Math.floor((ms % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
-    if (days >= 7) return `${Math.floor(days / 7)}w ${days % 7}d`;
-    return `${days}d ${hours}h`;
-  }
-  const hours = Math.floor(ms / (60 * 60 * 1000));
-  const mins = Math.floor((ms % (60 * 60 * 1000)) / (60 * 1000));
-  if (hours > 0) return `${hours}h ${mins}m`;
-  return `${mins}m`;
-}
-
-function formatTokenPlanDisplay(
-  intervalRemaining: number,
-  weeklyRemaining: number,
-  intervalResetMs?: number | null,
-  weeklyResetMs?: number | null,
-  style: QuotaStyle = "with-clock-7d",
-): string {
-  const formatPercent = (value: number) => `${Math.round(value)}%`;
-  const formatClock = (resetMs?: number | null) => {
-    if (!resetMs || resetMs <= 0) return "";
-    const diff = resetMs - Date.now();
-    return diff > 0 && diff < 30 * 24 * 60 * 60 * 1000
-      ? ` ⏱ ${formatDuration(diff)}`
-      : "";
-  };
-  const interval = `5h: ${formatPercent(intervalRemaining)}`;
-  const weeklyLabel = "7d";
-  const weekly = `${weeklyLabel}: ${formatPercent(weeklyRemaining)}`;
-  if (style === "compact") return `${interval} ${weekly}`;
-  if (style === "nearest-clock-7d") {
-    const resets = [intervalResetMs, weeklyResetMs].filter(
-      (value): value is number => typeof value === "number" && value > Date.now(),
-    );
-    const nearest = resets.length > 0 ? Math.min(...resets) : null;
-    const clock = formatClock(nearest);
-    return `${interval} ${weekly}${clock}`;
-  }
-  const intervalClock = formatClock(intervalResetMs);
-  const weeklyClock = formatClock(weeklyResetMs);
-  return `${interval}${intervalClock} ${weekly}${weeklyClock}`;
-}
-
-const BUILTIN_PLANS: TokenPlan[] = [
-  {
-    id: "minimax",
-    name: "MiniMax",
-    matchProviders: ["minimax_local", "minimax-cn", "minimax"],
-    apiKeyEnv: "MINIMAX_API_KEY",
-    baseUrl: "https://api.minimaxi.com",
-    quotaPath: "/v1/api/openplatform/coding_plan/remains",
-    authHeader: (key) => ({ Authorization: "Bearer " + key }),
-    fetchQuota: async (plan: TokenPlan, key: string) => {
-      const url = "https://api.minimaxi.com" + plan.quotaPath;
-      const r = await fetch(url, {
-        method: "GET",
-        headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(5000),
-      });
-      const data = await r.json();
-      if (data.base_resp?.status_code === 0) return data;
-      throw new Error(data.base_resp?.status_msg || "MiniMax 返回错误");
-    },
-    format: (data: any) => {
-      const models = data.model_remains || [];
-      // MiniMax 官方接口 2026-07 起 model_name 改为 general / video 等语义化命名，
-      // 不再是 MiniMax-M2 / MiniMax-M3。
-      // 优先取 "general"（通用文本/编码套餐），否则取第一项
-      const m =
-        models.find((x: any) => x.model_name === "general") ||
-        models.find((x: any) => x.model_name?.includes("M2")) ||
-        models[0];
-      if (!m) return { modelPrefix: "", display: "无数据", color: "err" as const };
-      const intervalRemaining = m.current_interval_remaining_percent ?? 0;
-      const weeklyRemaining = m.current_weekly_remaining_percent ?? 0;
-      const now = Date.now();
-      const intervalReset = typeof m.end_time === "number" && m.end_time > now ? m.end_time : null;
-      const weeklyReset = typeof m.weekly_end_time === "number" && m.weekly_end_time > now ? m.weekly_end_time : null;
-      return {
-        modelPrefix: "",
-        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, displayConfig.quotaStyle),
-        color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
-      };
-    },
-  },
-  {
-    id: "glm",
-    name: "GLM (智谱)",
-    matchProviders: ["zhipu-cn", "zhipu", "glm", "bigmodel"],
-    apiKeyEnv: "GLM_API_KEY",
-    baseUrl: "https://open.bigmodel.cn",
-    quotaPath: "/api/monitor/usage/quota/limit",
-    authHeader: (key) => ({ Authorization: key }),
-    fetchQuota: async (plan: TokenPlan, key: string) => {
-      const r = await fetch(plan.baseUrl + plan.quotaPath, {
-        method: "GET",
-        headers: { ...plan.authHeader(key), "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!r.ok) throw new Error("GLM 配额查询 HTTP " + r.status);
-      return await r.json();
-    },
-    format: (data: any) => {
-      const limits = data?.data?.limits || [];
-      const tokenLimits = limits.filter((x: any) => (x.type || "").toLowerCase() === "tokens_limit");
-      if (tokenLimits.length === 0) return { modelPrefix: "", display: "无数据", color: "err" as const };
-      let fiveHour = tokenLimits[0];
-      let weekly = tokenLimits[1];
-      if (fiveHour?.unit === 6) [fiveHour, weekly] = [weekly, fiveHour];
-      const intervalRemaining = 100 - (fiveHour?.percentage ?? 0);
-      const weeklyRemaining = 100 - (weekly?.percentage ?? 0);
-      const now = Date.now();
-      const intervalReset = typeof fiveHour?.nextResetTime === "number" && fiveHour.nextResetTime > now ? fiveHour.nextResetTime : null;
-      const weeklyReset = typeof weekly?.nextResetTime === "number" && weekly.nextResetTime > now ? weekly.nextResetTime : null;
-      return {
-        modelPrefix: "",
-        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, displayConfig.quotaStyle),
-        color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
-      };
-    },
-  },
-  {
-    id: "kimi",
-    name: "Kimi",
-    matchProviders: ["moonshot-cn", "moonshot", "kimi"],
-    apiKeyEnv: "MOONSHOT_API_KEY",
-    baseUrl: "https://api.kimi.com",
-    quotaPath: "/coding/v1/usages",
-    authHeader: (key) => ({ Authorization: "Bearer " + key }),
-    fetchQuota: async (plan: TokenPlan, key: string) => {
-      const r = await fetch(plan.baseUrl + plan.quotaPath, {
-        method: "GET",
-        headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!r.ok) throw new Error("Kimi 配额查询 HTTP " + r.status);
-      return await r.json();
-    },
-    format: (data: any) => {
-      // ponytail: 5h 窗口与周配额分开计时，各自显示倒计时（原逻辑只显示二者较早的一个，易误导）
-      const limits = data.limits || [];
-      let intervalRemaining = 100;
-      let intervalReset: number | null = null;
-      if (limits.length > 0) {
-        const d = limits[0].detail || {};
-        const limit = d.limit || 1;
-        const remaining = Math.max(d.remaining ?? 0, 0);
-        intervalRemaining = (remaining / limit) * 100;
-        const rt = d.resetTime;
-        if (rt) {
-          const ms = typeof rt === "string" ? new Date(rt).getTime() : rt;
-          if (ms > Date.now()) intervalReset = ms;
-        }
-      }
-      const usage = data.usage || {};
-      let weeklyRemaining = 100;
-      let weeklyReset: number | null = null;
-      if (usage.limit) {
-        const remaining = Math.max(usage.remaining ?? 0, 0);
-        weeklyRemaining = (remaining / usage.limit) * 100;
-        const rt = usage.resetTime;
-        if (rt) {
-          const ms = typeof rt === "string" ? new Date(rt).getTime() : rt;
-          if (ms > Date.now()) weeklyReset = ms;
-        }
-      }
-      if (intervalRemaining >= 100 && weeklyRemaining >= 100) return { modelPrefix: "", display: "无数据", color: "err" as const };
-      return {
-        modelPrefix: "",
-        display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, displayConfig.quotaStyle),
-        color: intervalRemaining < 20 || weeklyRemaining < 20 ? "err" as const : intervalRemaining < 50 || weeklyRemaining < 50 ? "warn" as const : "ok" as const,
-      };
-    },
-  },
-  {
-    id: "deepseek",
-    name: "DeepSeek",
-    matchProviders: ["deepseek-cn", "deepseek"],
-    apiKeyEnv: "DEEPSEEK_API_KEY",
-    baseUrl: "https://api.deepseek.com",
-    quotaPath: "/user/balance",
-    authHeader: (key) => ({ Authorization: "Bearer " + key }),
-    fetchQuota: async (plan: TokenPlan, key: string) => {
-      const r = await fetch(plan.baseUrl + plan.quotaPath, {
-        method: "GET",
-        headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!r.ok) throw new Error("DeepSeek 配额查询 HTTP " + r.status);
-      return await r.json();
-    },
-    format: (data: any) => {
-      const infos = data?.balance_infos || [];
-      const cny = infos.find((x: any) => x.currency === "CNY") || infos[0];
-      if (!cny) return { modelPrefix: "", display: "无数据", color: "err" as const };
-      const total = parseFloat(cny.total_balance || "0");
-      return {
-        modelPrefix: "",
-        display: "¥" + total.toFixed(1),
-        color: total < 1 ? "warn" as const : "ok" as const,
-      };
-    },
-  },
-];
 
 // ── 配置文件操作 ─────────────────────────────────────────
 
@@ -1339,6 +1208,9 @@ async function ensureFreshOAuth(providerId: string, entry: any): Promise<string 
 }
 
 function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
+  // 0. 登录态套餐：凭据是控制台网页登录 Cookie，单独存放；
+  //    auth.json 里同名的 api key 是推理域用的，拿来查套餐必 401。
+  if (plan.needsLogin) return plan.readCredential?.() ?? null;
   // 1. 环境变量优先
   if (plan.apiKeyEnv && process.env[plan.apiKeyEnv]) {
     return process.env[plan.apiKeyEnv]!;
@@ -1440,6 +1312,10 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   // 1. 先检测 provider 变化（可能清空 quotaState）
   detectAndHandleProviderChange(ctx);
 
+  // 1.5 主动刷新（启用套餐 / 手动刷新 / 首次进入）时清掉登录退避，
+  //     否则用户刚点完「启用」就被上一次失败的 10 分钟退避卡住，看起来像没反应。
+  if (force) resetMimoLoginBackoff();
+
   const curProvider = ctx.model?.provider;
   if (!curProvider) return; // provider 缺失：不显示
 
@@ -1468,7 +1344,7 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
 
   // 3. 解析 key
   const key = freshAccess ?? resolveApiKey(plan, curProvider);
-  if (!key) {
+  if (!key && !plan.needsLogin) {
     quotaState = buildErrorState(curProvider, plan.id, {
       kind: "key_missing",
       envVar: plan.apiKeyEnv || "API_KEY",
@@ -1476,13 +1352,14 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
     });
     return;
   }
+  // 登录态套餐即使没有凭据也要往下走：它的 fetchQuota 会自行静默续期
 
   // 4. 读缓存（force 时跳过）
   const cache = await readQuotaCache();
   const cached = cache[plan.id];
   if (oauthExpired) {
     if (cached) {
-      const fmt = plan.format(cached.data);
+      const fmt = plan.format(cached.data, displayConfig.quotaStyle);
       quotaState = {
         planId: plan.id,
         provider: curProvider,
@@ -1498,7 +1375,7 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   }
   const ttlMs = (tokenConfig?.ttl || 60) * 1000;
   if (!force && cached && (Date.now() - cached.fetchedAt) < cached.ttl) {
-    const fmt = plan.format(cached.data);
+    const fmt = plan.format(cached.data, displayConfig.quotaStyle);
     quotaState = {
       planId: plan.id,
       provider: curProvider,
@@ -1512,10 +1389,10 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
 
   // 5. 调接口
   try {
-    const data = await plan.fetchQuota(plan, key);
+    const data = await plan.fetchQuota(plan, key ?? "");
     cache[plan.id] = { fetchedAt: Date.now(), ttl: ttlMs, data };
     await writeQuotaCache(cache);
-    const fmt = plan.format(data);
+    const fmt = plan.format(data, displayConfig.quotaStyle);
     // format 可能返回 "无数据" 颜色为 err
     if (fmt.color === "err" && fmt.display === "无数据") {
       quotaState = buildErrorState(curProvider, plan.id, { kind: "no_data" });
@@ -1532,6 +1409,12 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
       fetchedAt: Date.now(),
     };
   } catch (e: any) {
+    // 套餐自带静默失败（如 mimo 登录态不可用）：隐藏该段，不打扰
+    if (e?.silent) {
+      quotaState = null;
+      mimoLog("silent-fail", e.message);
+      return;
+    }
     // 区分网络错误与 API 业务错误
     const msg = e?.message || String(e);
     const isNetwork = /timeout|abort|fetch failed|network|econnreset|enotfound/i.test(msg);
@@ -1543,8 +1426,37 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
 }
 
 async function forceRefreshQuota(ctx: ExtensionContext) {
-  await refreshQuota(ctx, true);
+  await refreshQuotaOnce(ctx, true);
   requestFooterRender?.();
+}
+
+/**
+ * 单飞：session_start / provider 变化检测 / 定时器 / 手动刷新
+ * 都可能同时打到 refreshQuota，并发会同时启多个 Chrome 并互相抢 profile。
+ */
+let quotaRefreshInFlight: Promise<void> | null = null;
+/** 在途刷新期间收到的 force 请求：不能被降级成复用，结束后补跑一次 */
+let quotaRefreshPendingForce = false;
+function refreshQuotaOnce(ctx: ExtensionContext, force = false): Promise<void> {
+  if (quotaRefreshInFlight) {
+    if (force) quotaRefreshPendingForce = true;
+    mimoLog("refresh-dedup", `force=${force} 复用进行中的刷新${force ? "（已标记补跑 force）" : ""}`);
+    return quotaRefreshInFlight;
+  }
+  const p = (async () => {
+    let nextForce = force;
+    for (;;) {
+      quotaRefreshPendingForce = false;
+      await refreshQuota(ctx, nextForce);
+      if (!quotaRefreshPendingForce) break;
+      nextForce = true;
+      mimoLog("refresh-deferred-force", "在途刷新结束，补跑一次 force");
+    }
+  })().finally(() => {
+    quotaRefreshInFlight = null;
+  });
+  quotaRefreshInFlight = p;
+  return p;
 }
 
 /** 清空所有套餐缓存（session_start 调，避免 P7） */
@@ -1863,7 +1775,14 @@ async function showMonth(month: string, ctx: ExtensionContext, pi: ExtensionAPI)
 export default function tokenStatsExtension(pi: ExtensionAPI) {
   // ── message renderer: 渲染 /stats 发出的消息 ─────────
   pi.registerMessageRenderer("token-stats", (message, _options, _theme) => {
-    return new Text(message.content, 0, 0);
+    // content 可能是字符串，也可能是内容块数组（如 pi.sendMessage 传入的 TextContent[]）
+    const content: any = message.content;
+    const text = typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content.filter((b: any) => b?.type === "text").map((b: any) => b.text).join("\n")
+        : "";
+    return new Text(text, 0, 0);
   });
 
   // ── turn_start: 记录时间 + 检测供应商切换 ──────────
@@ -1882,7 +1801,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     if (ctx.model?.provider !== lastQuotaProvider) {
       lastQuotaProvider = ctx.model?.provider ?? null;
       quotaState = null; // 跨 provider 立即清旧 state
-      await refreshQuota(ctx, true); // force 绕过缓存
+      await refreshQuotaOnce(ctx, true); // force 绕过缓存
       requestFooterRender?.();
     }
 
@@ -2052,6 +1971,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     requestFooterRender = null;
     lastQuotaProvider = null;
     quotaState = null;
+    bindMimoFeedback(null, null);
   });
 
   // ── session_start: 恢复累计状态 + 注册 footer ───────
@@ -2059,6 +1979,12 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     sessionActive = true;
     rebuildFromHistory(ctx);
+    bindMimoFeedback(
+      typeof ctx.ui?.setWorkingMessage === "function"
+        ? (message: string) => ctx.ui.setWorkingMessage!(message)
+        : null,
+      (message: string) => ctx.ui.notify(message, "info"),
+    );
 
     // 套餐用量：加载配置 + 定时刷新
     tokenConfig = await loadTokenConfig();
@@ -2069,16 +1995,16 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     await invalidateAllQuotaCache();
     if (quotaTimerId) clearInterval(quotaTimerId);
     // 第一次强制刷新（绕缓存）
-    await refreshQuota(ctx, true);
+    await refreshQuotaOnce(ctx, true);
     requestFooterRender?.();
     quotaTimerId = setInterval(async () => {
       if (!sessionActive) return;
       try {
         // 定时器也先检测 provider 变化；变化则 force refresh
         if (ctx.model?.provider !== lastQuotaProvider) {
-          await refreshQuota(ctx, true);
+          await refreshQuotaOnce(ctx, true);
         } else {
-          await refreshQuota(ctx, false);
+          await refreshQuotaOnce(ctx, false);
         }
       } catch { /* ctx 已失效（session 被替换），忽略本次刷新 */ }
       requestFooterRender?.();
@@ -2191,83 +2117,24 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           ctx.ui.notify("无法获取当前供应商，请先切换对话", "warning");
           return;
         }
-        // 套餐用量选择菜单
-        const options = ["关闭", ...BUILTIN_PLANS.map(p => p.name)];
-        const choice = await ctx.ui.select(
-          "选择 " + provider + " 要显示配额的套餐（选中后返回）",
-          options,
-        );
-
-        // Esc 只返回主菜单，不改变当前套餐配置。
-        if (!choice) {
-          if (fromMainMenu) {
-            arg = "";
-            continue mainMenu;
+        // 套餐选择：TUI 用带搜索的单选组件，非 TUI 退回 select。
+        // 前置检查不通过（如缺 Chrome）时留在界面重选；选中后保存并关闭弹窗。
+        while (true) {
+          const choice = await pickQuotaPlan(ctx, provider);
+          if (!choice) return; // esc：直接关闭
+          const plan = choice === "关闭" ? null : (BUILTIN_PLANS.find((p) => p.name === choice) ?? null);
+          if (choice !== "关闭" && !plan) continue;
+          if (plan) {
+            const prereq = await checkLoginPlanPrereq(plan);
+            if (prereq) {
+              ctx.ui.notify("无法启用「" + plan.name + "」\n" + prereq, "warning");
+              continue; // 留在选择界面重选
+            }
           }
-          return;
+          await applyQuotaPlan(ctx, provider, plan);
+          return; // 选中即关闭弹窗
         }
-
-        const defaults: TokenConfig = {
-          providerPlans: {},
-          ttl: 60,
-        };
-
-        if (choice === "关闭") {
-          tokenConfig = tokenConfig
-            ? { ...tokenConfig, providerPlans: { ...tokenConfig.providerPlans, [provider]: null } }
-            : { ...defaults, providerPlans: { [provider]: null } };
-          await saveTokenConfig(tokenConfig);
-          lastQuotaProvider = provider;
-          quotaState = null;
-          if (quotaTimerId) clearInterval(quotaTimerId);
-          quotaTimerId = setInterval(async () => {
-            if (!sessionActive) return;
-            try {
-              await refreshQuota(ctx);
-            } catch { /* ctx 已失效（session 被替换），忽略 */ }
-            requestFooterRender?.();
-          }, (tokenConfig?.ttl || 60) * 1000);
-          requestFooterRender?.();
-          ctx.ui.notify(provider + " 的套餐用量已关闭", "info");
-          if (fromMainMenu) {
-            arg = "";
-            continue mainMenu;
-          }
-          return;
-        }
-        const plan = BUILTIN_PLANS.find(p => p.name === choice);
-        if (plan) {
-          tokenConfig = tokenConfig
-            ? { ...tokenConfig, providerPlans: { ...tokenConfig.providerPlans, [provider]: plan.id } }
-            : { ...defaults, providerPlans: { [provider]: plan.id } };
-          await saveTokenConfig(tokenConfig);
-          lastQuotaProvider = provider;
-          // 立即查询
-          await forceRefreshQuota(ctx);
-          if (quotaTimerId) clearInterval(quotaTimerId);
-          quotaTimerId = setInterval(async () => {
-            if (!sessionActive) return;
-            try {
-              await refreshQuota(ctx);
-            } catch { /* ctx 已失效（session 被替换），忽略 */ }
-            requestFooterRender?.();
-          }, (tokenConfig?.ttl || 60) * 1000);
-          if (quotaState?.error) {
-            // 仅当 quotaState 带有 error 字段时（key 缺失 / API 错误 / 网络错误 / 无数据）才提示"查询失败"
-            // 不能用 color === "err" 判断，因为 5h 剩余 < 20% 的正常状态也会用 err 颜色（仅用于 footer 高亮）
-            const errMsg = formatQuotaError(quotaState);
-            ctx.ui.notify(`${plan.name} 配额查询失败：${errMsg}`, "info");
-          } else {
-            ctx.ui.notify(plan.name + " 配额已启用", "info");
-          }
-        }
-        if (fromMainMenu) {
-          arg = "";
-          continue mainMenu;
-        }
-        return;
       }
-
       if (arg === "config") {
         configMenu: while (true) {
         const subChoice = await ctx.ui.select("Token 统计配置", [
@@ -2437,7 +2304,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
               quotaTimerId = setInterval(async () => {
                 if (!sessionActive) return;
                 try {
-                  await refreshQuota(ctx);
+                  await refreshQuotaOnce(ctx);
                 } catch { /* ctx 已失效（session 被替换），忽略 */ }
                 requestFooterRender?.();
               }, sec * 1000);
