@@ -13,4 +13,4 @@ import { mimoPlan } from "./mimo";
 export const BUILTIN_PLANS: TokenPlan[] = [minimaxPlan, glmPlan, kimiPlan, deepseekPlan, mimoPlan];
 
 export { checkLoginPlanPrereq, mimoLog, bindMimoFeedback, resetMimoLoginBackoff } from "./mimo";
-export type { QuotaStyle, TokenPlan } from "./shared";
+export type { PlanFormatContext, QuotaStyle, TokenPlan } from "./shared";

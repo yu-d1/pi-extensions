@@ -31,7 +31,9 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { BUILTIN_PLANS, bindMimoFeedback, checkLoginPlanPrereq, mimoLog, resetMimoLoginBackoff } from "./plans";
-import type { QuotaStyle, TokenPlan } from "./plans";
+import type { PlanFormatContext, QuotaStyle, TokenPlan } from "./plans";
+import type { TokenPrecision } from "./format";
+import { formatAmount, formatDuration, formatLatency, formatPercent, formatSpeed, formatTokens } from "./format";
 export type { QuotaStyle } from "./plans";
 
 // ── 路径 ──────────────────────────────────────────────────
@@ -109,21 +111,35 @@ export type ContextStyle = "pct-window" | "used-window" | "pct" | "used" | "bar"
 export type SpeedStyle = "t/s" | "tok/s" | "T/s" | "liveAt";
 
 export type DisplayKey =
-  | "input"       // 输入（累计输入数 ↑）
   | "output"      // 输出（累计输出数 ↓）
+  | "cost"        // 会话花费（$）
+  | "input"       // 输入（累计输入数 ↑）
   | "totalTokens" // 总token（累计输入+输出）
   | "cacheHit"    // 缓存命中率
   | "speed"       // 速度（tok/s）
+  | "latency"     // 首 token 延迟（TTFT）
   | "context"     // 容量（🧠 ctx%）
-  | "quota5h"     // 5h 额度
-  | "quotaWeek"   // 周额度（各自包含对应刷新倒计时）
-  | "thinking";   // 思考强度（TH）
+  | "quota"       // 套餐余量（样式由 quotaStyle 决定）
+  | "thinking"    // 思考强度（TH）
+  | "elapsed";    // 会话时长（T+）
+
+/** 数值精度（各部分独立设置，互不影响） */
+export interface PrecisionConfig {
+  contextPercent: 0 | 1 | 2;
+  cacheHitPercent: 0 | 1 | 2;
+  quotaPercent: 0 | 1 | 2;
+  token: TokenPrecision;
+  speed: 0 | 1 | 2;
+  costAmount: 1 | 2;
+  balanceAmount: 1 | 2;
+}
 
 export interface DisplayConfig {
   items: Record<DisplayKey, boolean>;
   contextStyle: ContextStyle;
   speedStyle: SpeedStyle;
   quotaStyle: QuotaStyle;
+  precision: PrecisionConfig;
 }
 
 
@@ -202,26 +218,6 @@ let lastQuotaProvider: string | null = null;
 /**
  * Token 格式化（对齐 @firstpick/pi-utils formatTokens）
  */
-function formatTokens(count: number): string {
-  if (count < 1000) return count.toString();
-  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-  if (count < 1000000) return `${Math.round(count / 1000)}k`;
-  if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
-  return `${Math.round(count / 1000000)}M`;
-}
-
-function formatTokenSpeed(tokensPerSecond: number): string {
-  if (tokensPerSecond < 100) {
-    if (tokensPerSecond >= 10) return tokensPerSecond.toFixed(1);
-    return tokensPerSecond.toFixed(2);
-  }
-  if (tokensPerSecond < 1000) return Math.round(tokensPerSecond).toString();
-  if (tokensPerSecond < 10000) return `${(tokensPerSecond / 1000).toFixed(1)}k`;
-  if (tokensPerSecond < 1000000) return `${Math.round(tokensPerSecond / 1000)}k`;
-  if (tokensPerSecond < 10000000) return `${(tokensPerSecond / 1000000).toFixed(1)}M`;
-  return `${Math.round(tokensPerSecond / 1000000)}M`;
-}
-
 function isReasonableTokenSpeed(tokensPerSecond: number): boolean {
   return Number.isFinite(tokensPerSecond) && tokensPerSecond > 0 && tokensPerSecond <= MAX_REASONABLE_TOKEN_SPEED;
 }
@@ -317,96 +313,137 @@ function resetLiveState() {
   stats.liveTokenSamples = [];
 }
 
-function buildMetricParts(theme: ExtensionContext["ui"]["theme"], ctx: ExtensionContext): string[] {
+/** footer 指标段：rank=0 为核心（窄终端永不裁剪），数值越大越先被裁掉 */
+interface MetricSeg {
+  text: string;
+  rank: number;
+}
+
+/** 按宽度预算裁剪：先丢 rank 大的非核心段；仍超宽交给上层 truncateToWidth */
+function fitSegments(segs: MetricSeg[], budget: number): string[] {
+  const dropped = new Set<number>();
+  const totalWidth = () =>
+    segs.reduce((sum, seg, idx) => (dropped.has(idx) ? sum : sum + visibleWidth(seg.text) + 3), -3);
+  if (totalWidth() > budget) {
+    const dropOrder = segs
+      .map((seg, idx) => idx)
+      .filter((idx) => segs[idx].rank > 0)
+      .sort((a, b) => segs[b].rank - segs[a].rank);
+    for (const idx of dropOrder) {
+      dropped.add(idx);
+      if (totalWidth() <= budget) break;
+    }
+  }
+  return segs.filter((_, idx) => !dropped.has(idx)).map((seg) => seg.text);
+}
+
+/** 会话开始时间（elapsed 段用） */
+let sessionStartedAt = 0;
+
+function buildMetricSegments(theme: ExtensionContext["ui"]["theme"], ctx: ExtensionContext): MetricSeg[] {
+  const P = displayConfig.precision;
+  const cfg = displayConfig.items;
   const dim = (s: string) => theme.fg("dim", s);
   const warn = (s: string) => theme.fg("warning", s);
   const ok = (s: string) => theme.fg("success", s);
   const muted = (s: string) => theme.fg("muted", s);
 
-  const parts: string[] = [];
-  const cfg = displayConfig.items;
+  const segs: MetricSeg[] = [];
+  const push = (text: string, rank: number) => {
+    if (text) segs.push({ text, rank });
+  };
 
-  // ── 输入 / 输出 / 总token / 缓存命中 ──────────────
+  // ── 产出段：↓ $ ↑ Σ CH TTFT T+ ─────────────────────
   {
     const segParts: string[] = [];
-    if (cfg.input) segParts.push(`↑${formatTokens(stats.totalInput)}`);
-    if (cfg.output) segParts.push(`↓${formatTokens(stats.totalOutput)}`);
+    if (cfg.output) segParts.push(`↓${formatTokens(stats.totalOutput, P.token)}`);
+    // 没有花费数据（provider 不返回 usage.cost）时不显示 $0.00 误导用户
+    if (cfg.cost && stats.totalCost > 0) segParts.push(formatAmount(stats.totalCost, P.costAmount));
+    if (cfg.input) segParts.push(`↑${formatTokens(stats.totalInput, P.token)}`);
     if (cfg.totalTokens) {
       const total = stats.totalInput + stats.totalOutput;
-      segParts.push(`Σ${formatTokens(total)}`);
+      segParts.push(`Σ${formatTokens(total, P.token)}`);
     }
     if (cfg.cacheHit) {
       const totalPrompt = stats.totalInput + stats.totalCacheRead + stats.totalCacheWrite;
-      const cumCH = totalPrompt > 0 ? (stats.totalCacheRead / totalPrompt) * 100 : 0;
-      const chColor = cumCH >= 80 ? ok
-        : cumCH >= 50 ? (s: string) => s
-        : warn;
-      segParts.push(`${dim("CH")} ${chColor(`${cumCH.toFixed(0)}%`)}`);
+      // 无任何 prompt 数据时不显示 CH 0%（那是“无数据”而不是命中率为零）
+      if (totalPrompt > 0) {
+        const cumCH = (stats.totalCacheRead / totalPrompt) * 100;
+        const chColor = cumCH >= 80 ? ok : cumCH >= 50 ? (s: string) => s : warn;
+        segParts.push(`${dim("CH")} ${chColor(formatPercent(cumCH, P.cacheHitPercent))}`);
+      }
     }
-    if (segParts.length > 0) parts.push(segParts.join(" "));
+    if (cfg.latency) segParts.push(`${dim("TTFT")} ${formatLatency(stats.lastFirstTokenLatency)}`);
+    if (cfg.elapsed && sessionStartedAt > 0) {
+      segParts.push(`${dim("T+")} ${formatDuration(Date.now() - sessionStartedAt)}`);
+    }
+    push(segParts.join(" "), 1);
   }
 
-  // ── 速度 ⚡ ─────────────────────────────────────────
+  // ── 速度 ⚡（核心）──────────────────────────────────
   if (cfg.speed) {
     const liveSpeed = getRollingLiveTokenSpeed();
     const displaySpeed = liveSpeed !== null ? liveSpeed : stats.lastTokensPerSec;
-    const speedNum = ok(formatTokenSpeed(displaySpeed));
-    const speedStyle = displayConfig.speedStyle ?? "t/s";
-    switch (speedStyle) {
-      case "tok/s":
-        parts.push(`⚡${speedNum} tok/s`);
-        break;
-      case "T/s":
-        parts.push(`⚡${speedNum} T/s`);
-        break;
-      case "liveAt":
-        if (stats.streaming && liveSpeed !== null) {
-          parts.push(`⚡${formatTokens(stats.liveEstimatedTokens)}@${speedNum}`);
-        } else {
-          parts.push(`⚡${speedNum} t/s`);
-        }
-        break;
-      default:
-        parts.push(`⚡${speedNum} t/s`);
-        break;
+    // 还没有任何输出时不显示 ⚡-- （无数据不是速度为零）
+    if (displaySpeed > 0) {
+      const speedNum = ok(formatSpeed(displaySpeed, P.speed));
+      const speedStyle = displayConfig.speedStyle ?? "t/s";
+      switch (speedStyle) {
+        case "tok/s":
+          push(`⚡${speedNum} tok/s`, 0);
+          break;
+        case "T/s":
+          push(`⚡${speedNum} T/s`, 0);
+          break;
+        case "liveAt":
+          if (stats.streaming && liveSpeed !== null) {
+            push(`⚡${formatTokens(stats.liveEstimatedTokens, P.token)}@${speedNum}`, 0);
+          } else {
+            push(`⚡${speedNum} t/s`, 0);
+          }
+          break;
+        default:
+          push(`⚡${speedNum} t/s`, 0);
+          break;
+      }
     }
   }
 
-  // ── 思考强度 TH ────────────────────────────────
+  // ── 思考强度 TH ────────────────────────────────────
   if (cfg.thinking && ctx.thinkingLevel) {
     const level = ctx.thinkingLevel;
-    parts.push(level === "off" ? dim("TH off") : theme.fg("accent", `TH ${level}`));
+    push(level === "off" ? dim("TH off") : theme.fg("accent", `TH ${level}`), 2);
   }
 
-  // ── 容量 🧠 ────────────────────────────────────────
+  // ── 上下文占用 🧠（核心）───────────────────────────
   if (cfg.context) {
     try {
       const cu = ctx.getContextUsage();
       const ctxWindow = cu?.contextWindow ?? ctx.model?.contextWindow ?? 0;
       const ctxPercent = typeof cu?.percent === "number" ? cu.percent : null;
-      const ctxUsed = ctxPercent !== null && ctxWindow > 0 ? Math.round(ctxWindow * ctxPercent / 100) : 0;
+      const ctxUsed = ctxPercent !== null && ctxWindow > 0 ? Math.round((ctxWindow * ctxPercent) / 100) : 0;
       const ctxStyle = displayConfig.contextStyle ?? "pct-window";
       let ctxStr: string;
       if (ctxWindow > 0 && ctxPercent !== null) {
         switch (ctxStyle) {
           case "used-window":
-            ctxStr = `${formatTokens(ctxUsed)}/${formatTokens(ctxWindow)}`;
+            ctxStr = `${formatTokens(ctxUsed, P.token)}/${formatTokens(ctxWindow, P.token)}`;
             break;
           case "pct":
-            ctxStr = `${ctxPercent.toFixed(1)}%`;
+            ctxStr = formatPercent(ctxPercent, P.contextPercent);
             break;
           case "used":
-            ctxStr = formatTokens(ctxUsed);
+            ctxStr = formatTokens(ctxUsed, P.token);
             break;
           case "bar":
-            ctxStr = `${progressBar(ctxPercent)} ${ctxPercent.toFixed(1)}%`;
+            ctxStr = `${progressBar(ctxPercent)} ${formatPercent(ctxPercent, P.contextPercent)}`;
             break;
           default:
-            ctxStr = `${ctxPercent.toFixed(1)}%/${formatTokens(ctxWindow)}`;
+            ctxStr = `${formatPercent(ctxPercent, P.contextPercent)}/${formatTokens(ctxWindow, P.token)}`;
             break;
         }
       } else {
-        ctxStr = ctxWindow > 0 ? `?/${formatTokens(ctxWindow)}` : `0%/0`;
+        ctxStr = ctxWindow > 0 ? `--/${formatTokens(ctxWindow, P.token)}` : "--";
       }
       const ctxColor = ctxPercent !== null && ctxWindow > 0
         ? ctxPercent < 50 ? ok
@@ -415,12 +452,11 @@ function buildMetricParts(theme: ExtensionContext["ui"]["theme"], ctx: Extension
               : ctxPercent < 85 ? warn
                 : (s: string) => theme.fg("error", s)
         : dim;
-      parts.push(`${muted("🧠")} ${ctxColor(ctxStr)}`);
+      push(`${muted("🧠")} ${ctxColor(ctxStr)}`, 0);
     } catch { /* ignore */ }
   }
 
-  // ── 套餐用量（最右侧）：检测 provider 变化，自动隐藏/刷新 ─
-  // P1 修复：provider 切换会同时清旧 state，错误状态会显示为 "未启用" / "KEY 未设置" 等
+  // ── 套餐用量（核心）：provider 变化时后台强制刷新 ──
   const curProvider = ctx.model?.provider ?? null;
   if (curProvider !== lastQuotaProvider) {
     // 跨 provider 切换：force refresh（绕过缓存，避免 P7）
@@ -434,40 +470,17 @@ function buildMetricParts(theme: ExtensionContext["ui"]["theme"], ctx: Extension
     }
     lastQuotaProvider = curProvider;
   }
-  if (quotaState && quotaState.display) {
+  if (cfg.quota && quotaState && quotaState.display) {
     const qColor = quotaState.color === "ok" ? ok
       : quotaState.color === "warn" ? warn
         : quotaState.color === "err" ? (s: string) => theme.fg("error", s)
           : muted;
     const prefix = quotaState.modelPrefix ? quotaState.modelPrefix + " " : "";
-
-    // P2 修复：error 状态（如 no_plan / key_missing）也显示具体原因，不再静默消失
-    if (quotaState.error) {
-      // 错误状态：直接显示提示文本，不解析 5h/W/⏱ 字段
-      parts.push(qColor(prefix + quotaState.display));
-    } else {
-      // 正常状态：按子项过滤配额显示
-      const fullDisplay = quotaState.display;
-      const filteredParts: string[] = [];
-      if (cfg.quota5h) {
-        const m = fullDisplay.match(/\b5h:\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[wdhm](?:\s*\d+[wdhm](?!:))?)?/);
-        if (m) filteredParts.push(m[0]);
-      }
-      if (cfg.quotaWeek) {
-        const m = fullDisplay.match(/\b(?:W|7d):\s+\d+(?:\.\d+)?%(?:\s*⏱\s*\d+[wdhm](?:\s*\d+[wdhm](?!:))?)?/);
-        if (m) filteredParts.push(m[0]);
-      }
-      if (filteredParts.length > 0) {
-        parts.push(qColor(prefix + filteredParts.join(" | ")));
-      } else if (cfg.quota5h || cfg.quotaWeek) {
-        // 余额型套餐（DeepSeek ¥xx.x 等）不含 5h/W/⏱ 字段，
-        // 子项过滤匹配不到任何内容时回退显示完整 display，避免配额段静默消失
-        parts.push(qColor(prefix + fullDisplay));
-      }
-    }
+    // 样式（紧凑 / 倒计时）已由套餐的 quotaStyle 决定，这里整段显示
+    push(qColor(prefix + quotaState.display), 0);
   }
 
-  return parts;
+  return segs;
 }
 
 let requestFooterRender: (() => void) | null = null;
@@ -687,6 +700,97 @@ function rebuildFromHistory(ctx: ExtensionContext) {
 }
 // ── 套餐用量工具 ─────────────────────────────────────────
 
+// ── 状态栏配置：选项表（中文 label + 效果预览）──────────────────────
+
+const CONTEXT_STYLE_ITEMS: { value: ContextStyle; label: string; preview: string }[] = [
+  { value: "pct-window", label: "百分比 / 窗口", preview: "5.3%/1.0M" },
+  { value: "used-window", label: "已用 / 窗口", preview: "256k/1.0M" },
+  { value: "pct", label: "仅百分比", preview: "5.3%" },
+  { value: "used", label: "仅已用", preview: "256k" },
+  { value: "bar", label: "进度条 + 百分比", preview: "[██░░░░░░] 25%" },
+];
+const SPEED_STYLE_ITEMS: { value: SpeedStyle; label: string; preview: string }[] = [
+  { value: "t/s", label: "简写 t/s", preview: "⚡77.7 t/s" },
+  { value: "tok/s", label: "完整单位", preview: "⚡77.7 tok/s" },
+  { value: "T/s", label: "大写单位", preview: "⚡77.7 T/s" },
+  { value: "liveAt", label: "流式时带已生成量", preview: "⚡1.2k@77.7" },
+];
+const QUOTA_STYLE_ITEMS: { value: QuotaStyle; label: string; preview: string }[] = [
+  { value: "compact", label: "紧凑（不带倒计时）", preview: "5h: 89% 7d: 72%" },
+  { value: "with-clock-7d", label: "各自带倒计时（精确到分）", preview: "5h: 89% ⏱ 4h15m 7d: 72% ⏱ 2d" },
+  { value: "nearest-clock-7d", label: "仅最近一个倒计时", preview: "5h: 89% 7d: 72% ⏱ 4h15m" },
+  { value: "largest-unit", label: "倒计时只显示最大单位", preview: "5h: 89% ⏱ 4h 7d: 72% ⏱ 2d" },
+];
+
+/** 显示内容分组（面板按组展示，组内顺序即 footer 中的顺序） */
+const DISPLAY_GROUPS: { group: string; keys: DisplayKey[] }[] = [
+  { group: "用量", keys: ["output", "cost", "input", "totalTokens", "cacheHit"] },
+  { group: "性能", keys: ["speed", "latency", "thinking"] },
+  { group: "状态", keys: ["context", "quota"] },
+  { group: "元信息", keys: ["elapsed"] },
+];
+const DISPLAY_ITEM_NAMES: Record<DisplayKey, string> = {
+  output: "输出 token",
+  cost: "会话花费",
+  input: "输入 token",
+  totalTokens: "总 token",
+  cacheHit: "缓存命中",
+  speed: "速度",
+  latency: "首 token 延迟",
+  context: "上下文占用",
+  quota: "套餐余量",
+  thinking: "思考强度",
+  elapsed: "会话时长",
+};
+
+/** 套餐段格式化上下文：样式 + 套餐余量百分比位数 + 余额金额位数 */
+function planFormatCtx(): PlanFormatContext {
+  return {
+    style: displayConfig.quotaStyle,
+    percentDigits: displayConfig.precision.quotaPercent,
+    amountDigits: displayConfig.precision.balanceAmount,
+  };
+}
+
+/** 面板右侧示例值：随当前精度联动，选之前就看到效果 */
+function displayItemPreview(key: DisplayKey, cfg: DisplayConfig): string {
+  const P = cfg.precision;
+  switch (key) {
+    case "output": return "↓" + formatTokens(804, P.token);
+    case "cost": return formatAmount(0.12, P.costAmount);
+    case "input": return "↑" + formatTokens(128400, P.token);
+    case "totalTokens": return "Σ" + formatTokens(129204, P.token);
+    case "cacheHit": return "CH " + formatPercent(82, P.cacheHitPercent);
+    case "speed": return "⚡" + formatSpeed(77.7, P.speed) + " t/s";
+    case "latency": return "TTFT " + formatLatency(420);
+    case "context": return "🧠 " + formatPercent(5.3, P.contextPercent) + "/" + formatTokens(1000000, P.token);
+    case "quota": return "5h: " + formatPercent(89, P.quotaPercent) + " ⏱ 4h15m";
+    case "thinking": return "TH high";
+    case "elapsed": return "T+" + formatDuration(72 * 60 * 1000);
+  }
+}
+
+/** 精度摘要（菜单项右侧显示） */
+function precisionSummary(p: PrecisionConfig): string {
+  const tokenLabel = p.token === "auto" ? "自适应" : p.token === 0 ? "整数" : "1位";
+  return `${p.contextPercent}位上下文 · CH ${p.cacheHitPercent}位 · 套餐 ${p.quotaPercent}位 · ${tokenLabel}token · ${p.speed}位速率 · ${p.costAmount}/${p.balanceAmount}位金额`;
+}
+
+/** 样式单选：中文 label + 效果预览，选中即保存并刷新 footer */
+async function pickStyleOption<T extends string>(
+  ctx: ExtensionContext,
+  title: string,
+  items: { value: T; label: string; preview: string }[],
+  current: T,
+  onPick: (value: T) => Promise<void>,
+): Promise<void> {
+  const render = (i: { value: T; label: string; preview: string }) =>
+    (current === i.value ? "● " : "○ ") + i.label + "    " + i.preview;
+  const choice = await ctx.ui.select(title, items.map(render));
+  const picked = items.find((i) => render(i) === choice);
+  if (picked && picked.value !== current) await onPick(picked.value);
+}
+
 /**
  * 套餐选择：TUI 走带搜索的单选组件（↑↓ 选择、输入即过滤、enter 选中即关闭），
  * 非 TUI 环境退回 select。返回 null = 用户取消。
@@ -763,24 +867,40 @@ const DEFAULT_TOKEN_CONFIG: TokenConfig = {
 };
 
 const DISPLAY_CONFIG_FILE = join(TOKEN_CONFIG_DIR, "display-config.json");
+// 默认组合：产出（↓↑Σ CH）+ 速度 + 思考强度 + 上下文 + 套餐，一屏看完会话全貌
 const DEFAULT_DISPLAY_CONFIG: DisplayConfig = {
   items: {
-    input: false,
     output: true,
-    totalTokens: false,
-    cacheHit: false,
+    cost: false,
+    input: true,
+    totalTokens: true,
+    cacheHit: true,
     speed: true,
+    latency: false,
     context: true,
-    quota5h: true,
-    quotaWeek: true,
-    thinking: false,
+    quota: true,
+    thinking: true,
+    elapsed: false,
   },
-  contextStyle: "pct-window",
+  contextStyle: "used-window",
   speedStyle: "t/s",
-  quotaStyle: "with-clock-7d",
+  quotaStyle: "nearest-clock-7d",
+  precision: {
+    contextPercent: 1,
+    cacheHitPercent: 1,
+    quotaPercent: 0,
+    token: "auto",
+    speed: 1,
+    costAmount: 2,
+    balanceAmount: 1,
+  },
 };
 
-let displayConfig: DisplayConfig = { ...DEFAULT_DISPLAY_CONFIG, items: { ...DEFAULT_DISPLAY_CONFIG.items } };
+let displayConfig: DisplayConfig = {
+  ...DEFAULT_DISPLAY_CONFIG,
+  items: { ...DEFAULT_DISPLAY_CONFIG.items },
+  precision: { ...DEFAULT_DISPLAY_CONFIG.precision },
+};
 
 // ── 勾选组件（样式与交互对齐内置 /scoped-models 选择器）─────────────
 
@@ -788,6 +908,8 @@ interface ToggleEntry {
   id: string;
   primary: string;
   badge?: string;
+  /** 分组标题（勾选面板按组分隔展示，仅用于显示） */
+  group?: string;
   detail?: string;
 }
 
@@ -801,8 +923,9 @@ interface ToggleSelectorOptions {
 
 /**
  * 勾选组件：↑↓ 选择、enter 切换勾选、ctrl+a 全选、ctrl+x 清空、
- * ctrl+s 保存、esc 取消；支持模糊搜索过滤；勾选的条目排在最上面。
- * 仅限 TUI 模式通过 ctx.ui.custom() 挂载；done(ids) 保存，done(null) 取消。
+ * ctrl+s 保存、esc 取消；支持模糊搜索过滤；条目按注册顺序固定展示（勾选不改变排序），
+ * 可选 group 字段渲染分组标题。仅限 TUI 模式通过 ctx.ui.custom() 挂载；
+ * done(ids) 保存，done(null) 取消。mode="single" 时为单选：enter 选中即返回。
  */
 class ToggleSelectorComponent extends Container {
   private entriesById = new Map<string, ToggleEntry>();
@@ -882,12 +1005,11 @@ class ToggleSelectorComponent extends Container {
   }
 
   private buildItems() {
+    // 固定按注册顺序展示：勾选不改变排序，操作时条目不跳动、分组不重复割裂
     const markedSet = new Set(this.markedIds);
-    const sorted = [
-      ...this.markedIds.filter((id) => this.entriesById.has(id)),
-      ...this.allIds.filter((id) => !markedSet.has(id)),
-    ];
-    return sorted.map((id) => ({ entry: this.entriesById.get(id) as ToggleEntry, marked: markedSet.has(id) }));
+    return this.allIds
+      .filter((id) => this.entriesById.has(id))
+      .map((id) => ({ entry: this.entriesById.get(id) as ToggleEntry, marked: markedSet.has(id) }));
   }
 
   /** ctrl+s：触发保存但不关闭组件，留在当前界面继续调整；esc 才退出。 */
@@ -961,11 +1083,29 @@ class ToggleSelectorComponent extends Container {
       Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
     );
     const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+    // 分组标题：醒目分隔（色块 + 标题 + 横线），组间留白；分页时先补上当前页首项所属分组
+    let lastGroup: string | undefined;
+    if (startIndex > 0) {
+      const g = this.filteredItems[startIndex]?.entry.group;
+      if (g) {
+        lastGroup = g;
+        this.addGroupHeader(g, true);
+      }
+    }
     for (let i = startIndex; i < endIndex; i++) {
       const item = this.filteredItems[i];
+      if (item.entry.group && item.entry.group !== lastGroup) {
+        if (lastGroup !== undefined) this.listContainer.addChild(new Spacer(1));
+        lastGroup = item.entry.group;
+        this.addGroupHeader(item.entry.group, false);
+      }
       const isSelected = i === this.selectedIndex;
       const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
-      const primary = isSelected ? this.theme.fg("accent", item.entry.primary) : item.entry.primary;
+      // 层次：光标行 accent > 已勾选正常色 > 未勾选 dim
+      const base = this.options.mode === "single" || item.marked
+        ? item.entry.primary
+        : this.theme.fg("dim", item.entry.primary);
+      const primary = isSelected ? this.theme.fg("accent", item.entry.primary) : base;
       const badge = item.entry.badge ? this.theme.fg("muted", ` ${item.entry.badge}`) : "";
       const status = this.options.mode === "single" ? "" : item.marked ? this.theme.fg("success", " ✓") : this.theme.fg("dim", " ✗");
       this.listContainer.addChild(new Text(`${prefix}${primary}${badge}${status}`, 0, 0));
@@ -980,6 +1120,13 @@ class ToggleSelectorComponent extends Container {
       this.listContainer.addChild(new Spacer(1));
       this.listContainer.addChild(new Text(this.theme.fg("muted", `  ${selected.entry.detail}`), 0, 0));
     }
+  }
+
+  /** 分组标题行：accent 色块 + 粗体标题 + 淡色横线，与条目形成清晰层次 */
+  private addGroupHeader(group: string, continued: boolean): void {
+    const title = (continued ? "  … " : "▌ ") + group;
+    const line = this.theme.fg("border", " " + "─".repeat(Math.max(4, 44 - visibleWidth(title))));
+    this.listContainer.addChild(new Text(this.theme.fg("accent", this.theme.bold(title)) + line, 0, 0));
   }
 
   handleInput(data: string): void {
@@ -1079,28 +1226,52 @@ async function saveTokenConfig(cfg: TokenConfig) {
   await writeFile(TOKEN_CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf-8");
 }
 
+/** 迁移并归一化旧配置：新增字段取默认、quota5h/quotaWeek 双开关合并为 quota、精度容错 */
+function normalizeDisplayConfig(saved: any): DisplayConfig {
+  const items = { ...DEFAULT_DISPLAY_CONFIG.items };
+  const savedItems = (saved && typeof saved === "object" && saved.items) || {};
+  for (const key of Object.keys(items) as DisplayKey[]) {
+    if (typeof savedItems[key] === "boolean") items[key] = savedItems[key];
+  }
+  // 旧配置用两个独立开关控制额度段（5h / 周），任一开启即视为额度段可见
+  if (typeof savedItems.quota5h === "boolean" || typeof savedItems.quotaWeek === "boolean") {
+    items.quota = !!(savedItems.quota5h || savedItems.quotaWeek);
+  }
+  const p = (saved && typeof saved === "object" && saved.precision) || {};
+  const digits = <T extends number>(v: unknown, allowed: readonly T[], dflt: T): T =>
+    typeof v === "number" && allowed.includes(v as T) ? (v as T) : dflt;
+  // 旧配置的 percent 只作用于上下文（套餐当时还是写死取整），amount 对应会话花费
+  const oldPercent = digits(p.percent, [0, 1, 2] as const, 1);
+  const oldAmount = digits(p.amount, [1, 2] as const, 2);
+  return {
+    items,
+    contextStyle: isContextStyle(saved?.contextStyle) ? saved.contextStyle : DEFAULT_DISPLAY_CONFIG.contextStyle,
+    speedStyle: isSpeedStyle(saved?.speedStyle) ? saved.speedStyle : DEFAULT_DISPLAY_CONFIG.speedStyle,
+    quotaStyle: isQuotaStyle(saved?.quotaStyle) ? saved.quotaStyle : DEFAULT_DISPLAY_CONFIG.quotaStyle,
+    precision: {
+      contextPercent: digits(p.contextPercent, [0, 1, 2] as const, oldPercent),
+      cacheHitPercent: digits(p.cacheHitPercent, [0, 1, 2] as const, 0),
+      quotaPercent: digits(p.quotaPercent, [0, 1, 2] as const, 0),
+      token: p.token === 0 || p.token === 1 ? p.token : "auto",
+      speed: digits(p.speed, [0, 1, 2] as const, 1),
+      costAmount: digits(p.costAmount, [1, 2] as const, oldAmount),
+      balanceAmount: digits(p.balanceAmount, [1, 2] as const, 1),
+    },
+  };
+}
+
 async function loadDisplayConfig(): Promise<DisplayConfig> {
   try {
     if (existsSync(DISPLAY_CONFIG_FILE)) {
       const raw = await readFile(DISPLAY_CONFIG_FILE, "utf-8");
-      const saved = JSON.parse(raw) as DisplayConfig;
-      // 与默认值合并，防止新增条目缺失
-      const merged: DisplayConfig = {
-        ...DEFAULT_DISPLAY_CONFIG,
-        items: { ...DEFAULT_DISPLAY_CONFIG.items },
-      };
-      if (saved.items) {
-        for (const key of Object.keys(merged.items) as DisplayKey[]) {
-          if (typeof saved.items[key] === "boolean") merged.items[key] = saved.items[key];
-        }
-      }
-      if (isContextStyle(saved.contextStyle)) merged.contextStyle = saved.contextStyle;
-      if (isSpeedStyle(saved.speedStyle)) merged.speedStyle = saved.speedStyle;
-      if (isQuotaStyle(saved.quotaStyle)) merged.quotaStyle = saved.quotaStyle;
-      return merged;
+      return normalizeDisplayConfig(JSON.parse(raw));
     }
   } catch {}
-  return { ...DEFAULT_DISPLAY_CONFIG, items: { ...DEFAULT_DISPLAY_CONFIG.items } };
+  return {
+    ...DEFAULT_DISPLAY_CONFIG,
+    items: { ...DEFAULT_DISPLAY_CONFIG.items },
+    precision: { ...DEFAULT_DISPLAY_CONFIG.precision },
+  };
 }
 
 function isContextStyle(v: unknown): v is ContextStyle {
@@ -1110,7 +1281,7 @@ function isSpeedStyle(v: unknown): v is SpeedStyle {
   return typeof v === "string" && ["t/s", "tok/s", "T/s", "liveAt"].includes(v);
 }
 function isQuotaStyle(v: unknown): v is QuotaStyle {
-  return typeof v === "string" && ["compact", "with-clock-7d", "nearest-clock-7d"].includes(v);
+  return typeof v === "string" && ["compact", "with-clock-7d", "nearest-clock-7d", "largest-unit"].includes(v);
 }
 
 async function saveDisplayConfig(cfg: DisplayConfig) {
@@ -1359,7 +1530,7 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   const cached = cache[plan.id];
   if (oauthExpired) {
     if (cached) {
-      const fmt = plan.format(cached.data, displayConfig.quotaStyle);
+      const fmt = plan.format(cached.data, planFormatCtx());
       quotaState = {
         planId: plan.id,
         provider: curProvider,
@@ -1375,7 +1546,7 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   }
   const ttlMs = (tokenConfig?.ttl || 60) * 1000;
   if (!force && cached && (Date.now() - cached.fetchedAt) < cached.ttl) {
-    const fmt = plan.format(cached.data, displayConfig.quotaStyle);
+    const fmt = plan.format(cached.data, planFormatCtx());
     quotaState = {
       planId: plan.id,
       provider: curProvider,
@@ -1392,7 +1563,7 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
     const data = await plan.fetchQuota(plan, key ?? "");
     cache[plan.id] = { fetchedAt: Date.now(), ttl: ttlMs, data };
     await writeQuotaCache(cache);
-    const fmt = plan.format(data, displayConfig.quotaStyle);
+    const fmt = plan.format(data, planFormatCtx());
     // format 可能返回 "无数据" 颜色为 err
     if (fmt.color === "err" && fmt.display === "无数据") {
       quotaState = buildErrorState(curProvider, plan.id, { kind: "no_data" });
@@ -1964,6 +2135,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     // 注意：reload 会重新执行本文件（全新实例、quotaTimerId 为 null），
     // 所以只有这里能清掉旧实例的定时器，不能依赖 session_start 里的清理。
     sessionActive = false;
+    sessionStartedAt = 0;
     if (quotaTimerId) {
       clearInterval(quotaTimerId);
       quotaTimerId = null;
@@ -1971,6 +2143,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     requestFooterRender = null;
     lastQuotaProvider = null;
     quotaState = null;
+    sessionStartedAt = 0;
     bindMimoFeedback(null, null);
   });
 
@@ -1978,6 +2151,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     sessionActive = true;
+    sessionStartedAt = Date.now();
     rebuildFromHistory(ctx);
     bindMimoFeedback(
       typeof ctx.ui?.setWorkingMessage === "function"
@@ -2026,15 +2200,15 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           // session 替换后旧 footer 可能仍被 TUI 渲染，此时 ctx 已失效，直接返回空
           if (!sessionActive) return [];
           // ── 上行：指标左对齐，模型名右对齐 ──────────
-          const metrics = buildMetricParts(theme, ctx);
-          const left = metrics.join(" | ");
+          const metrics = buildMetricSegments(theme, ctx);
 
           const modelName = ctx.model?.id || "";
           const provider = ctx.model?.provider || "";
           const rightSide = provider ? `(${provider}) ${modelName}` : modelName;
-
-          const leftWidth = visibleWidth(left);
           const rightWidth = visibleWidth(rightSide);
+          // 宽度预算：右侧模型名固定，左侧按优先级裁剪（核心段永不丢）
+          const left = fitSegments(metrics, width - rightWidth - 1).join(" | ");
+          const leftWidth = visibleWidth(left);
           const topLine = leftWidth + rightWidth <= width
             ? left + " ".repeat(width - leftWidth - rightWidth) + rightSide
             : leftWidth <= width
@@ -2137,117 +2311,38 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       }
       if (arg === "config") {
         configMenu: while (true) {
-        const subChoice = await ctx.ui.select("Token 统计配置", [
-          "显示样式",
-          "显示内容",
-          "查询间隔  (当前 " + (tokenConfig?.ttl || 60) + "s)",
+        const allDisplayKeys = DISPLAY_GROUPS.flatMap((g) => g.keys);
+        const enabledCount = allDisplayKeys.filter((k) => displayConfig.items[k]).length;
+        const subChoice = await ctx.ui.select("状态栏配置", [
+          "显示内容    已开 " + enabledCount + "/" + allDisplayKeys.length,
+          "显示精度    " + precisionSummary(displayConfig.precision),
+          "上下文样式  " + (CONTEXT_STYLE_ITEMS.find((i) => i.value === displayConfig.contextStyle)?.label ?? displayConfig.contextStyle),
+          "速率样式    " + (SPEED_STYLE_ITEMS.find((i) => i.value === displayConfig.speedStyle)?.label ?? displayConfig.speedStyle),
+          "套餐样式    " + (QUOTA_STYLE_ITEMS.find((i) => i.value === displayConfig.quotaStyle)?.label ?? displayConfig.quotaStyle),
+          "查询间隔    " + (tokenConfig?.ttl || 60) + "s",
+          "恢复默认",
         ]);
         if (!subChoice) break configMenu;
 
-        if (subChoice === "显示样式") {
-          styleCategoryMenu: while (true) {
-          const catChoice = await ctx.ui.select("选择要配置的样式类别", [
-            "上下文样式",
-            "速率样式",
-            "配额样式",
-          ]);
-          if (!catChoice) break styleCategoryMenu;
-
-          if (catChoice === "上下文样式") {
-            const items: { label: string; value: ContextStyle; preview: string }[] = [
-              { label: "pct-window", value: "pct-window", preview: `5.3%/1.0M` },
-              { label: "used-window", value: "used-window", preview: `256k/1.0M` },
-              { label: "pct", value: "pct", preview: `5.3%` },
-              { label: "used", value: "used", preview: `256k` },
-              { label: "bar", value: "bar", preview: `[██░░░░░░] 25%` },
-            ];
-            const choice = await ctx.ui.select(
-              "上下文样式（当前: " + displayConfig.contextStyle + "）",
-              items.map(i =>
-                (displayConfig.contextStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview
-              ),
-            );
-            if (choice) {
-              const idx = items.findIndex(i =>
-                (displayConfig.contextStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview === choice
-              );
-              if (idx >= 0) {
-                displayConfig = { ...displayConfig, contextStyle: items[idx].value };
-                await saveDisplayConfig(displayConfig);
-                requestFooterRender?.();
-              }
-            }
-          } else if (catChoice === "速率样式") {
-            const items: { label: string; value: SpeedStyle; preview: string }[] = [
-              { label: "t/s", value: "t/s", preview: `77.7 t/s` },
-              { label: "tok/s", value: "tok/s", preview: `77.7 tok/s` },
-              { label: "T/s", value: "T/s", preview: `77.7 T/s` },
-              { label: "live@速率", value: "liveAt", preview: `1.2k@77.7` },
-            ];
-            const choice = await ctx.ui.select(
-              "速率样式（当前: " + displayConfig.speedStyle + "）",
-              items.map(i =>
-                (displayConfig.speedStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview
-              ),
-            );
-            if (choice) {
-              const idx = items.findIndex(i =>
-                (displayConfig.speedStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview === choice
-              );
-              if (idx >= 0) {
-                displayConfig = { ...displayConfig, speedStyle: items[idx].value };
-                await saveDisplayConfig(displayConfig);
-                requestFooterRender?.();
-              }
-            }
-          } else if (catChoice === "配额样式") {
-            const items: { label: string; value: QuotaStyle; preview: string }[] = [
-              { label: "compact", value: "compact", preview: `5h: 89% 7d: 72%` },
-              { label: "with-clock-7d", value: "with-clock-7d", preview: `5h: 89% 4h 15m 7d: 72% 2d` },
-              { label: "nearest-clock-7d", value: "nearest-clock-7d", preview: `5h: 89% 7d: 72% 4h 15m` },
-            ];
-            const choice = await ctx.ui.select(
-              "配额样式（当前: " + displayConfig.quotaStyle + "）",
-              items.map(i =>
-                (displayConfig.quotaStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview
-              ),
-            );
-            if (choice) {
-              const idx = items.findIndex(i =>
-                (displayConfig.quotaStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview === choice
-              );
-              if (idx >= 0) {
-                displayConfig = { ...displayConfig, quotaStyle: items[idx].value };
-                await saveDisplayConfig(displayConfig);
-                await forceRefreshQuota(ctx);
-                requestFooterRender?.();
-              }
-            }
-          }
-          continue styleCategoryMenu;
-          }
-        } else if (subChoice === "显示内容") {
-          const itemLabels: DisplayKey[] = [
-            "input", "output", "totalTokens", "cacheHit", "speed", "context",
-            "quota5h", "quotaWeek", "thinking",
-          ];
-          const itemNames: Record<DisplayKey, string> = {
-            input: "输入", output: "输出", totalTokens: "总token",
-            cacheHit: "缓存命中", speed: "速度", context: "容量",
-            quota5h: "5h额度（含倒计时）", quotaWeek: "周额度（含倒计时）",
-            thinking: "思考强度",
-          };
-          // TUI 模式：勾选组件批量编辑，ctrl+s 实时保存并刷新 footer，留在界面继续调整
+        if (subChoice.startsWith("显示内容")) {
+          // 分组勾选面板：右侧示例值随精度联动，ctrl+s 保存并实时刷新 footer
           if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
-            const entries: ToggleEntry[] = itemLabels.map((k) => ({ id: k, primary: itemNames[k] }));
-            const initialMarked = itemLabels.filter((k) => displayConfig.items[k]);
+            const entries: ToggleEntry[] = DISPLAY_GROUPS.flatMap((g) =>
+              g.keys.map((k) => ({
+                id: k,
+                primary: DISPLAY_ITEM_NAMES[k],
+                badge: displayItemPreview(k, displayConfig),
+                group: g.group,
+              })),
+            );
+            const initialMarked = allDisplayKeys.filter((k) => displayConfig.items[k]);
             await ctx.ui.custom<string[] | null>(
               (tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
                 new ToggleSelectorComponent(
                   tui,
                   {
                     title: "状态栏显示内容",
-                    subtitle: "勾选 = 在 footer 中显示该项",
+                    subtitle: "勾选 = 在 footer 中显示该项（右侧为当前精度下的效果）",
                     countLabel: "显示",
                   },
                   entries,
@@ -2259,7 +2354,9 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                     const marked = new Set(ids);
                     displayConfig = {
                       ...displayConfig,
-                      items: Object.fromEntries(itemLabels.map((k) => [k, marked.has(k)])) as Record<DisplayKey, boolean>,
+                      items: Object.fromEntries(
+                        allDisplayKeys.map((k) => [k, marked.has(k)]),
+                      ) as Record<DisplayKey, boolean>,
                     };
                     await saveDisplayConfig(displayConfig);
                     requestFooterRender?.();
@@ -2267,17 +2364,17 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 ),
             );
           } else {
-            // 非 TUI：保留循环 select 切换
+            // 非 TUI：循环 select 切换
             while (true) {
-              const options = itemLabels.map(k =>
-                `${displayConfig.items[k] ? "[✓]" : "[ ]"} ${itemNames[k]}`,
+              const options = allDisplayKeys.map(
+                (k) => `${displayConfig.items[k] ? "[✓]" : "[ ]"} ${DISPLAY_ITEM_NAMES[k]}  ${displayItemPreview(k, displayConfig)}`,
               );
               options.push("完成");
               const choice = await ctx.ui.select("选择要切换显示的项目", options);
               if (!choice || choice === "完成") break;
               const idx = options.indexOf(choice);
-              if (idx >= 0 && idx < itemLabels.length) {
-                const key = itemLabels[idx];
+              if (idx >= 0 && idx < allDisplayKeys.length) {
+                const key = allDisplayKeys[idx];
                 displayConfig = {
                   ...displayConfig,
                   items: { ...displayConfig.items, [key]: !displayConfig.items[key] },
@@ -2286,9 +2383,88 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 requestFooterRender?.();
               }
             }
-            ctx.ui.notify("状态栏显示配置已保存", "info");
           }
-        } else if (subChoice === "查询间隔  (当前 " + (tokenConfig?.ttl || 60) + "s)") {
+        } else if (subChoice.startsWith("显示精度")) {
+          precisionMenu: while (true) {
+            const P = displayConfig.precision;
+            const pChoice = await ctx.ui.select("显示精度（各部分独立设置）", [
+              "上下文百分比    当前 " + P.contextPercent + " 位",
+              "缓存命中率      当前 " + P.cacheHitPercent + " 位",
+              "套餐余量百分比  当前 " + P.quotaPercent + " 位",
+              "token 精度      当前 " + (P.token === "auto" ? "自适应" : P.token + " 位"),
+              "速率小数位      当前 " + P.speed + " 位",
+              "会话花费金额    当前 " + P.costAmount + " 位",
+              "套餐余额金额    当前 " + P.balanceAmount + " 位",
+            ]);
+            if (!pChoice) break precisionMenu;
+            const apply = async <K extends keyof PrecisionConfig>(key: K, value: PrecisionConfig[K]) => {
+              displayConfig = { ...displayConfig, precision: { ...displayConfig.precision, [key]: value } };
+              await saveDisplayConfig(displayConfig);
+              // 套餐段的 display 是已格式化的字符串，需重新格式化（缓存命中不重发请求）
+              await refreshQuotaOnce(ctx);
+              requestFooterRender?.();
+            };
+            /** 0/1/2 位选择，示例值随选项实时展示 */
+            const pickDigits = async (title: string, sample: (d: number) => string) => {
+              const c = await ctx.ui.select(title, [0, 1, 2].map((d) => `${d} 位    ${sample(d)}`));
+              const d = c ? parseInt(c[0], 10) : NaN;
+              return Number.isNaN(d) ? null : (d as 0 | 1 | 2);
+            };
+            /** 1/2 位选择（金额） */
+            const pickAmount = async (title: string, sample: (d: number) => string) => {
+              const c = await ctx.ui.select(title, [1, 2].map((d) => `${d} 位    ${sample(d)}`));
+              const d = c ? parseInt(c[0], 10) : NaN;
+              return Number.isNaN(d) ? null : (d as 1 | 2);
+            };
+            if (pChoice.startsWith("上下文百分比")) {
+              const d = await pickDigits("上下文占用百分比小数位", (d) => formatPercent(5.3, d) + "/" + formatTokens(1000000, P.token));
+              if (d !== null && d !== P.contextPercent) await apply("contextPercent", d);
+            } else if (pChoice.startsWith("缓存命中率")) {
+              const d = await pickDigits("缓存命中率小数位（惯例为整数）", (d) => "CH " + formatPercent(82.4, d));
+              if (d !== null && d !== P.cacheHitPercent) await apply("cacheHitPercent", d);
+            } else if (pChoice.startsWith("套餐余量")) {
+              const d = await pickDigits("套餐余量百分比小数位", (d) => "5h: " + formatPercent(89.34, d) + " ⏱ 4h15m");
+              if (d !== null && d !== P.quotaPercent) await apply("quotaPercent", d);
+            } else if (pChoice.startsWith("token")) {
+              const c = await ctx.ui.select("token 精度（自适应最省心）", [
+                "自适应    " + formatTokens(128400, "auto"),
+                "整数      " + formatTokens(128400, 0),
+                "1 位小数  " + formatTokens(128400, 1),
+              ]);
+              const t = c ? (c.startsWith("整数") ? 0 : c.startsWith("1 位") ? 1 : "auto") : null;
+              if (t !== null && t !== P.token) await apply("token", t as TokenPrecision);
+            } else if (pChoice.startsWith("速率")) {
+              const d = await pickDigits("速率小数位", (d) => formatSpeed(77.7, d) + " t/s");
+              if (d !== null && d !== P.speed) await apply("speed", d);
+            } else if (pChoice.startsWith("会话花费")) {
+              const d = await pickAmount("会话花费金额小数位", (d) => formatAmount(0.124, d));
+              if (d !== null && d !== P.costAmount) await apply("costAmount", d);
+            } else {
+              const d = await pickAmount("套餐余额金额小数位", (d) => formatAmount(12.34, d, "¥"));
+              if (d !== null && d !== P.balanceAmount) await apply("balanceAmount", d);
+            }
+          }
+        } else if (subChoice.startsWith("上下文样式")) {
+          await pickStyleOption(ctx, "上下文样式", CONTEXT_STYLE_ITEMS, displayConfig.contextStyle, async (v) => {
+            displayConfig = { ...displayConfig, contextStyle: v };
+            await saveDisplayConfig(displayConfig);
+            requestFooterRender?.();
+          });
+        } else if (subChoice.startsWith("速率样式")) {
+          await pickStyleOption(ctx, "速率样式", SPEED_STYLE_ITEMS, displayConfig.speedStyle, async (v) => {
+            displayConfig = { ...displayConfig, speedStyle: v };
+            await saveDisplayConfig(displayConfig);
+            requestFooterRender?.();
+          });
+        } else if (subChoice.startsWith("套餐样式")) {
+          await pickStyleOption(ctx, "套餐样式", QUOTA_STYLE_ITEMS, displayConfig.quotaStyle, async (v) => {
+            displayConfig = { ...displayConfig, quotaStyle: v };
+            await saveDisplayConfig(displayConfig);
+            // 缓存数据重新格式化即可，不必重新请求接口
+            await refreshQuotaOnce(ctx);
+            requestFooterRender?.();
+          });
+        } else if (subChoice.startsWith("查询间隔")) {
           const input = await ctx.ui.input("输入刷新间隔（秒）", String(tokenConfig?.ttl || 60));
           if (input) {
             const sec = parseInt(input, 10);
@@ -2299,7 +2475,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 ? { ...tokenConfig, ttl: sec }
                 : { providerPlans: {}, ttl: sec };
               await saveTokenConfig(tokenConfig);
-              // 重设定时器
               if (quotaTimerId) clearInterval(quotaTimerId);
               quotaTimerId = setInterval(async () => {
                 if (!sessionActive) return;
@@ -2310,6 +2485,14 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
               }, sec * 1000);
               ctx.ui.notify("查询间隔已设为 " + sec + " 秒", "info");
             }
+          }
+        } else if (subChoice === "恢复默认") {
+          const ok = await ctx.ui.confirm("恢复默认", "显示项、精度、样式全部恢复默认？");
+          if (ok) {
+            displayConfig = normalizeDisplayConfig({});
+            await saveDisplayConfig(displayConfig);
+            requestFooterRender?.();
+            ctx.ui.notify("已恢复默认显示配置", "info");
           }
         }
         continue configMenu;

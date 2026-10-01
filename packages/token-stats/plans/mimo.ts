@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import type { TokenPlan } from "./shared";
 import { silentError } from "./shared";
+import { formatAmount } from "../format";
 
 // ── 常量 ────────────────────────────────────────────────────────────────
 
@@ -446,11 +447,11 @@ export const mimoPlan: TokenPlan = {
   authHeader: (key) => ({ Cookie: key, Accept: "application/json" }),
   /** fetchQuota 的 key 由 resolveApiKey 提供（此处为 cookie 串），但取数自带重登逻辑，故忽略 */
   fetchQuota: async () => fetchMimoQuota(),
-  format: (data: any) => {
+  format: (data, ctx) => {
     const amount = Number(data?.amount ?? 0);
     return {
       modelPrefix: "",
-      display: "¥" + amount.toFixed(1),
+      display: formatAmount(amount, ctx.amountDigits, "¥"),
       color: amount < 1 ? "warn" : "ok",
     };
   },

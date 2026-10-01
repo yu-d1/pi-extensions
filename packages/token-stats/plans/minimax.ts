@@ -25,7 +25,7 @@ export const minimaxPlan: TokenPlan = {
     if (data.base_resp?.status_code === 0) return data;
     throw new Error(data.base_resp?.status_msg || "MiniMax 返回错误");
   },
-  format: (data: any, style) => {
+  format: (data, ctx) => {
     const models = data.model_remains || [];
     // 官方接口 2026-07 起 model_name 改为 general / video 等语义化命名，
     // 不再是 MiniMax-M2 / MiniMax-M3。优先取 "general"（通用文本/编码套餐），否则取第一项
@@ -41,7 +41,7 @@ export const minimaxPlan: TokenPlan = {
     const weeklyReset = typeof m.weekly_end_time === "number" && m.weekly_end_time > now ? m.weekly_end_time : null;
     return {
       modelPrefix: "",
-      display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, style),
+      display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, ctx.style, ctx.percentDigits),
       color: quotaColor(intervalRemaining, weeklyRemaining),
     };
   },

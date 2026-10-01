@@ -4,6 +4,7 @@
  */
 
 import type { TokenPlan } from "./shared";
+import { formatAmount } from "../format";
 
 export const deepseekPlan: TokenPlan = {
   id: "deepseek",
@@ -22,14 +23,14 @@ export const deepseekPlan: TokenPlan = {
     if (!r.ok) throw new Error("DeepSeek 配额查询 HTTP " + r.status);
     return await r.json();
   },
-  format: (data: any) => {
+  format: (data, ctx) => {
     const infos = data?.balance_infos || [];
     const cny = infos.find((x: any) => x.currency === "CNY") || infos[0];
     if (!cny) return { modelPrefix: "", display: "无数据", color: "err" };
     const total = parseFloat(cny.total_balance || "0");
     return {
       modelPrefix: "",
-      display: "¥" + total.toFixed(1),
+      display: formatAmount(total, ctx.amountDigits, "¥"),
       color: total < 1 ? "warn" : "ok",
     };
   },

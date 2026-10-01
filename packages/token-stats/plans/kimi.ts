@@ -23,7 +23,7 @@ export const kimiPlan: TokenPlan = {
     if (!r.ok) throw new Error("Kimi 配额查询 HTTP " + r.status);
     return await r.json();
   },
-  format: (data: any, style) => {
+  format: (data, ctx) => {
     const limits = data.limits || [];
     let intervalRemaining = 100;
     let intervalReset: number | null = null;
@@ -53,7 +53,7 @@ export const kimiPlan: TokenPlan = {
     if (intervalRemaining >= 100 && weeklyRemaining >= 100) return { modelPrefix: "", display: "无数据", color: "err" };
     return {
       modelPrefix: "",
-      display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, style),
+      display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, ctx.style, ctx.percentDigits),
       color: quotaColor(intervalRemaining, weeklyRemaining),
     };
   },

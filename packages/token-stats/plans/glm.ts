@@ -23,7 +23,7 @@ export const glmPlan: TokenPlan = {
     if (!r.ok) throw new Error("GLM 配额查询 HTTP " + r.status);
     return await r.json();
   },
-  format: (data: any, style) => {
+  format: (data, ctx) => {
     const limits = data?.data?.limits || [];
     const tokenLimits = limits.filter((x: any) => (x.type || "").toLowerCase() === "tokens_limit");
     if (tokenLimits.length === 0) return { modelPrefix: "", display: "无数据", color: "err" };
@@ -37,7 +37,7 @@ export const glmPlan: TokenPlan = {
     const weeklyReset = typeof weekly?.nextResetTime === "number" && weekly.nextResetTime > now ? weekly.nextResetTime : null;
     return {
       modelPrefix: "",
-      display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, style),
+      display: formatTokenPlanDisplay(intervalRemaining, weeklyRemaining, intervalReset, weeklyReset, ctx.style, ctx.percentDigits),
       color: quotaColor(intervalRemaining, weeklyRemaining),
     };
   },
