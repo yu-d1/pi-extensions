@@ -10,26 +10,24 @@
  *      认证统一走 /login <名称> 存入 auth.json。
  *   3. 配置统一持久化到 ~/.pi/agent/extensions/model-provider/config.json（schemaVersion:2），
  *      首次加载时自动迁移旧的 minimax-local/config.json。
+ *   4. MiniMax 专属协议实现、流式逻辑与参数配置菜单拆分在 minimax.ts；
+ *      内置 MiniMax 作为固定供应商出现在“管理模型”列表中，参数经“配置管理”进入。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type {
-	Api,
-	AssistantMessage,
-	AssistantMessageEventStream,
-	Context,
-	ImageContent,
-	Message,
-	Model,
-	SimpleStreamOptions,
-	StopReason,
-	TextContent,
-	ThinkingContent,
-	Tool,
-	ToolCall,
-} from "@earendil-works/pi-ai";
-import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Container, Input, Key, matchesKey, Spacer, Text, fuzzyFilter } from "@earendil-works/pi-tui";
+import {
+	DEFAULT_MINIMAX,
+	MINIMAX_BASE_URL,
+	MINIMAX_PROVIDER_ID,
+	MINIMAX_PROVIDER_LABEL,
+	asMiniMaxConfig,
+	cloneMiniMaxDefaultModels,
+	minimaxMenu,
+	setMiniMaxHost,
+	streamMiniMaxChat,
+	type MiniMaxConfig,
+} from "./minimax";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -86,7 +84,7 @@ interface StoredCost {
 	cacheWrite: number;
 }
 
-interface StoredModel {
+export interface StoredModel {
 	id: string;
 	name?: string;
 	reasoning?: boolean;
@@ -99,27 +97,13 @@ interface StoredModel {
 	enabled?: boolean;
 }
 
-type ServiceTier = "standard" | "priority";
-type ThinkingType = "adaptive" | "disabled";
-
-interface MiniMaxConfig {
-	serviceTier: ServiceTier;
-	reasoningSplit: boolean;
-	/** "auto" 表示根据模型 + reasoningEffort 自动决定；否则覆盖自动逻辑 */
-	thinkingOverride: ThinkingType | "auto";
-	/** 采样温度，范围 [0, 2]，默认 1 */
-	temperature: number;
-	/** 核采样参数，范围 [0, 1]，MiniMax-M3 默认 0.95，M2.x 系列默认 0.9 */
-	topP: number;
-	/** 生成内容长度上限；null 表示使用 model.maxTokens */
-	maxCompletionTokens: number | null;
-}
-
 interface BuiltinEntry {
 	kind: "builtin";
 	name: "minimax_local";
 	label: "MiniMax Local";
 	minimax: MiniMaxConfig;
+	/** 内置模型列表（可在“管理模型”中勾选启用/修改）。 */
+	models: StoredModel[];
 }
 
 interface CommonEntry {
@@ -148,15 +132,6 @@ interface Store {
 const STORE_FILE = join(homedir(), ".pi", "agent", "extensions", "model-provider", "config.json");
 const LEGACY_MINIMAX_FILE = join(homedir(), ".pi", "agent", "extensions", "minimax-local", "config.json");
 
-const DEFAULT_MINIMAX: MiniMaxConfig = {
-	serviceTier: "priority",
-	reasoningSplit: true,
-	thinkingOverride: "auto",
-	temperature: 1,
-	topP: 0.95,
-	maxCompletionTokens: null,
-};
-
 function createDefaultStore(): Store {
 	return {
 		schemaVersion: 2,
@@ -166,6 +141,7 @@ function createDefaultStore(): Store {
 				name: "minimax_local",
 				label: "MiniMax Local",
 				minimax: { ...DEFAULT_MINIMAX },
+				models: cloneMiniMaxDefaultModels(),
 			},
 		],
 	};
@@ -174,41 +150,46 @@ function createDefaultStore(): Store {
 let store: Store = createDefaultStore();
 let api: ExtensionAPI | null = null;
 
+// minimax.ts 通过宿主回调读写 store，保持 index → minimax 的单向依赖。
+setMiniMaxHost({
+	getBuiltin: () => getBuiltinEntry(),
+	save: () => saveStore(),
+});
+
 // =============================================================================
 // Store 读写与迁移
 // =============================================================================
 
-function asMiniMaxConfig(raw: any): MiniMaxConfig {
-	return {
-		serviceTier: raw?.serviceTier === "standard" || raw?.serviceTier === "priority" ? raw.serviceTier : DEFAULT_MINIMAX.serviceTier,
-		reasoningSplit: typeof raw?.reasoningSplit === "boolean" ? raw.reasoningSplit : DEFAULT_MINIMAX.reasoningSplit,
-		thinkingOverride:
-			raw?.thinkingOverride === "auto" || raw?.thinkingOverride === "adaptive" || raw?.thinkingOverride === "disabled"
-				? raw.thinkingOverride
-				: DEFAULT_MINIMAX.thinkingOverride,
-		temperature:
-			typeof raw?.temperature === "number" && !isNaN(raw.temperature) && raw.temperature >= 0 && raw.temperature <= 2
-				? raw.temperature
-				: DEFAULT_MINIMAX.temperature,
-		topP: typeof raw?.topP === "number" && !isNaN(raw.topP) && raw.topP >= 0 && raw.topP <= 1 ? raw.topP : DEFAULT_MINIMAX.topP,
-		maxCompletionTokens:
-			raw?.maxCompletionTokens === null
-				? null
-				: typeof raw?.maxCompletionTokens === "number" && raw.maxCompletionTokens >= 1
-					? raw.maxCompletionTokens
-					: DEFAULT_MINIMAX.maxCompletionTokens,
-	};
+/** 解析持久化的模型数组（builtin 与 common 共用）。 */
+function normalizeStoredModels(raw: unknown): StoredModel[] {
+	if (!Array.isArray(raw)) return [];
+	return raw
+		.filter((m: any) => typeof m?.id === "string")
+		.map((m: any) => ({
+			id: m.id,
+			...(m.name ? { name: m.name } : {}),
+			reasoning: inferModelReasoning(m),
+			input: normalizeInput(m.input),
+			...(typeof m.contextWindow === "number" ? { contextWindow: m.contextWindow } : {}),
+			...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}),
+			...(m.cost ? { cost: m.cost } : {}),
+			...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
+			...(typeof m.enabled === "boolean" ? { enabled: m.enabled } : {}),
+		}));
 }
 
 function normalizeStore(raw: any): Store {
 	const providers: ProviderEntry[] = [];
 	// 内置 minimax 始终存在
 	const builtinRaw = Array.isArray(raw?.providers) ? raw.providers.find((p: any) => p?.kind === "builtin") : undefined;
+	const builtinModels = normalizeStoredModels(builtinRaw?.models);
 	providers.push({
 		kind: "builtin",
 		name: "minimax_local",
 		label: "MiniMax Local",
 		minimax: asMiniMaxConfig(builtinRaw?.minimax),
+		// 旧配置没有 models 字段时回落到内置默认模型（M3 / M2.7-HighSpeed）。
+		models: builtinModels.length > 0 ? sortModels(builtinModels) : cloneMiniMaxDefaultModels(),
 	});
 	// 其它 common 条目
 	if (Array.isArray(raw?.providers)) {
@@ -220,23 +201,7 @@ function normalizeStore(raw: any): Store {
 				name: p.name.trim(),
 				api: typeof p.api === "string" && KNOWN_APIS.includes(p.api) ? p.api : "openai-completions",
 				baseUrl: typeof p.baseUrl === "string" ? p.baseUrl : "",
-				models: sortModels(
-					Array.isArray(p.models)
-						? p.models
-								.filter((m: any) => typeof m?.id === "string")
-								.map((m: any) => ({
-									id: m.id,
-									...(m.name ? { name: m.name } : {}),
-									reasoning: inferModelReasoning(m),
-									input: normalizeInput(m.input),
-									...(typeof m.contextWindow === "number" ? { contextWindow: m.contextWindow } : {}),
-									...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}),
-									...(m.cost ? { cost: m.cost } : {}),
-									...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
-									...(typeof m.enabled === "boolean" ? { enabled: m.enabled } : {}),
-								}))
-						: [],
-				),
+				models: sortModels(normalizeStoredModels(p.models)),
 			};
 			providers.push(entry);
 		}
@@ -291,496 +256,12 @@ async function saveStore(): Promise<void> {
 	}
 }
 
-function getMiniMax(): MiniMaxConfig {
-	const builtin = store.providers.find((p): p is BuiltinEntry => p.kind === "builtin");
-	return builtin?.minimax ?? DEFAULT_MINIMAX;
+function getBuiltinEntry(): BuiltinEntry | undefined {
+	return store.providers.find((p): p is BuiltinEntry => p.kind === "builtin");
 }
 
 function getCommonEntries(): CommonEntry[] {
 	return store.providers.filter((p): p is CommonEntry => p.kind === "common");
-}
-
-// =============================================================================
-// 工具：M2.x 系列识别
-// =============================================================================
-
-const isM2Series = (modelId: string) => modelId.startsWith("MiniMax-M2");
-
-/** 计算字符串的终端显示宽度（CJK 汉字=2，其他=1） */
-function visualWidth(s: string): number {
-	let w = 0;
-	for (const ch of s) {
-		if (/[㐀-鿿　-〿＀-￯]/.test(ch)) {
-			w += 2;
-		} else {
-			w += 1;
-		}
-	}
-	return w;
-}
-
-/** 按视觉宽度右侧补齐空格（用于表格对齐） */
-function padVisualEnd(s: string, target: number): string {
-	const w = visualWidth(s);
-	if (w >= target) return s;
-	return s + " ".repeat(target - w);
-}
-
-/** 模型官方推荐的 top_p 默认值 */
-function defaultTopPForModel(modelId: string): number {
-	return isM2Series(modelId) ? 0.9 : 0.95;
-}
-
-/** 模型 max_completion_tokens 上限 */
-function getMaxTokensLimit(modelId: string): number {
-	return isM2Series(modelId) ? 204800 : 524288;
-}
-
-// =============================================================================
-// 消息转换：pi 内部消息 → OpenAI 格式（内置 minimax 用）
-// =============================================================================
-
-function convertContent(
-	blocks: (TextContent | ImageContent)[],
-): string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> {
-	const hasImages = blocks.some((b) => b.type === "image");
-	if (!hasImages) {
-		return blocks
-			.filter((b): b is TextContent => b.type === "text")
-			.map((b) => b.text)
-			.join("");
-	}
-	const result: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = [];
-	for (const block of blocks) {
-		if (block.type === "text") {
-			result.push({ type: "text", text: block.text });
-		} else if (block.type === "image") {
-			const dataUrl = `data:${block.mimeType};base64,${block.data}`;
-			result.push({ type: "image_url", image_url: { url: dataUrl } });
-		}
-	}
-	if (!result.some((b) => b.type === "text")) {
-		result.unshift({ type: "text", text: "(see attached image)" });
-	}
-	return result;
-}
-
-/**
- * 后处理：剥离孤立的 assistant(tool_calls)
- * MiniMax 协议要求 assistant(tool_calls) 之后必须紧跟 tool 消息；
- * 中断场景下 assistant 发了 tool_calls 但 tool_result 没回来，必须清空，否则报 2013。
- */
-function sanitizeOrphanToolCalls(messages: any[]): any[] {
-	const fulfilled = new Set<string>();
-	for (const m of messages) {
-		if (m.role === "tool" && m.tool_call_id) {
-			fulfilled.add(m.tool_call_id);
-		}
-	}
-	const out: any[] = [];
-	for (const m of messages) {
-		if (m.role !== "assistant" || !Array.isArray(m.tool_calls) || m.tool_calls.length === 0) {
-			out.push(m);
-			continue;
-		}
-		const valid = m.tool_calls.filter((tc: any) => fulfilled.has(tc.id));
-		if (valid.length === m.tool_calls.length) {
-			out.push(m);
-			continue;
-		}
-		if (valid.length === 0) {
-			const { tool_calls, ...rest } = m;
-			if (typeof rest.content === "string" ? rest.content.trim() : rest.content) {
-				out.push(rest);
-			}
-		} else {
-			out.push({ ...m, tool_calls: valid });
-		}
-	}
-	return out;
-}
-
-function convertMessages(messages: Message[]): any[] {
-	const result: any[] = [];
-	let pendingToolCallIds = new Set<string>();
-	for (const msg of messages) {
-		if (msg.role === "user") {
-			if (typeof msg.content === "string") {
-				if (msg.content.trim()) {
-					result.push({ role: "user", content: msg.content });
-				}
-			} else {
-				const content = convertContent(msg.content as (TextContent | ImageContent)[]);
-				if (Array.isArray(content) ? content.length > 0 : content.trim()) {
-					result.push({ role: "user", content });
-				}
-			}
-		} else if (msg.role === "assistant") {
-			const blocks: any[] = [];
-			let text = "";
-			const toolCalls: any[] = [];
-			for (const block of msg.content) {
-				if (block.type === "text" && block.text.trim()) {
-					text += block.text;
-				} else if (block.type === "thinking") {
-					if (!text.startsWith(" thinking")) {
-						text = ` thinking\n${(block as ThinkingContent).thinking}\n response\n\n${text}`;
-					}
-				} else if (block.type === "toolCall") {
-					toolCalls.push({
-						id: block.id,
-						type: "function",
-						function: {
-							name: block.name,
-							arguments: typeof block.arguments === "string" ? block.arguments : JSON.stringify(block.arguments),
-						},
-					});
-				}
-			}
-			const assistantMsg: any = { role: "assistant" };
-			if (text) assistantMsg.content = text;
-			else assistantMsg.content = "";
-			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
-			result.push(assistantMsg);
-			for (const tc of toolCalls) pendingToolCallIds.add(tc.id);
-		} else if (msg.role === "toolResult") {
-			if (!msg.toolCallId || !pendingToolCallIds.has(msg.toolCallId)) {
-				continue;
-			}
-			result.push({
-				role: "tool",
-				tool_call_id: msg.toolCallId,
-				content:
-					typeof msg.content === "string"
-						? msg.content
-						: msg.content
-								.filter((b): b is TextContent => b.type === "text")
-								.map((b) => b.text)
-								.join(""),
-			});
-			pendingToolCallIds.delete(msg.toolCallId);
-		}
-	}
-	return sanitizeOrphanToolCalls(result);
-}
-
-function convertTools(tools: Tool[]): any[] {
-	return tools.map((t) => ({
-		type: "function",
-		function: {
-			name: t.name,
-			description: t.description,
-			parameters: (t.parameters as any) ?? { type: "object", properties: {} },
-		},
-	}));
-}
-
-// =============================================================================
-// thinking.type 决定逻辑（内置 minimax 用）
-// =============================================================================
-
-function resolveThinkingType(model: Model<Api>, options?: SimpleStreamOptions): ThinkingType | undefined {
-	if (!model.reasoning) return undefined;
-	const cfg = getMiniMax();
-	if (cfg.thinkingOverride !== "auto") {
-		if (isM2Series(model.id)) return "adaptive";
-		return cfg.thinkingOverride;
-	}
-	if (isM2Series(model.id)) return "adaptive";
-	if (!options?.reasoning || (options.reasoning as string) === "off") {
-		return (model.thinkingLevelMap as any)?.off === "disabled" ? "disabled" : "adaptive";
-	}
-	const mapped = model.thinkingLevelMap?.[options.reasoning];
-	if (mapped === "disabled") return "disabled";
-	return "adaptive";
-}
-
-// =============================================================================
-// 响应 → StopReason 映射
-// =============================================================================
-
-function mapStopReason(reason: string | null | undefined): StopReason {
-	switch (reason) {
-		case "stop":
-		case "stop_sequence":
-			return "stop";
-		case "length":
-		case "max_tokens":
-			return "length";
-		case "tool_calls":
-		case "tool_use":
-			return "toolUse";
-		case "content_filter":
-			return "error";
-		default:
-			return "error";
-	}
-}
-
-// =============================================================================
-// 内置 minimax 流式实现
-// =============================================================================
-
-function streamMiniMaxChat(
-	model: Model<Api>,
-	context: Context,
-	options?: SimpleStreamOptions,
-): AssistantMessageEventStream {
-	const stream = createAssistantMessageEventStream();
-
-	(async () => {
-		const cfg = getMiniMax();
-		const output: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-		};
-
-		try {
-			const apiKey = options?.apiKey ?? "";
-
-			const thinkingType = resolveThinkingType(model, options);
-			const body: any = {
-				model: model.id,
-				messages: convertMessages(context.messages),
-				service_tier: cfg.serviceTier,
-				reasoning_split: cfg.reasoningSplit,
-				stream: true,
-				stream_options: { include_usage: true },
-				temperature: cfg.temperature,
-				top_p: cfg.topP,
-				max_completion_tokens: Math.max(
-					1,
-					Math.min(
-						cfg.maxCompletionTokens ?? options?.maxTokens ?? model.maxTokens,
-						getMaxTokensLimit(model.id),
-					),
-				),
-			};
-			if (thinkingType) {
-				body.thinking = { type: thinkingType };
-			}
-			if (context.systemPrompt) {
-				body.messages = [{ role: "system", content: context.systemPrompt }, ...body.messages];
-			}
-			if (context.tools && context.tools.length > 0) {
-				body.tools = convertTools(context.tools);
-			}
-
-			const url = `${(model.baseUrl ?? "https://api.minimaxi.com/v1").replace(/\/+$/, "")}/chat/completions`;
-
-			const response = await fetch(url, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: `Bearer ${apiKey}`,
-					Accept: "text/event-stream",
-				},
-				body: JSON.stringify(body),
-				signal: options?.signal,
-			});
-
-			if (!response.ok) {
-				const errorText = await response.text();
-				throw new Error(`HTTP ${response.status}: ${errorText}`);
-			}
-
-			if (!response.body) {
-				throw new Error("No response body");
-			}
-
-			stream.push({ type: "start", partial: output });
-
-			const reader = response.body.getReader();
-			const decoder = new TextDecoder();
-			let buffer = "";
-
-			const blocks = output.content as any[];
-			const toolCallBlocksByIndex = new Map<number, any>();
-
-			const ensureTextBlock = (): TextContent => {
-				if (blocks.length === 0 || blocks[blocks.length - 1].type !== "text") {
-					const block: TextContent = { type: "text", text: "" };
-					blocks.push(block);
-					stream.push({ type: "text_start", contentIndex: blocks.length - 1, partial: output });
-				}
-				return blocks[blocks.length - 1] as TextContent;
-			};
-
-			const ensureThinkingBlock = (): ThinkingContent => {
-				if (blocks.length === 0 || blocks[blocks.length - 1].type !== "thinking") {
-					const block: ThinkingContent = { type: "thinking", thinking: "" };
-					blocks.push(block);
-					stream.push({ type: "thinking_start", contentIndex: blocks.length - 1, partial: output });
-				}
-				return blocks[blocks.length - 1] as ThinkingContent;
-			};
-
-			const ensureToolCallBlock = (index: number, id: string, name: string): any => {
-				let block = toolCallBlocksByIndex.get(index);
-				if (!block) {
-					block = { type: "toolCall", id, name, arguments: {}, partialJson: "" };
-					toolCallBlocksByIndex.set(index, block);
-					blocks.push(block);
-					stream.push({ type: "toolcall_start", contentIndex: blocks.length - 1, partial: output });
-				}
-				return block;
-			};
-
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-
-				buffer += decoder.decode(value, { stream: true });
-
-				const events = buffer.split("\n\n");
-				buffer = events.pop() ?? "";
-
-				for (const event of events) {
-					const lines = event.split("\n");
-					let data = "";
-					for (const line of lines) {
-						if (line.startsWith("data:")) {
-							data += line.slice(5).trim();
-						}
-					}
-					if (!data || data === "[DONE]") continue;
-
-					let chunk: any;
-					try {
-						chunk = JSON.parse(data);
-					} catch {
-						continue;
-					}
-
-					if (chunk.usage) {
-						const u = chunk.usage;
-						output.usage.input = u.prompt_tokens ?? 0;
-						output.usage.output = u.completion_tokens ?? 0;
-						output.usage.cacheRead = u.prompt_tokens_details?.cached_tokens ?? 0;
-						output.usage.cacheWrite = 0;
-						output.usage.totalTokens = u.total_tokens ?? 0;
-						calculateCost(model, output.usage);
-					}
-
-					const choice = chunk.choices?.[0];
-					if (!choice) continue;
-
-					const delta = choice.delta ?? {};
-					const finishReason = choice.finish_reason;
-
-					if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
-						const block = ensureThinkingBlock();
-						block.thinking += delta.reasoning_content;
-						stream.push({ type: "thinking_delta", contentIndex: blocks.length - 1, delta: delta.reasoning_content, partial: output });
-					}
-
-					if (typeof delta.content === "string" && delta.content.length > 0) {
-						const block = ensureTextBlock();
-						block.text += delta.content;
-						stream.push({ type: "text_delta", contentIndex: blocks.length - 1, delta: delta.content, partial: output });
-					}
-
-					if (Array.isArray(delta.tool_calls)) {
-						for (const tc of delta.tool_calls) {
-							const idx = tc.index ?? 0;
-							const id = tc.id ?? "";
-							const name = tc.function?.name ?? "";
-							const argsDelta = tc.function?.arguments ?? "";
-
-							const block = ensureToolCallBlock(idx, id || getExistingToolCallId(toolCallBlocksByIndex, idx), name);
-
-							if (id) block.id = id;
-							if (name) block.name = name;
-							if (argsDelta) {
-								block.partialJson = (block.partialJson ?? "") + argsDelta;
-								try {
-									block.arguments = JSON.parse(block.partialJson);
-								} catch {
-									// 部分 JSON，继续累积
-								}
-								stream.push({ type: "toolcall_delta", contentIndex: blocks.length - 1, delta: argsDelta, partial: output });
-							}
-						}
-					}
-
-					if (finishReason) {
-						output.stopReason = mapStopReason(finishReason);
-						for (let i = 0; i < blocks.length; i++) {
-							const b = blocks[i];
-							if (b.type === "text") {
-								stream.push({ type: "text_end", contentIndex: i, content: b.text, partial: output });
-							} else if (b.type === "thinking") {
-								stream.push({ type: "thinking_end", contentIndex: i, content: b.thinking, partial: output });
-							} else if (b.type === "toolCall") {
-								try {
-									b.arguments = JSON.parse(b.partialJson ?? "{}");
-								} catch {
-									b.arguments = {};
-								}
-								delete b.partialJson;
-								stream.push({ type: "toolcall_end", contentIndex: i, toolCall: b as ToolCall, partial: output });
-							}
-						}
-					}
-				}
-			}
-
-			if (output.stopReason === "stop") {
-				for (let i = 0; i < blocks.length; i++) {
-					const b = blocks[i];
-					if (b.type === "text") {
-						stream.push({ type: "text_end", contentIndex: i, content: b.text, partial: output });
-					} else if (b.type === "thinking") {
-						stream.push({ type: "thinking_end", contentIndex: i, content: b.thinking, partial: output });
-					} else if (b.type === "toolCall") {
-						try {
-							b.arguments = JSON.parse(b.partialJson ?? "{}");
-						} catch {
-							b.arguments = {};
-						}
-						delete b.partialJson;
-						stream.push({ type: "toolcall_end", contentIndex: i, toolCall: b as ToolCall, partial: output });
-					}
-				}
-			}
-
-			if (options?.signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-
-			stream.push({
-				type: "done",
-				reason: output.stopReason as "stop" | "length" | "toolUse",
-				message: output,
-			});
-			stream.end();
-		} catch (error) {
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
-			stream.push({ type: "error", reason: output.stopReason, error: output });
-			stream.end();
-		}
-	})();
-
-	return stream;
-}
-
-// 辅助：获取已有 toolCall 的 id（用于流式 tool_calls 增量）
-function getExistingToolCallId(map: Map<number, any>, index: number): string {
-	return map.get(index)?.id ?? "";
 }
 
 // =============================================================================
@@ -1155,211 +636,35 @@ function unregisterAndReRegister(pi: ExtensionAPI, oldName: string | null, entry
 	registerCommon(pi, entry);
 }
 
-function registerAllProviders(pi: ExtensionAPI): void {
-	pi.unregisterProvider("minimax_local");
-	pi.registerProvider("minimax_local", {
-		name: "MiniMax Local",
-		baseUrl: "https://api.minimaxi.com/v1",
+/** 模型等本地变更后重新注册：builtin 走 MiniMax 注册，common 走通用注册。 */
+function reRegisterEntry(entry: ProviderEntry): void {
+	if (!api) return;
+	if (entry.kind === "builtin") registerBuiltin(api);
+	else unregisterAndReRegister(api, entry.name, entry);
+}
+
+/** 注册内置 MiniMax 供应商：模型列表来自 store（可在“管理模型”中勾选启用）。 */
+function registerBuiltin(pi: ExtensionAPI): void {
+	const builtin = getBuiltinEntry();
+	const models = (builtin?.models?.length ? builtin.models : cloneMiniMaxDefaultModels())
+		.filter(isModelEnabled)
+		.map(normalizeModel);
+	pi.unregisterProvider(MINIMAX_PROVIDER_ID);
+	pi.registerProvider(MINIMAX_PROVIDER_ID, {
+		name: MINIMAX_PROVIDER_LABEL,
+		baseUrl: MINIMAX_BASE_URL,
 		apiKey: "$MINIMAX_API_KEY",
 		authHeader: true,
 		api: "minimax-chat",
-		models: [
-			{
-				id: "MiniMax-M3",
-				name: "MiniMax-M3 (priority)",
-				reasoning: true,
-				input: ["text", "image"],
-				contextWindow: 1000000,
-				maxTokens: 131072,
-				cost: { input: 2.0, output: 8.0, cacheRead: 0, cacheWrite: 0 },
-				thinkingLevelMap: {
-					off: "disabled",
-					minimal: "adaptive",
-					low: "adaptive",
-					medium: "adaptive",
-					high: "adaptive",
-					xhigh: "adaptive",
-				},
-			},
-			{
-				id: "MiniMax-M2.7-highspeed",
-				name: "MiniMax-M2.7-HighSpeed (priority)",
-				reasoning: true,
-				input: ["text"],
-				contextWindow: 204800,
-				maxTokens: 65536,
-				cost: { input: 0.5, output: 2.0, cacheRead: 0, cacheWrite: 0 },
-				thinkingLevelMap: {
-					off: "adaptive",
-					minimal: "adaptive",
-					low: "adaptive",
-					medium: "adaptive",
-					high: "adaptive",
-					xhigh: "adaptive",
-				},
-			},
-		],
+		models,
 		streamSimple: streamMiniMaxChat,
 	});
+}
+
+function registerAllProviders(pi: ExtensionAPI): void {
+	registerBuiltin(pi);
 	for (const entry of getCommonEntries()) {
 		registerCommon(pi, entry);
-	}
-}
-
-// =============================================================================
-// 内置 minimax 配置菜单（原 /minimax 迁入 /model-provider minimax）
-// =============================================================================
-
-function formatConfig(currentModel?: { id: string } | null): string {
-	const cfg = getMiniMax();
-	const thinkingText = (() => {
-		if (cfg.thinkingOverride === "auto") {
-			const m2 = currentModel ? isM2Series(currentModel.id) : false;
-			return m2 ? "auto（M2.x 系列始终为开启思考）" : "auto（根据思考级别自动决定）";
-		}
-		if (cfg.thinkingOverride === "adaptive") return "adaptive（强制开启思考）";
-		return "disabled（强制关闭思考）";
-	})();
-
-	const tierText = cfg.serviceTier === "priority" ? "priority（高优先级）" : "standard（标准排队）";
-	const splitText = cfg.reasoningSplit ? "true（拆分到独立字段）" : "false（混合在 content 中）";
-
-	const modelId = currentModel?.id ?? "MiniMax-M3";
-	const modelLimit = getMaxTokensLimit(modelId);
-	const recommendedTopP = defaultTopPForModel(modelId);
-	const maxTokensDisplay =
-		cfg.maxCompletionTokens === null ? `自动（模型上限 ${modelLimit}）` : `${cfg.maxCompletionTokens}（上限 ${modelLimit}）`;
-
-	return [
-		"━━━━━━ MiniMax 当前配置 ━━━━━━",
-		"",
-		padVisualEnd("思考模式（thinking）", 27) + thinkingText,
-		padVisualEnd("服务层级（service_tier）", 27) + tierText,
-		padVisualEnd("思考拆分（reasoning_split）", 27) + splitText,
-		padVisualEnd("温度（temperature）", 27) + `${cfg.temperature}（范围 0-2）`,
-		padVisualEnd("核采样（top_p）", 27) + `${cfg.topP}（推荐 ${recommendedTopP}，范围 0-1）`,
-		padVisualEnd("最大输出（max_tokens）", 27) + maxTokensDisplay,
-		"",
-	].join("\n");
-}
-
-async function minimaxMenu(ctx: any): Promise<void> {
-	await loadStore();
-	const currentModel = ctx.model ? { id: ctx.model.id } : null;
-
-	const thinkingDesc = (v: string): string => {
-		if (v === "auto") return "auto  （根据模型自动决定）";
-		if (v === "adaptive") return "adaptive （强制开启）";
-		return "disabled （强制关闭）";
-	};
-	const tierDesc = (v: string): string => {
-		if (v === "priority") return "priority （高优先级，1.5×价格）";
-		return "standard （标准排队）";
-	};
-
-	const cfg = getMiniMax();
-	const mainMenu = [
-		padVisualEnd("思考模式（thinking）", 27) + `当前：${cfg.thinkingOverride}`,
-		padVisualEnd("服务层级（service_tier）", 27) + `当前：${cfg.serviceTier}`,
-		padVisualEnd("思考拆分（reasoning_split）", 27) + `当前：${cfg.reasoningSplit ? "拆分到独立字段" : "混合在 content 中"}`,
-		padVisualEnd("温度（temperature）", 27) + `当前：${cfg.temperature}（范围 0-2）`,
-		padVisualEnd("核采样（top_p）", 27) + `当前：${cfg.topP}（范围 0-1）`,
-		padVisualEnd("最大输出（max_tokens）", 27) + `当前：${cfg.maxCompletionTokens ?? "自动（用模型默认）"}`,
-		"恢复默认设置",
-		"返回上级",
-	];
-
-	const action = await ctx.ui.select("MiniMax 配置", mainMenu);
-	if (!action || action === "返回上级") return;
-
-	if (action === "恢复默认设置") {
-		const builtin = store.providers.find((p): p is BuiltinEntry => p.kind === "builtin");
-		if (builtin) builtin.minimax = { ...DEFAULT_MINIMAX };
-		await saveStore();
-		ctx.ui.notify("已恢复默认设置。\n\n" + formatConfig(currentModel), "info");
-		return;
-	}
-
-	if (action.startsWith("思考模式（thinking）")) {
-		const values = [`auto      （根据模型自动决定）`, `adaptive  （强制开启）`, `disabled  （强制关闭，M3生效）`, "取消"];
-		const choice = await ctx.ui.select("选择思考模式（thinking）", values);
-		if (!choice || choice === "取消") return;
-		const newValue = choice.split(/\s+/)[0];
-		getMiniMax().thinkingOverride = newValue as ThinkingType | "auto";
-		await saveStore();
-		ctx.ui.notify(`思考模式（thinking） = ${thinkingDesc(newValue)}\n\n` + formatConfig(currentModel), "info");
-		return;
-	}
-
-	if (action.startsWith("服务层级（service_tier）")) {
-		const values = [`priority  （高优先级，1.5×价格）`, `standard  （标准排队）`, "取消"];
-		const choice = await ctx.ui.select("选择服务层级（service_tier）", values);
-		if (!choice || choice === "取消") return;
-		const newValue = choice.split(/\s+/)[0];
-		getMiniMax().serviceTier = newValue as ServiceTier;
-		await saveStore();
-		ctx.ui.notify(`服务层级（service_tier） = ${tierDesc(newValue)}\n\n` + formatConfig(currentModel), "info");
-		return;
-	}
-
-	if (action.startsWith("思考拆分（reasoning_split）")) {
-		const values = [`true   （拆分到 reasoning_content 字段）`, `false  （保留在 content 字段中）`, "取消"];
-		const choice = await ctx.ui.select("选择思考拆分方式（reasoning_split）", values);
-		if (!choice || choice === "取消") return;
-		const newValue = choice.split(/\s+/)[0];
-		getMiniMax().reasoningSplit = newValue === "true";
-		await saveStore();
-		ctx.ui.notify(`思考拆分（reasoning_split） = ${getMiniMax().reasoningSplit ? "拆分到 reasoning_content" : "保留在 content 中"}\n\n` + formatConfig(currentModel), "info");
-		return;
-	}
-
-	if (action.startsWith("温度（temperature）")) {
-		const values = [`0.0  （完全确定）`, `0.5  （较确定）`, `0.7  （MiniMax 官方推荐低值）`, `1.0  （默认，平衡）`, `1.3  （MiniMax 官方推荐高值）`, `1.5  （较随机）`, `2.0  （完全随机）`, "取消"];
-		const choice = await ctx.ui.select("选择温度（temperature）", values);
-		if (!choice || choice === "取消") return;
-		const newValue = parseFloat(choice.split(/\s+/)[0]);
-		if (!isNaN(newValue) && newValue >= 0 && newValue <= 2) {
-			getMiniMax().temperature = newValue;
-			await saveStore();
-			ctx.ui.notify(`温度（temperature） = ${getMiniMax().temperature}\n\n` + formatConfig(currentModel), "info");
-		}
-		return;
-	}
-
-	if (action.startsWith("核采样（top_p）")) {
-		const m2 = currentModel ? isM2Series(currentModel.id) : false;
-		const recommended = m2 ? 0.9 : 0.95;
-		const values = [`0.5  （聚焦）`, `0.7  （较聚焦）`, `${recommended}  （当前模型官方推荐）`, `1.0  （全概率采样）`, "取消"];
-		const choice = await ctx.ui.select("选择核采样（top_p）", values);
-		if (!choice || choice === "取消") return;
-		const newValue = parseFloat(choice.split(/\s+/)[0]);
-		if (!isNaN(newValue) && newValue >= 0 && newValue <= 1) {
-			getMiniMax().topP = newValue;
-			await saveStore();
-			ctx.ui.notify(`核采样（top_p） = ${getMiniMax().topP}\n\n` + formatConfig(currentModel), "info");
-		}
-		return;
-	}
-
-	if (action.startsWith("最大输出（max_tokens）")) {
-		const m2 = currentModel ? isM2Series(currentModel.id) : false;
-		const modelDefault = m2 ? 65536 : 131072;
-		const modelLimit = getMaxTokensLimit(currentModel?.id ?? "MiniMax-M3");
-		const values = [`自动   （使用模型默认 ${modelDefault}）`, `${modelDefault}    （MiniMax 官方推荐）`, `${modelLimit}    （模型上限）`, "取消"];
-		const choice = await ctx.ui.select("选择最大输出（max_tokens）", values);
-		if (!choice || choice === "取消") return;
-		if (choice.startsWith("自动")) {
-			getMiniMax().maxCompletionTokens = null;
-		} else {
-			const n = parseInt(choice.split(/\s+/)[0], 10);
-			if (!isNaN(n) && n >= 1) {
-				getMiniMax().maxCompletionTokens = Math.min(n, modelLimit);
-			}
-		}
-		await saveStore();
-		const display = getMiniMax().maxCompletionTokens === null ? `自动（上限 ${modelLimit}）` : `${getMiniMax().maxCompletionTokens}（上限 ${modelLimit}）`;
-		ctx.ui.notify(`最大输出（max_tokens） = ${display}\n\n` + formatConfig(currentModel), "info");
-		return;
 	}
 }
 
@@ -1372,10 +677,12 @@ function listProvidersText(): string {
 	for (const p of store.providers) {
 		if (p.kind === "builtin") {
 			const cfg = p.minimax;
-			lines.push(`● ${p.name}（内置 MiniMax）`);
-			lines.push(`   地址：https://api.minimaxi.com/v1`);
-			lines.push(`   模型：MiniMax-M3, MiniMax-M2.7-highspeed（2 个）`);
+			const enabledCount = p.models.filter(isModelEnabled).length;
+			lines.push(`● ${p.name}（内置 MiniMax，固定供应商）`);
+			lines.push(`   地址：${MINIMAX_BASE_URL}`);
+			lines.push(`   模型：启用 ${enabledCount} / 共 ${p.models.length} 个（未勾选的不显示在 /model 中）`);
 			lines.push(`   服务层级：${cfg.serviceTier}  思考拆分：${cfg.reasoningSplit}`);
+			lines.push(`   参数配置：/model-provider → 管理模型 → ${p.name} → 配置管理`);
 		} else {
 			const apiOption = getCommonApiOption(p.api);
 			const enabledCount = p.models.filter(isModelEnabled).length;
@@ -1399,7 +706,7 @@ async function addCommonFlow(ctx: any): Promise<void> {
 		ctx.ui.notify("供应商名称只能包含字母、数字、下划线、连字符。", "error");
 		return;
 	}
-	if (cleanName === "minimax_local" || getCommonEntries().some((p) => p.name === cleanName)) {
+	if (cleanName === MINIMAX_PROVIDER_ID || getCommonEntries().some((p) => p.name === cleanName)) {
 		ctx.ui.notify(`供应商 "${cleanName}" 已存在或是内置供应商。`, "error");
 		return;
 	}
@@ -1442,27 +749,36 @@ async function addCommonFlow(ctx: any): Promise<void> {
 	);
 }
 
-async function selectCommon(ctx: any, title: string): Promise<CommonEntry | undefined> {
-	const commons = getCommonEntries();
-	if (commons.length === 0) {
-		ctx.ui.notify("暂无 common 供应商，请先“添加供应商”。", "warning");
+/**
+ * 选择供应商。includeBuiltin = true 时，内置 MiniMax 固定显示在最前（仅“管理模型”入口使用）。
+ */
+async function selectProvider(ctx: any, title: string, includeBuiltin = false): Promise<ProviderEntry | undefined> {
+	const entries: ProviderEntry[] = [
+		...(includeBuiltin ? store.providers.filter((p): p is BuiltinEntry => p.kind === "builtin") : []),
+		...getCommonEntries(),
+	];
+	if (entries.length === 0) {
+		ctx.ui.notify("暂无供应商，请先“添加供应商”。", "warning");
 		return undefined;
 	}
-	const options = commons.map((p) => {
-		const apiOption = getCommonApiOption(p.api);
+	const options = entries.map((p) => {
 		const enabledCount = p.models.filter(isModelEnabled).length;
+		if (p.kind === "builtin") {
+			return `${p.name}  [内置 MiniMax]  ${MINIMAX_BASE_URL}  （启用 ${enabledCount}/${p.models.length} 个模型）`;
+		}
+		const apiOption = getCommonApiOption(p.api);
 		return `${p.name}  [${apiOption.label}]  ${p.baseUrl}  （启用 ${enabledCount}/${p.models.length} 个模型）`;
 	});
 	options.push("取消");
 	const choice = await ctx.ui.select(title, options);
 	if (!choice || choice === "取消") return undefined;
 	const picked = choice.split(/\s+\[/)[0];
-	return commons.find((p) => p.name === picked);
+	return entries.find((p) => p.name === picked);
 }
 
 async function editCommonFlow(ctx: any): Promise<void> {
-	const entry = await selectCommon(ctx, "选择要编辑的供应商");
-	if (!entry) return;
+	const entry = await selectProvider(ctx, "选择要编辑的供应商");
+	if (!entry || entry.kind !== "common") return;
 	const oldName = entry.name;
 
 	const newName = (await ctx.ui.input(`供应商名称（当前：${entry.name}）`, entry.name))?.trim() || entry.name;
@@ -1491,7 +807,7 @@ async function editCommonFlow(ctx: any): Promise<void> {
 		return;
 	}
 	const existingSameName = getCommonEntries().some((p) => p.name === newName && p !== entry);
-	if (existingSameName || newName === "minimax_local") {
+	if (existingSameName || newName === MINIMAX_PROVIDER_ID) {
 		ctx.ui.notify(`供应商 "${newName}" 已存在或是内置供应商。`, "error");
 		return;
 	}
@@ -1506,8 +822,8 @@ async function editCommonFlow(ctx: any): Promise<void> {
 }
 
 async function removeCommonFlow(ctx: any): Promise<void> {
-	const entry = await selectCommon(ctx, "选择要移除的供应商");
-	if (!entry) return;
+	const entry = await selectProvider(ctx, "选择要移除的供应商");
+	if (!entry || entry.kind !== "common") return;
 	const ok = await ctx.ui.confirm("确认移除", `确定移除供应商 ${entry.name}？其模型将一并删除。`);
 	if (!ok) return;
 	store.providers = store.providers.filter((p) => p !== entry);
@@ -1516,7 +832,7 @@ async function removeCommonFlow(ctx: any): Promise<void> {
 	ctx.ui.notify(`已移除供应商 ${entry.name}。`, "info");
 }
 
-async function refreshCommonModels(ctx: any, entry: CommonEntry): Promise<void> {
+async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void> {
 	ctx.ui.setStatus("model-provider", `正在刷新 ${entry.name} 模型列表...`);
 	try {
 		let key: string | undefined;
@@ -1525,11 +841,14 @@ async function refreshCommonModels(ctx: any, entry: CommonEntry): Promise<void> 
 		} catch {
 			key = undefined;
 		}
-		const list = await fetchModelsByApi(entry.api, entry.baseUrl, key);
+		// 内置 MiniMax 的模型目录固定走官方 /v1（OpenAI 兼容 /models）。
+		const apiType = entry.kind === "builtin" ? "openai-completions" : entry.api;
+		const baseUrl = entry.kind === "builtin" ? MINIMAX_BASE_URL : entry.baseUrl;
+		const list = await fetchModelsByApi(apiType, baseUrl, key);
 		const knownIds = new Set(entry.models.map((m) => m.id));
 		const added = list.filter((m) => !knownIds.has(m.id)).length;
 		entry.models = mergeModels(entry.models, list);
-		if (api) unregisterAndReRegister(api, entry.name, entry);
+		reRegisterEntry(entry);
 		await saveStore();
 		const enabledCount = entry.models.filter(isModelEnabled).length;
 		let message = `已刷新 ${entry.name}：启用 ${enabledCount} / 共 ${entry.models.length} 个模型。`;
@@ -1544,7 +863,7 @@ async function refreshCommonModels(ctx: any, entry: CommonEntry): Promise<void> 
 	}
 }
 
-async function addModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
+async function addModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 	const ids = (await ctx.ui.input("新增模型（多个用逗号分隔）", "例如：gpt-4o, claude-sonnet-4-20250514"))?.trim();
 	if (!ids) return;
 	const list = ids.split(/[,，\s]+/).map((s: string) => s.trim()).filter(Boolean);
@@ -1574,7 +893,7 @@ async function addModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 		}
 	}
 	entry.models = sortModels(entry.models);
-	if (api) unregisterAndReRegister(api, entry.name, entry);
+	reRegisterEntry(entry);
 	await saveStore();
 	ctx.ui.notify(`已处理 ${list.length} 个模型，新增 ${added} 个（默认未启用）；请到“启用模型”中勾选后使用。`, "info");
 }
@@ -1595,7 +914,7 @@ function formatContextWindow(value: number | undefined): string {
 	return value.toLocaleString();
 }
 
-async function editModelContextFlow(ctx: any, entry: CommonEntry): Promise<void> {
+async function editModelContextFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 	if (entry.models.length === 0) {
 		ctx.ui.notify("暂无模型，请先刷新或手动添加。", "info");
 		return;
@@ -1620,7 +939,7 @@ async function editModelContextFlow(ctx: any, entry: CommonEntry): Promise<void>
 		return;
 	}
 	model.contextWindow = contextWindow;
-	if (api) unregisterAndReRegister(api, entry.name, entry);
+	reRegisterEntry(entry);
 	await saveStore();
 	ctx.ui.notify(`已更新 ${id}：上下文 ${formatContextWindow(contextWindow)}（${contextWindow.toLocaleString()}）`, "info");
 }
@@ -1629,7 +948,7 @@ async function editModelContextFlow(ctx: any, entry: CommonEntry): Promise<void>
  * 批量设置图片读取能力：勾选 = 支持图片输入（文本 + 图片），未勾选 = 仅文本。
  * ctrl+s 保存后留在界面，esc 退出。
  */
-async function editModelInputFlow(ctx: any, entry: CommonEntry): Promise<void> {
+async function editModelInputFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 	if (entry.models.length === 0) {
 		ctx.ui.notify("暂无模型，请先刷新或手动添加。", "info");
 		return;
@@ -1639,11 +958,11 @@ async function editModelInputFlow(ctx: any, entry: CommonEntry): Promise<void> {
 		for (const model of entry.models) {
 			model.input = ids.has(model.id) ? ["text", "image"] : ["text"];
 		}
-		if (api) unregisterAndReRegister(api, entry.name, entry);
+		reRegisterEntry(entry);
 		await saveStore();
 	};
 	if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
-		await ctx.ui.custom<string[] | null>(
+		await ctx.ui.custom(
 			(tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
 				new ModelToggleSelectorComponent(
 					tui,
@@ -1935,7 +1254,7 @@ class ModelToggleSelectorComponent extends Container {
  */
 async function toggleViaSelectFallback(
 	ctx: any,
-	entry: CommonEntry,
+	entry: ProviderEntry,
 	opts: { title: string; countLabel: string; isMarked: (model: StoredModel) => boolean; apply: (ids: Set<string>) => void | Promise<void> },
 ): Promise<void> {
 	const marked = new Set(entry.models.filter((m) => opts.isMarked(m)).map((m) => m.id));
@@ -1972,7 +1291,7 @@ async function toggleViaSelectFallback(
  * 多选勾选入口：TUI 模式使用与内置 /scoped-models 一致的交互组件，
  * 其它模式降级为 select 循环。ctrl+s 保存后留在界面，esc 退出。
  */
-async function toggleModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
+async function toggleModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 	if (entry.models.length === 0) {
 		ctx.ui.notify("暂无模型，请先刷新或手动添加。", "info");
 		return;
@@ -1980,11 +1299,11 @@ async function toggleModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 	entry.models = sortModels(entry.models);
 	const apply = async (ids: Set<string>) => {
 		entry.models = sortModels(entry.models.map((m) => ({ ...m, enabled: ids.has(m.id) })));
-		if (api) unregisterAndReRegister(api, entry.name, entry);
+		reRegisterEntry(entry);
 		await saveStore();
 	};
 	if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
-		await ctx.ui.custom<string[] | null>(
+		await ctx.ui.custom(
 			(tui: any, theme: any, keybindings: any, done: (value: string[] | null) => void) =>
 				new ModelToggleSelectorComponent(
 					tui,
@@ -2014,25 +1333,30 @@ async function toggleModelsFlow(ctx: any, entry: CommonEntry): Promise<void> {
 /** 模型管理：选供应商后进入操作循环；“返回供应商列表”回到选择，便于连续管理多个供应商 */
 async function modelsMenu(ctx: any): Promise<void> {
 	while (true) {
-		const entry = await selectCommon(ctx, "管理模型：选择供应商");
+		// 内置 MiniMax 作为固定供应商始终出现在列表首位，可统一管理模型与参数。
+		const entry = await selectProvider(ctx, "管理模型：选择供应商", true);
 		if (!entry) return;
 		await modelOpsMenu(ctx, entry);
 	}
 }
 
-async function modelOpsMenu(ctx: any, entry: CommonEntry): Promise<void> {
+async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 	while (true) {
 		const enabledCount = entry.models.filter(isModelEnabled).length;
-		const action = await ctx.ui.select(`模型管理：${entry.name}（启用 ${enabledCount} / 共 ${entry.models.length} 个）`, [
+		const items = [
+			// 内置 MiniMax 独有：参数配置菜单（思考模式/服务层级/温度等）。
+			...(entry.kind === "builtin" ? ["配置管理"] : []),
 			"启用模型",
 			"刷新模型",
 			"新增模型",
 			"修改上下文窗口",
 			"是否支持图片读取",
 			"返回供应商列表",
-		]);
+		];
+		const action = await ctx.ui.select(`模型管理：${entry.name}（启用 ${enabledCount} / 共 ${entry.models.length} 个）`, items);
 		if (!action || action === "返回供应商列表") return;
-		if (action === "启用模型") await toggleModelsFlow(ctx, entry);
+		if (action === "配置管理") await minimaxMenu(ctx);
+		else if (action === "启用模型") await toggleModelsFlow(ctx, entry);
 		else if (action === "刷新模型") await refreshCommonModels(ctx, entry);
 		else if (action === "新增模型") await addModelsFlow(ctx, entry);
 		else if (action === "修改上下文窗口") await editModelContextFlow(ctx, entry);
@@ -2048,7 +1372,6 @@ async function modelProviderCommand(_args: string, ctx: any): Promise<void> {
 			"添加供应商",
 			"编辑供应商",
 			"删除供应商",
-			"MiniMax 配置",
 			"查看全部供应商",
 			"返回",
 		]);
@@ -2057,7 +1380,6 @@ async function modelProviderCommand(_args: string, ctx: any): Promise<void> {
 		else if (action === "添加供应商") await addCommonFlow(ctx);
 		else if (action === "编辑供应商") await editCommonFlow(ctx);
 		else if (action === "删除供应商") await removeCommonFlow(ctx);
-		else if (action === "MiniMax 配置") await minimaxMenu(ctx);
 		else if (action === "查看全部供应商") ctx.ui.notify(listProvidersText(), "info");
 	}
 }
@@ -2072,14 +1394,7 @@ export default async function (pi: ExtensionAPI) {
 	registerAllProviders(pi);
 
 	pi.registerCommand("model-provider", {
-		description: "统一管理模型供应商：内置 MiniMax 配置 + 添加/编辑/移除 common 供应商、模型管理",
+		description: "统一管理模型供应商：内置 MiniMax 与通用供应商、模型管理，MiniMax 参数经“配置管理”进入",
 		handler: modelProviderCommand,
-	});
-	// 兼容别名（旧命令），指向同一处理逻辑
-	pi.registerCommand("minimax", {
-		description: "进入 MiniMax 内置配置菜单（等价 /model-provider 内的 MiniMax 配置）",
-		handler: async (_args, ctx) => {
-			await minimaxMenu(ctx);
-		},
 	});
 }

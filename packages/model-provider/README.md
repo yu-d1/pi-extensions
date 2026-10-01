@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **MiniMax Local**：直接调用 MiniMax API，支持 `service_tier`、`thinking`、`reasoning_split`、`temperature`、`top_p` 和 `max_completion_tokens`。
+- **MiniMax Local**：直接调用 MiniMax API，支持 `service_tier`、`thinking`、`reasoning_split`、`temperature`、`top_p` 和 `max_completion_tokens`；作为内置固定供应商出现在“管理模型”列表中，参数配置在 `配置管理` 菜单内。
 - **通用供应商**：按供应商名称、API 格式和 API 前缀统一管理多个服务。
 - **三种官方 API 格式**：`openai-completions`、`openai-responses`、`anthropic-messages`。
 - **统一认证**：普通供应商通过 `/login <供应商名称>` 登录，密钥保存在 pi 的 `auth.json`，不写入扩展配置。
@@ -46,7 +46,7 @@ pi install npm:@liziy/model-provider
    minimax_local/MiniMax-M2.7-highspeed
    ```
 
-3. 使用 `/model-provider` → `MiniMax 配置` 调整服务层级、思考模式、思考拆分、温度、核采样和最大输出长度。
+3. 使用 `/model-provider` → `管理模型` → `minimax_local` → `配置管理` 调整服务层级、思考模式、温度等参数；MiniMax 为内置固定供应商，也可在 `管理模型` 中统一管理模型。
 
 ### 通用供应商
 
@@ -149,7 +149,7 @@ max       需要模型声明支持的扩展档位
 
 1. 优先使用服务端 `/models` 返回的上下文字段，例如 `contextWindow`、`context_window`、`context_length` 或 `max_context_length`。
 2. 服务端没有返回有效上下文时，默认使用 `1M（1,000,000）`。
-3. 可以进入 `/model-provider` → `Common 供应商` → `管理模型` → `修改上下文窗口` 手动覆盖。
+3. 可以进入 `/model-provider` → `管理模型` → 选择供应商 → `修改上下文窗口` 手动覆盖。
 4. 手动新增模型默认使用 `1M` 上下文。
 
 手动设置支持以下格式：
@@ -165,8 +165,7 @@ max       需要模型声明支持的扩展档位
 
 | 命令 | 说明 |
 |---|---|
-| `/model-provider` | 管理供应商、模型和 MiniMax 配置 |
-| `/minimax` | 进入 MiniMax 配置菜单的兼容别名 |
+| `/model-provider` | 管理内置 MiniMax 与通用供应商、模型管理；MiniMax 参数经 `管理模型` → `配置管理` 进入 |
 | `/login <名称>` | 使用 pi 内置认证流程登录供应商 |
 
 ## 说明
@@ -181,6 +180,12 @@ max       需要模型声明支持的扩展档位
 - 通用供应商的系统提示词统一以 `system` 角色发送。pi 默认会在推理模型上改用 `developer` 角色，而多数第三方网关只接受 `system` / `user` / `assistant` / `tool`，会把请求拒为 `400 unknown variant developer`。
 
 ## 版本历史
+
+### 0.2.5
+
+- MiniMax 改为内置固定供应商：移除 `/minimax` 命令与主菜单入口，经 `管理模型` → `配置管理` 进入参数菜单
+- 内置 MiniMax 支持统一的模型管理（启用/刷新/上下文/图片）
+- MiniMax 专属代码拆分到 `minimax.ts`
 
 ### 0.2.4
 
