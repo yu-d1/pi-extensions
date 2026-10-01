@@ -104,6 +104,7 @@ API Key 读取顺序：环境变量 > `~/.pi/agent/auth.json` 中当前 provider
 
 ## 版本历史
 
+- **v1.7.1** — mimo 浏览器检测补齐 Edge / Chromium / Brave（Windows 预装 Edge 可用），记忆上次选择，支持 `MIMO_CHROME` 手动指定
 - **v1.7.0** — 新增 mimo（小米）账户余额套餐（Chrome/CDP 静默续期，零依赖）；套餐选择支持搜索且选中即关闭弹窗；配额查询按套餐拆分到 `plans/` 模块
 - **v1.6.0** — 移除联网搜索；`/stats` 菜单去掉图标
 - **v1.5.x** — 新增年度按月统计；精简配额样式（默认 `with-clock-7d`）；主菜单三级入口；修复杂额显示与菜单导航问题

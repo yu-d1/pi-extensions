@@ -21,6 +21,8 @@ const MIMO_BASE = "https://platform.xiaomimimo.com";
 const TOKEN_CONFIG_DIR = join(homedir(), ".pi/agent/extensions/token-stats");
 const LOGS_DIR = join(homedir(), ".pi/agent/extensions/token-stats-logs");
 const MIMO_COOKIE_FILE = join(TOKEN_CONFIG_DIR, "mimo-cookie.txt");
+/** 上次成功使用的浏览器（检测结果记忆，避免每次刷新都遍历文件系统） */
+const MIMO_BROWSER_FILE = join(TOKEN_CONFIG_DIR, "mimo-browser.json");
 const MIMO_PROFILE_DIR = join(TOKEN_CONFIG_DIR, "mimo-browser-data");
 const MIMO_COOKIE_NAMES = [
   "serviceToken",
@@ -100,27 +102,56 @@ function writeMimoCookie(cookie: string): void {
 
 // ── Chrome / CDP ────────────────────────────────────────────────────────
 
-/** 找系统已装的 Chrome（避免额外下载浏览器） */
+/**
+ * 找可用的 Chromium 内核浏览器（Chrome / Edge / Chromium，避免额外下载浏览器）。
+ * 优先级：手动指定（MIMO_CHROME） > 上次成功用的（缓存） > 按平台依次探测。
+ * Chromium 系命令行参数（--remote-debugging-port / DevToolsActivePort）三者完全一致。
+ */
 function findChrome(): string | null {
+  // 1. 手动指定：环境变量优先，适合 Chromium 装在非标准路径
+  const manual = process.env.MIMO_CHROME?.trim();
+  if (manual && existsSync(manual)) return manual;
+
+  // 2. 记忆上次成功的选择（缓存失效即回落探测）
+  try {
+    if (existsSync(MIMO_BROWSER_FILE)) {
+      const cached = JSON.parse(readFileSync(MIMO_BROWSER_FILE, "utf-8"))?.path;
+      if (typeof cached === "string" && cached && existsSync(cached)) return cached;
+    }
+  } catch {}
+
+  // 3. 按平台探测：Chrome → Edge → Chromium（Edge 在 Windows 上是预装的）
   const candidates = process.platform === "darwin"
     ? [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
         join(homedir(), "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
       ]
     : process.platform === "win32"
       ? [
           "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
           "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+          "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+          "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+          `${process.env.LOCALAPPDATA ?? ""}\\Microsoft\\Edge\\Application\\msedge.exe`,
         ]
       : [
           "/usr/bin/google-chrome",
           "/usr/bin/google-chrome-stable",
+          "/usr/bin/microsoft-edge",
+          "/usr/bin/microsoft-edge-stable",
           "/usr/bin/chromium",
           "/usr/bin/chromium-browser",
         ];
-  return candidates.find((p) => existsSync(p)) ?? null;
+  const found = candidates.find((p) => p && existsSync(p)) ?? null;
+  if (found) {
+    try {
+      writeFileSync(MIMO_BROWSER_FILE, JSON.stringify({ path: found, detectedAt: Date.now() }), "utf-8");
+    } catch {}
+  }
+  return found;
 }
 
 /** CDP:Storage.getCookies —— 纯 Node WebSocket，零依赖 */
