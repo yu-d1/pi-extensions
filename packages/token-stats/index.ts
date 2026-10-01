@@ -30,7 +30,6 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { createDeepseekBackend, type SearchBackend } from "./search";
 
 // ── 路径 ──────────────────────────────────────────────────
 
@@ -107,15 +106,6 @@ interface TokenPlan {
 interface TokenConfig {
   providerPlans: Record<string, string | null>;
   ttl: number;
-  /** 联网搜索配置（v1.4.0+；旧配置文件无此字段时用默认值：开启 + deepseek 映射） */
-  search?: SearchConfig;
-}
-
-interface SearchConfig {
-  /** 总开关，默认 true */
-  enabled: boolean;
-  /** 套餐 id → 搜索后端 id 映射（如 { "deepseek": "deepseek-server" }） */
-  backends: Record<string, string>;
 }
 
 interface QuotaCache {
@@ -716,7 +706,6 @@ const QUOTA_CACHE_FILE = join(LOGS_DIR, "quota-cache.json");
 const DEFAULT_TOKEN_CONFIG: TokenConfig = {
   providerPlans: {},
   ttl: 60,
-  search: { enabled: true, backends: { deepseek: "deepseek-server" } },
 };
 
 const DISPLAY_CONFIG_FILE = join(TOKEN_CONFIG_DIR, "display-config.json");
@@ -1210,15 +1199,10 @@ async function loadTokenConfig(): Promise<TokenConfig> {
       return {
         ...DEFAULT_TOKEN_CONFIG,
         ...parsed,
-        // search 深合并：旧配置无 search 字段时自动获得默认（开启 + deepseek 映射）
-        search: { ...DEFAULT_TOKEN_CONFIG.search!, ...(parsed.search ?? {}) },
       };
     }
   } catch {}
-  return {
-    ...DEFAULT_TOKEN_CONFIG,
-    search: { ...DEFAULT_TOKEN_CONFIG.search! },
-  };
+  return { ...DEFAULT_TOKEN_CONFIG };
 }
 
 async function saveTokenConfig(cfg: TokenConfig) {
@@ -1374,47 +1358,6 @@ function resolveApiKey(plan: TokenPlan, provider?: string): string | null {
     if (entry?.key) return entry.key;
   }
   return null;
-}
-
-// ── 联网搜索（内嵌 deepseek-server，见 search.ts）────────
-
-/** 当前应激活的搜索后端 id（由 syncSearchTool 计算，供 execute 守卫读取） */
-let activeSearchBackendId: string | null = null;
-
-const SEARCH_BACKENDS: SearchBackend[] = [
-  createDeepseekBackend({
-    resolveApiKey: () =>
-      resolveApiKey(BUILTIN_PLANS.find((p) => p.id === "deepseek")!),
-    isActive: () => activeSearchBackendId === "deepseek-server",
-  }),
-];
-
-/**
- * 根据配置 + 当前 provider 的套餐，同步 web_search 工具注册状态。
- * 规则（套餐驱动）：search.enabled=false 或 backends[plan.id] 未命中 → 不启用；
- * 未命中时若已注册完整实现则覆盖为禁用空壳（pi 无注销 API，同名注册即覆盖）。
- */
-function syncSearchTool(pi: ExtensionAPI, provider: string | null | undefined) {
-  const searchCfg = tokenConfig?.search ?? DEFAULT_TOKEN_CONFIG.search!;
-  let targetId: string | null = null;
-  if (searchCfg.enabled) {
-    const plan = resolveActivePlan(provider ?? undefined);
-    if (plan) {
-      const backendId = searchCfg.backends[plan.id];
-      if (backendId && SEARCH_BACKENDS.some((b) => b.id === backendId)) {
-        targetId = backendId;
-      }
-    }
-  }
-  for (const backend of SEARCH_BACKENDS) {
-    if (backend.id === targetId) {
-      backend.enable(pi);
-      activeSearchBackendId = backend.id;
-    } else {
-      backend.disable(pi);
-      if (activeSearchBackendId === backend.id) activeSearchBackendId = null;
-    }
-  }
 }
 
 /**
@@ -1940,8 +1883,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       lastQuotaProvider = ctx.model?.provider ?? null;
       quotaState = null; // 跨 provider 立即清旧 state
       await refreshQuota(ctx, true); // force 绕过缓存
-      // 搜索后端跟随套餐：provider 切换时同步注册状态
-      syncSearchTool(pi, ctx.model?.provider);
       requestFooterRender?.();
     }
 
@@ -2111,7 +2052,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     requestFooterRender = null;
     lastQuotaProvider = null;
     quotaState = null;
-    activeSearchBackendId = null;
   });
 
   // ── session_start: 恢复累计状态 + 注册 footer ───────
@@ -2123,8 +2063,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     // 套餐用量：加载配置 + 定时刷新
     tokenConfig = await loadTokenConfig();
     displayConfig = await loadDisplayConfig();
-    // 联网搜索：按配置 + 当前套餐注册 web_search（默认开启）
-    syncSearchTool(pi, ctx.model?.provider);
     lastQuotaProvider = null; // 强制让 refreshQuota 检测一次
     quotaState = null;
     // P7 修复：清空所有 plan 的缓存（避免跨 session 复用旧数据）
@@ -2214,35 +2152,35 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         // 无参 → 主菜单：统计查询不再需要记参数，套餐/配置入口也在这里
         if (!arg) {
           const main = await ctx.ui.select("Token 统计", [
-            "⚙️  状态栏配置",
-            "📦 套餐配额配置",
-            "📊 统计查询",
+            "状态栏配置",
+            "套餐配额配置",
+            "统计查询",
           ]);
           if (!main) return;
-          if (main.startsWith("📊")) {
-            const report = await ctx.ui.select("📊 统计查询", [
-              "📊 今日统计",
-              "📊 按小时分布（今日）",
-              "📊 本周汇总",
-              "📊 月度汇总",
-              "📊 年度汇总（按月）",
+          if (main === "统计查询") {
+            const report = await ctx.ui.select("统计查询", [
+              "今日统计",
+              "按小时分布（今日）",
+              "本周汇总",
+              "月度汇总",
+              "年度汇总（按月）",
             ]);
             if (!report) continue mainMenu;
-            if (report.startsWith("📊 今日")) {
+            if (report === "今日统计") {
               await showDay(getDateStr(), ctx, pi);
-            } else if (report.startsWith("📊 按小时")) {
+            } else if (report === "按小时分布（今日）") {
               await showHourly(getDateStr(), ctx, pi);
-            } else if (report.startsWith("📊 本周")) {
+            } else if (report === "本周汇总") {
               await showWeek(ctx, pi);
-            } else if (report.startsWith("📊 月度")) {
+            } else if (report === "月度汇总") {
               await showMonth(getMonthStr(), ctx, pi);
-            } else if (report.startsWith("📊 年度")) {
+            } else if (report === "年度汇总（按月）") {
               await showYear(String(new Date().getFullYear()), ctx, pi);
             }
             continue mainMenu;
           }
-          if (main.startsWith("📦")) arg = "plan";
-          else if (main.startsWith("⚙️")) arg = "config";
+          if (main === "套餐配额配置") arg = "plan";
+          else if (main === "状态栏配置") arg = "config";
           else return;
         }
 
@@ -2272,7 +2210,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         const defaults: TokenConfig = {
           providerPlans: {},
           ttl: 60,
-          search: { ...DEFAULT_TOKEN_CONFIG.search! },
         };
 
         if (choice === "关闭") {
@@ -2280,8 +2217,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             ? { ...tokenConfig, providerPlans: { ...tokenConfig.providerPlans, [provider]: null } }
             : { ...defaults, providerPlans: { [provider]: null } };
           await saveTokenConfig(tokenConfig);
-          // 搜索跟随套餐：关闭套餐时同步注销搜索工具
-          syncSearchTool(pi, provider);
           lastQuotaProvider = provider;
           quotaState = null;
           if (quotaTimerId) clearInterval(quotaTimerId);
@@ -2309,8 +2244,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           lastQuotaProvider = provider;
           // 立即查询
           await forceRefreshQuota(ctx);
-          // 搜索跟随套餐：选择 deepseek 等带搜索后端的套餐时同步注册
-          syncSearchTool(pi, provider);
           if (quotaTimerId) clearInterval(quotaTimerId);
           quotaTimerId = setInterval(async () => {
             if (!sessionActive) return;
@@ -2341,29 +2274,28 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           "显示样式",
           "显示内容",
           "查询间隔  (当前 " + (tokenConfig?.ttl || 60) + "s)",
-          "🔍 联网搜索",
         ]);
         if (!subChoice) break configMenu;
 
         if (subChoice === "显示样式") {
           styleCategoryMenu: while (true) {
           const catChoice = await ctx.ui.select("选择要配置的样式类别", [
-            "🧠 上下文样式",
-            "⚡ 速率样式",
-            "📦 配额样式",
+            "上下文样式",
+            "速率样式",
+            "配额样式",
           ]);
           if (!catChoice) break styleCategoryMenu;
 
-          if (catChoice === "🧠 上下文样式") {
+          if (catChoice === "上下文样式") {
             const items: { label: string; value: ContextStyle; preview: string }[] = [
-              { label: "pct-window", value: "pct-window", preview: `🧠 5.3%/1.0M` },
-              { label: "used-window", value: "used-window", preview: `🧠 256k/1.0M` },
-              { label: "pct", value: "pct", preview: `🧠 5.3%` },
-              { label: "used", value: "used", preview: `🧠 256k` },
-              { label: "bar", value: "bar", preview: `🧠 [██░░░░░░] 25%` },
+              { label: "pct-window", value: "pct-window", preview: `5.3%/1.0M` },
+              { label: "used-window", value: "used-window", preview: `256k/1.0M` },
+              { label: "pct", value: "pct", preview: `5.3%` },
+              { label: "used", value: "used", preview: `256k` },
+              { label: "bar", value: "bar", preview: `[██░░░░░░] 25%` },
             ];
             const choice = await ctx.ui.select(
-              "🧠 上下文样式（当前: " + displayConfig.contextStyle + "）",
+              "上下文样式（当前: " + displayConfig.contextStyle + "）",
               items.map(i =>
                 (displayConfig.contextStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview
               ),
@@ -2378,15 +2310,15 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 requestFooterRender?.();
               }
             }
-          } else if (catChoice === "⚡ 速率样式") {
+          } else if (catChoice === "速率样式") {
             const items: { label: string; value: SpeedStyle; preview: string }[] = [
-              { label: "t/s", value: "t/s", preview: `⚡77.7 t/s` },
-              { label: "tok/s", value: "tok/s", preview: `⚡77.7 tok/s` },
-              { label: "T/s", value: "T/s", preview: `⚡77.7 T/s` },
-              { label: "live@速率", value: "liveAt", preview: `⚡1.2k@77.7` },
+              { label: "t/s", value: "t/s", preview: `77.7 t/s` },
+              { label: "tok/s", value: "tok/s", preview: `77.7 tok/s` },
+              { label: "T/s", value: "T/s", preview: `77.7 T/s` },
+              { label: "live@速率", value: "liveAt", preview: `1.2k@77.7` },
             ];
             const choice = await ctx.ui.select(
-              "⚡ 速率样式（当前: " + displayConfig.speedStyle + "）",
+              "速率样式（当前: " + displayConfig.speedStyle + "）",
               items.map(i =>
                 (displayConfig.speedStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview
               ),
@@ -2401,14 +2333,14 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 requestFooterRender?.();
               }
             }
-          } else if (catChoice === "📦 配额样式") {
+          } else if (catChoice === "配额样式") {
             const items: { label: string; value: QuotaStyle; preview: string }[] = [
               { label: "compact", value: "compact", preview: `5h: 89% 7d: 72%` },
-              { label: "with-clock-7d", value: "with-clock-7d", preview: `5h: 89% ⏱ 4h 15m 7d: 72% ⏱ 2d` },
-              { label: "nearest-clock-7d", value: "nearest-clock-7d", preview: `5h: 89% 7d: 72% ⏱ 4h 15m` },
+              { label: "with-clock-7d", value: "with-clock-7d", preview: `5h: 89% 4h 15m 7d: 72% 2d` },
+              { label: "nearest-clock-7d", value: "nearest-clock-7d", preview: `5h: 89% 7d: 72% 4h 15m` },
             ];
             const choice = await ctx.ui.select(
-              "📦 配额样式（当前: " + displayConfig.quotaStyle + "）",
+              "配额样式（当前: " + displayConfig.quotaStyle + "）",
               items.map(i =>
                 (displayConfig.quotaStyle === i.value ? "● " : "○ ") + i.label + "  " + i.preview
               ),
@@ -2471,11 +2403,11 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             // 非 TUI：保留循环 select 切换
             while (true) {
               const options = itemLabels.map(k =>
-                `${displayConfig.items[k] ? "✅" : "⬜"} ${itemNames[k]}`,
+                `${displayConfig.items[k] ? "[✓]" : "[ ]"} ${itemNames[k]}`,
               );
-              options.push("🔙 完成");
+              options.push("完成");
               const choice = await ctx.ui.select("选择要切换显示的项目", options);
-              if (!choice || choice === "🔙 完成") break;
+              if (!choice || choice === "完成") break;
               const idx = options.indexOf(choice);
               if (idx >= 0 && idx < itemLabels.length) {
                 const key = itemLabels[idx];
@@ -2511,33 +2443,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
               }, sec * 1000);
               ctx.ui.notify("查询间隔已设为 " + sec + " 秒", "info");
             }
-          }
-        } else if (subChoice === "🔍 联网搜索") {
-          const searchCfg = (tokenConfig ?? DEFAULT_TOKEN_CONFIG).search!;
-          const plan = resolveActivePlan(ctx.model?.provider);
-          const backendId = searchCfg.enabled && plan
-            ? searchCfg.backends[plan.id]
-            : null;
-          const backendName = backendId
-            ? (SEARCH_BACKENDS.find((b) => b.id === backendId)?.name ?? backendId)
-            : "无（该套餐暂无搜索后端）";
-          const planName = plan ? `${plan.id} (${plan.name})` : "未配置套餐";
-          ctx.ui.notify(`当前套餐: ${planName} | 搜索后端: ${backendName}`, "info");
-          const toggleLabel = (searchCfg.enabled ? "✅" : "⬜") + " 启用联网搜索";
-          const choice = await ctx.ui.select("🔍 联网搜索", [
-            toggleLabel,
-            "🔙 返回",
-          ]);
-          if (choice === toggleLabel) {
-            const next = !searchCfg.enabled;
-            tokenConfig = {
-              ...(tokenConfig ?? DEFAULT_TOKEN_CONFIG),
-              search: { ...searchCfg, enabled: next },
-            };
-            await saveTokenConfig(tokenConfig);
-            syncSearchTool(pi, ctx.model?.provider);
-            requestFooterRender?.();
-            ctx.ui.notify(next ? "联网搜索已开启" : "联网搜索已关闭", "info");
           }
         }
         continue configMenu;
