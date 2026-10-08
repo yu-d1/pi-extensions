@@ -264,6 +264,77 @@ function buildManifestFromTools(allTools: ToolInfo[], tokenMap: Map<string, numb
   return grouped;
 }
 
+/**
+ * 列出一个 MCP 服务器注册后的全部工具名。
+ *
+ * 名字拼接复刻 pi-mcp-adapter（formatToolName / resourceNameToToolName），
+ * 属于外部约定：适配器改名时这里会静默对不上。用 verify 回调报告命中率，
+ * 由调用方决定是否告警——静默失效会表现为「禁用了但工具还在」。
+ *
+ * @returns names 推出的工具名；matched 其中能在实际工具列表里命中的个数
+ */
+function resolveMcpToolNames(
+  serverName: string,
+  cacheServer: McpCacheFile["servers"][string] | undefined,
+  prefixMode: ToolPrefix,
+  tokenMap?: Map<string, number>,
+): { names: string[]; totalTokens: number; matched: number } {
+  const names: string[] = [];
+  let totalTokens = 0;
+  // tools 数组（缓存中的名字无前缀）
+  for (const t of cacheServer?.tools ?? []) {
+    const fullName = formatMcpToolName(t.name, serverName, prefixMode);
+    names.push(fullName);
+    totalTokens += tokenMap?.get(fullName) ?? 0;
+  }
+  // resources 会被适配器注册成 read 工具，同样占上下文
+  for (const r of cacheServer?.resources ?? []) {
+    const fullName = formatMcpToolName(
+      `get_${resourceNameToToolName(r.name ?? "")}`,
+      serverName,
+      prefixMode,
+    );
+    names.push(fullName);
+    totalTokens += tokenMap?.get(fullName) ?? 0;
+  }
+  names.sort();
+  return { names, totalTokens, matched: tokenMap ? names.filter((n) => tokenMap.has(n)).length : 0 };
+}
+
+/** 已告警过前缀对不上的服务器，避免每次 /plugins 重复刷屏 */
+const prefixWarned = new Set<string>();
+
+/**
+ * 推出的工具名几乎全部对不上实际注册名 → 前缀复刻已失效。
+ * 不阻断功能（仍按推出的名字过滤），但要告诉用户禁用可能不生效。
+ */
+function warnOnPrefixMismatch(serverName: string, total: number, matched: number): void {
+  if (total === 0 || matched > 0 || prefixWarned.has(serverName)) return;
+  prefixWarned.add(serverName);
+  console.warn(
+    `[plugin-manager] MCP "${serverName}"：推出 ${total} 个工具名但一个都对不上实际注册名。` +
+    `可能是 pi-mcp-adapter 改了命名规则，禁用该服务器可能不生效。`,
+  );
+}
+
+/**
+ * 服务器集合 = mcp-cache 的键 ∪ mcp.json.mcpServers 的键。
+ *
+ * 只认 mcpServers 会漏掉通过 imports 引入的配置——那种情况下 mcpServers
+ * 为空而 cache 里全是已加载的服务器，导致 /plugins 里一个都不显示、
+ * 它们的工具却仍全额注入。cache 是适配器解析 imports 后的真实产物，以它
+ * 为主；并上 mcpServers 则能覆盖「声明了但尚未连接成功」的情况。
+ */
+function collectMcpServerNames(
+  mcpConfig: McpConfigFile,
+  mcpCache: McpCacheFile,
+): string[] {
+  return [...new Set([
+    ...Object.keys(mcpCache.servers ?? {}),
+    ...Object.keys(mcpConfig.mcpServers ?? {}),
+  ])].sort();
+}
+
 async function buildCurrentManifest(pi: ExtensionAPI): Promise<Manifest> {
   // 0. 构建工具名→token 估算的查找表
   const allTools = pi.getAllTools();
@@ -272,30 +343,20 @@ async function buildCurrentManifest(pi: ExtensionAPI): Promise<Manifest> {
   // 1. 扩展工具（通过 getAllTools + sourceInfo）
   const extensions = buildManifestFromTools(allTools, tokenMap);
 
-  // 2. MCP 服务器（从 mcp.json + mcp-cache 推断）
+  // 2. MCP 服务器（mcp-cache 为准，见 collectMcpServerNames）
   const mcpConfig = await readMcpConfig();
   const mcpCache = await readMcpCache();
   const prefixMode: ToolPrefix = mcpConfig.settings?.toolPrefix ?? "server";
   const mcpServers: Record<string, ManifestSource> = {};
-  for (const serverName of Object.keys(mcpConfig.mcpServers)) {
-    const cacheServer = mcpCache.servers?.[serverName];
-    const toolNames: string[] = [];
-    let totalTokens = 0;
-    // tools 数组（缓存中的名字无前缀，需用 formatMcpToolName 转换）
-    for (const t of cacheServer?.tools ?? []) {
-      const fullName = formatMcpToolName(t.name, serverName, prefixMode);
-      toolNames.push(fullName);
-      totalTokens += tokenMap.get(fullName) ?? 0;
-    }
-    // resources 会被注册为 read 工具，这里也计入
-    for (const r of cacheServer?.resources ?? []) {
-      const baseName = `get_${resourceNameToToolName(r.name ?? "")}`;
-      const fullName = formatMcpToolName(baseName, serverName, prefixMode);
-      toolNames.push(fullName);
-      totalTokens += tokenMap.get(fullName) ?? 0;
-    }
-    toolNames.sort();
-    mcpServers[serverName] = { tools: toolNames, totalTokens };
+  for (const serverName of collectMcpServerNames(mcpConfig, mcpCache)) {
+    const resolved = resolveMcpToolNames(
+      serverName,
+      mcpCache.servers?.[serverName],
+      prefixMode,
+      tokenMap,
+    );
+    warnOnPrefixMismatch(serverName, resolved.names.length, resolved.matched);
+    mcpServers[serverName] = { tools: resolved.names, totalTokens: resolved.totalTokens };
   }
 
   // 3. 技能（扫描 skills 目录）
@@ -374,8 +435,8 @@ function computeEnabledToolNames(
   allTools: ToolInfo[],
   optOut: Config["opt_out"],
 ): string[] {
-  // 把 mcp_servers 的禁用意图转换为注册后的 tool 名集合
-  // mcp 适配器会给工具名加前缀（默认 server_），需要复刻这个逻辑
+  // 把 mcp_servers 的禁用意图转换为注册后的 tool 名集合。
+  // 拼接规则与 manifest 共用 resolveMcpToolNames，避免两处实现漂移。
   let mcpCache: McpCacheFile = { version: 1, servers: {} };
   let mcpConfig: McpConfigFile = { mcpServers: {} };
   try {
@@ -388,22 +449,17 @@ function computeEnabledToolNames(
   } catch { /* ignore */ }
 
   const prefixMode: ToolPrefix = mcpConfig.settings?.toolPrefix ?? "server";
+  const tokenMap = buildTokenMap(allTools);
   const disabledMcpToolNames = new Set<string>();
   for (const serverName of Object.keys(optOut.mcp_servers)) {
-    const serverCache = mcpCache.servers?.[serverName];
-
-    // 1. tools 数组
-    for (const t of serverCache?.tools ?? []) {
-      disabledMcpToolNames.add(formatMcpToolName(t.name, serverName, prefixMode));
-    }
-
-    // 2. resources 数组 —— MCP 适配器会把每个 resource 注册成一个 read 工具
-    //    工具名规则：formatToolName("get_" + resourceNameToToolName(name), serverName, prefix)
-    //    例：resource "act_ge_bytearray database schema" → get_act_ge_bytearray_database_schema → postgres_gt_cloud_get_act_ge_bytearray_database_schema
-    for (const r of serverCache?.resources ?? []) {
-      const baseName = `get_${resourceNameToToolName(r.name ?? "")}`;
-      disabledMcpToolNames.add(formatMcpToolName(baseName, serverName, prefixMode));
-    }
+    const resolved = resolveMcpToolNames(
+      serverName,
+      mcpCache.servers?.[serverName],
+      prefixMode,
+      tokenMap,
+    );
+    warnOnPrefixMismatch(serverName, resolved.names.length, resolved.matched);
+    for (const n of resolved.names) disabledMcpToolNames.add(n);
   }
 
   const disabledExtSources = new Set(Object.keys(optOut.extensions));
@@ -522,23 +578,27 @@ async function refreshManifestAndFilter(
  *       <location>...</location>
  *     </skill>
  *   </available_skills>
+ *
+ * 按 <skill>…</skill> 逐块切分后只丢命中项，而不是用跨块正则：
+ * 描述里出现 </skill> 字面量时，贪婪/惰性匹配都会切错位置连带删掉别的技能。
  */
 function removeDisabledSkills(systemPrompt: string, disabledSkillNames: string[]): string {
   if (disabledSkillNames.length === 0) return systemPrompt;
-  let result = systemPrompt;
-  for (const name of disabledSkillNames) {
-    // 匹配 <skill>...</skill> 块，包含指定 <name> 的
-    const blockRe = new RegExp(
-      `<skill>[\\s\\S]*?<name>\\s*${escapeRegex(name)}\\s*</name>[\\s\\S]*?</skill>`,
-      "g",
-    );
-    result = result.replace(blockRe, "");
+  const disabled = new Set(disabledSkillNames);
+  const kept: string[] = [];
+  // 与 </skill> 之间的内容是技能正文；非配对文本原样保留。
+  const blockRe = /<skill>([\s\S]*?)<\/skill>/g;
+  let cursor = 0;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(systemPrompt)) !== null) {
+    kept.push(systemPrompt.slice(cursor, m.index));
+    const nameMatch = /<name>([\s\S]*?)<\/name>/.exec(m[1]);
+    const name = nameMatch?.[1]?.trim();
+    if (name && !disabled.has(name)) kept.push(m[0]);
+    cursor = m.index + m[0].length;
   }
-  return result;
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  kept.push(systemPrompt.slice(cursor));
+  return kept.join("");
 }
 
 /**
@@ -583,20 +643,24 @@ function resourceNameToToolName(name: string): string {
 /** 分类标识 */
 type ItemCat = "mcp" | "ext" | "skill";
 
-/** 切换某个来源的启用/禁用状态，返回操作结果 */
-function toggleItem(config: Config, cat: ItemCat, name: string): { enabled: boolean; label: string } {
-  const now = nowIso();
-  const bucket =
-    cat === "mcp" ? config.opt_out.mcp_servers
+/** 取某个分类的 opt_out 桶 */
+function optOutBucket(
+  config: Config,
+  cat: ItemCat,
+): Record<string, OptOutEntry> {
+  return cat === "mcp" ? config.opt_out.mcp_servers
     : cat === "ext" ? config.opt_out.extensions
     : config.opt_out.skills;
-  const prefix = cat === "mcp" ? "MCP" : cat === "ext" ? "扩展" : "技能";
-  if (bucket[name]) {
-    delete bucket[name];
-    return { enabled: true, label: `${prefix}: ${name}` };
-  }
-  bucket[name] = { disabled_at: now };
-  return { enabled: false, label: `${prefix}: ${name}` };
+}
+
+/** 取某分类下的来源快照（技能无工具信息，为 null） */
+function manifestSource(
+  manifest: Manifest,
+  cat: ItemCat,
+  name: string,
+): ManifestSource | null {
+  if (cat === "skill") return null;
+  return cat === "mcp" ? manifest.mcp_servers[name] : manifest.extensions[name];
 }
 
 /** 格式化 token 数：≥1000 显示 X.XK，否则显示裸数字 */
@@ -885,17 +949,12 @@ async function showPluginsMenu(ctx: ExtensionContext, pi: ExtensionAPI) {
     return;
   }
 
-  // TUI 模式：勾选组件批量编辑，ctrl+s 统一保存生效
-  if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
-    await runPluginToggleComponent(ctx, pi, config, manifest);
+  // 勾选组件只在 TUI 下可用；非 TUI（print/rpc）无法交互，直接说明。
+  if (ctx.mode !== "tui" || typeof ctx.ui?.custom !== "function") {
+    ctx.ui.notify("/plugins 需要在交互式（TUI）模式下使用", "warning");
     return;
   }
-  // 非 TUI：保留原有循环 select 交互
-  if (total <= 20) {
-    await showFlatMenu(ctx, pi, config, manifest);
-  } else {
-    await showCategoryMenu(ctx, pi, config, manifest);
-  }
+  await runPluginToggleComponent(ctx, pi, config, manifest);
 }
 
 /** 收集所有可管理条目（MCP + 扩展 + 技能）及其分类元数据 */
@@ -907,12 +966,8 @@ function collectPluginEntries(
   const entries: ToggleEntry[] = [];
   const meta = new Map<string, { cat: ItemCat; name: string }>();
   const add = (cat: ItemCat, name: string) => {
-    const off = cat === "mcp" ? !!config.opt_out.mcp_servers[name]
-      : cat === "ext" ? !!config.opt_out.extensions[name]
-      : !!config.opt_out.skills[name];
-    const info = cat === "skill" ? null
-      : cat === "mcp" ? manifest.mcp_servers[name]
-      : manifest.extensions[name];
+    const off = !!optOutBucket(config, cat)[name];
+    const info = manifestSource(manifest, cat, name);
     const badgeName = cat === "mcp" ? "MCP" : cat === "ext" ? "扩展" : "技能";
     const tail = info ? ` (${info.tools.length} 工具, ${fmtTokens(info.totalTokens)})` : "";
     const id = `${cat}:${name}`;
@@ -939,9 +994,7 @@ function applyPluginToggleDiff(
   let changed = 0;
   let nonSkillChanged = 0;
   for (const [id, { cat, name }] of meta) {
-    const bucket = cat === "mcp" ? config.opt_out.mcp_servers
-      : cat === "ext" ? config.opt_out.extensions
-      : config.opt_out.skills;
+    const bucket = optOutBucket(config, cat);
     const shouldEnable = enabledIds.has(id);
     if (shouldEnable && bucket[name]) {
       delete bucket[name];
@@ -997,138 +1050,32 @@ async function runPluginToggleComponent(
 function isEntryDisabled(config: Config, meta: Map<string, { cat: ItemCat; name: string }>, id: string): boolean {
   const item = meta.get(id);
   if (!item) return false;
-  const bucket = item.cat === "mcp" ? config.opt_out.mcp_servers
-    : item.cat === "ext" ? config.opt_out.extensions
-    : config.opt_out.skills;
-  return !!bucket[item.name];
+  return !!optOutBucket(config, item.cat)[item.name];
 }
 
-/** 扁平菜单：所有来源在一个列表里，按分类标题分组 */
-async function showFlatMenu(
-  ctx: ExtensionContext,
-  pi: ExtensionAPI,
-  config: Config,
-  manifest: Manifest,
-) {
-  const { mcp, ext, skill } = getSortedNames(manifest);
-  while (true) {
-    const options: string[] = [];
-    const items: { cat: ItemCat; name: string }[] = [];
-
-    if (mcp.length > 0) {
-      options.push(`── 🔌 MCP 服务器 (${mcp.length}) ──`);
-      items.push({ cat: "mcp", name: "" });
-      for (const n of mcp) {
-        const off = !!config.opt_out.mcp_servers[n];
-        const info = manifest.mcp_servers[n];
-        const tc = info.tools.length;
-        options.push(`  ${off ? "☐" : "☑"} ${n} (${tc}, ${fmtTokens(info.totalTokens)})`);
-        items.push({ cat: "mcp", name: n });
-      }
-    }
-    if (ext.length > 0) {
-      options.push(`── 🧩 扩展工具 (${ext.length}) ──`);
-      items.push({ cat: "ext", name: "" });
-      for (const n of ext) {
-        const off = !!config.opt_out.extensions[n];
-        const info = manifest.extensions[n];
-        const tc = info.tools.length;
-        options.push(`  ${off ? "☐" : "☑"} ${n} (${tc}, ${fmtTokens(info.totalTokens)})`);
-        items.push({ cat: "ext", name: n });
-      }
-    }
-    if (skill.length > 0) {
-      options.push(`── 📋 技能 (${skill.length}) ──`);
-      items.push({ cat: "skill", name: "" });
-      for (const n of skill) {
-        const off = !!config.opt_out.skills[n];
-        options.push(`  ${off ? "☐" : "☑"} ${n}`);
-        items.push({ cat: "skill", name: n });
-      }
-    }
-    options.push("🔙 返回");
-
-    const choice = await ctx.ui.select("插件管理（点击切换启用/禁用）", options);
-    if (!choice || choice === "🔙 返回") return;
-    const idx = options.indexOf(choice);
-    if (idx < 0 || idx >= items.length) continue;
-    const item = items[idx];
-    if (!item.name) continue; // 分类标题行，不操作
-
-    const r = toggleItem(config, item.cat, item.name);
-    cachedConfig = config;
-    await saveConfig(config);
-    if (item.cat !== "skill") applyToolFilter(pi, config);
-    ctx.ui.notify(r.enabled ? `已启用 ${r.label}` : `已禁用 ${r.label}`, "info");
-    ctx.ui.setStatus("plugin-manager", getFooterStatus());
-  }
+/** 各分类当前可见的来源快照（known_sources 是 manifest 的落盘副本） */
+function knownSourcesBucket(config: Config, cat: ItemCat): Record<string, unknown> {
+  return cat === "mcp" ? config.known_sources.mcp_servers
+    : cat === "ext" ? config.known_sources.extensions
+    : config.known_sources.skills;
 }
 
-/** 二级菜单：先选分类，再进子列表（用于来源数 > 20 的场景） */
-async function showCategoryMenu(
-  ctx: ExtensionContext,
-  pi: ExtensionAPI,
-  config: Config,
-  manifest: Manifest,
-) {
-  const { mcp, ext, skill } = getSortedNames(manifest);
-  while (true) {
-    const section = await ctx.ui.select("插件管理 — 选择类别", [
-      `🔌 MCP 服务器 (${mcp.length})`,
-      `🧩 扩展工具 (${ext.length})`,
-      `📋 技能 (${skill.length})`,
-      "🔙 返回",
-    ]);
-    if (!section || section === "🔙 返回") return;
-    if (section.startsWith("🔌")) await manageSubList(ctx, pi, config, manifest, "mcp", mcp);
-    else if (section.startsWith("🧩")) await manageSubList(ctx, pi, config, manifest, "ext", ext);
-    else if (section.startsWith("📋")) await manageSubList(ctx, pi, config, manifest, "skill", skill);
+/**
+ * footer 计数。total 与 enabled 同源于 known_sources，opt_out 里指向已消失
+ * 来源的残留条目不计入 disabled，否则会出现 enabled 为负。
+ */
+function countSources(config: Config): { total: number; enabled: number } {
+  let total = 0;
+  let enabled = 0;
+  for (const cat of ["mcp", "ext", "skill"] as ItemCat[]) {
+    const known = knownSourcesBucket(config, cat);
+    const off = optOutBucket(config, cat);
+    for (const k of Object.keys(known)) {
+      total++;
+      if (!off[k]) enabled++;
+    }
   }
-}
-
-/** 二级菜单的子列表切换 */
-async function manageSubList(
-  ctx: ExtensionContext,
-  pi: ExtensionAPI,
-  config: Config,
-  manifest: Manifest,
-  cat: ItemCat,
-  names: string[],
-) {
-  if (names.length === 0) {
-    ctx.ui.notify("该分类下没有来源", "info");
-    return;
-  }
-  while (true) {
-    const options = names.map((n) => {
-      const off =
-        cat === "mcp" ? !!config.opt_out.mcp_servers[n]
-        : cat === "ext" ? !!config.opt_out.extensions[n]
-        : !!config.opt_out.skills[n];
-      const info = cat === "skill" ? null
-        : cat === "mcp" ? manifest.mcp_servers[n]
-        : manifest.extensions[n];
-      const tc = info ? info.tools.length : 0;
-      const tk = info ? info.totalTokens : 0;
-      const tail = cat === "skill" ? "" : ` (${tc}, ${fmtTokens(tk)})`;
-      return `${off ? "☐" : "☑"} ${n}${tail}`;
-    });
-    options.push("🔙 返回");
-
-    const title = cat === "mcp" ? "MCP 服务器" : cat === "ext" ? "扩展工具" : "技能";
-    const choice = await ctx.ui.select(`${title}（点击切换）`, options);
-    if (!choice || choice === "🔙 返回") return;
-    const idx = options.indexOf(choice);
-    if (idx < 0 || idx >= names.length) continue;
-
-    const name = names[idx];
-    const r = toggleItem(config, cat, name);
-    cachedConfig = config;
-    await saveConfig(config);
-    if (cat !== "skill") applyToolFilter(pi, config);
-    ctx.ui.notify(r.enabled ? `已启用 ${r.label}` : `已禁用 ${r.label}`, "info");
-    ctx.ui.setStatus("plugin-manager", getFooterStatus());
-  }
+  return { total, enabled };
 }
 
 // ── 全局状态 ───────────────────────────────────────────
@@ -1137,17 +1084,8 @@ let lastStats: { enabled: number; disabled: number } = { enabled: 0, disabled: 0
 
 function getFooterStatus(): string {
   if (!cachedConfig) return "";
-  const total =
-    Object.keys(cachedConfig.known_sources.extensions).length +
-    Object.keys(cachedConfig.known_sources.mcp_servers).length +
-    Object.keys(cachedConfig.known_sources.skills).length;
-  if (total === 0) return "";
-  let disabled = 0;
-  disabled += Object.keys(cachedConfig.opt_out.extensions).length;
-  disabled += Object.keys(cachedConfig.opt_out.mcp_servers).length;
-  disabled += Object.keys(cachedConfig.opt_out.skills).length;
-  const enabled = total - disabled;
-  return `🧩 ${enabled}/${total}`;
+  const { total, enabled } = countSources(cachedConfig);
+  return total === 0 ? "" : `🧩 ${enabled}/${total}`;
 }
 
 // ── 扩展入口 ────────────────────────────────────────────
