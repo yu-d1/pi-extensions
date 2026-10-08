@@ -1483,9 +1483,11 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
   // 1. 先检测 provider 变化（可能清空 quotaState）
   detectAndHandleProviderChange(ctx);
 
-  // 1.5 主动刷新（启用套餐 / 手动刷新 / 首次进入）时清掉登录退避，
-  //     否则用户刚点完「启用」就被上一次失败的 10 分钟退避卡住，看起来像没反应。
-  if (force) resetMimoLoginBackoff();
+  // 注意：这里**不能**按 force 清登录退避。force 同时来自 session_start、
+  // provider 变化、定时器检测等自动路径（config.ttl 可低至 30s），
+  // 一旦被自动 force 反复重置，10 分钟退避形同虚设 —— 表现为每轮刷新都弹一次
+  // Chrome 窗口，用户刚要登录就被下一轮 kill 掉。
+  // 退避只由用户显式操作（启用/切换套餐 → forceRefreshQuota）清除。
 
   const curProvider = ctx.model?.provider;
   if (!curProvider) return; // provider 缺失：不显示
@@ -1597,6 +1599,10 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
 }
 
 async function forceRefreshQuota(ctx: ExtensionContext) {
+  // 用户显式操作（启用/切换套餐）：清掉上次失败的登录退避，
+  // 否则刚点完「启用」就被上一次失败的 10 分钟卡住，看起来像没反应。
+  // 自动路径（session_start / provider 变化 / 定时器）一律不清。
+  resetMimoLoginBackoff();
   await refreshQuotaOnce(ctx, true);
   requestFooterRender?.();
 }
