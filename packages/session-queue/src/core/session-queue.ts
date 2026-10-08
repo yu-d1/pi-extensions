@@ -41,8 +41,6 @@ export class SessionQueueService {
   private userParentMap = new Map<string, string | null>();
   /** 最近一次切换/导航应用的语义（before = 操作前，after = 操作后） */
   private lastAppliedMode: NodeMode | null = null;
-  /** 宿主 /tree 即将跳转的目标 entry，由 session_before_tree 提供。 */
-  private pendingTreeTargetId: string | null = null;
   /** /rollback 主动导航时，session_tree 事件只需确认，不要重复应用文件。 */
   private pendingRollbackNavigation: { targetLeafId: string | null } | null = null;
 
@@ -268,27 +266,50 @@ export class SessionQueueService {
   // Session Tree 同步
   // ---------------------------------------------------------------------
 
-  prepareSessionTreeNavigation(event: any): void {
-    const targetId = event?.preparation?.targetId;
-    this.pendingTreeTargetId = typeof targetId === "string" ? targetId : null;
+  /**
+   * 解析 /tree 导航后的 leaf 位置对应哪个队列检查点。
+   *
+   * pi 的导航语义（agent-session.js navigateTree）：
+   *   - 选中 user 消息 U → newLeafId = U.parentId（文本退回编辑器）
+   *   - 选中 assistant / custom_message → newLeafId = 选中节点本身
+   *
+   * 因此文件状态只由「导航后的 leafId」决定，与用户点了哪个节点无关：
+   *   - leafId 为 null            → 根，turn 0 的空状态
+   *   - leafId 恰为 user 消息 U   → U 所属轮次的“执行前”
+   *   - leafId 位于 U 之下        → U 所属轮次的“执行后”
+   *
+   * 沿 parentId 链向上找最近的、带检查点的 user 消息。中途遇到的轮次若没有检查点
+   * （启用工作区之前的对话），本身不含文件变更，跳过不影响状态。
+   */
+  private resolveLeafTarget(
+    sessionManager: any,
+    leafId: string | null,
+  ): { idx: number; mode: NodeMode } | null {
+    if (!this.activeWorkspace || !this.sessionId) return null;
+    if (leafId == null) return { idx: 0, mode: "before" };
+
+    const queue = this.queueStore.load(this.activeWorkspace, this.sessionId);
+    if (queue.entries.length === 0) return null;
+
+    let cur = sessionManager?.getEntry?.(leafId);
+    while (cur) {
+      if (cur.type === "message" && cur.message?.role === "user") {
+        const idx = queue.entries.findIndex((e) => !e.residual && e.sessionEntryId === cur.id);
+        if (idx >= 0) return { idx, mode: leafId === cur.id ? "before" : "after" };
+      }
+      cur = cur.parentId ? sessionManager?.getEntry?.(cur.parentId) : undefined;
+    }
+    return null;
   }
 
   handleSessionTreeNavigation(event: any, ctx: any): void {
-    if (event.fromExtension) {
-      this.pendingTreeTargetId = null;
-      return;
-    }
+    if (event.fromExtension) return;
     if (!this.activeWorkspace || !this.sessionId) return;
-    if (event.newLeafId === event.oldLeafId) {
-      this.pendingTreeTargetId = null;
-      return;
-    }
 
     // /rollback 已经先恢复文件，再调用宿主导航；这里只确认目标 leaf，避免重复应用。
     if (this.pendingRollbackNavigation) {
       const target = this.pendingRollbackNavigation;
       this.pendingRollbackNavigation = null;
-      this.pendingTreeTargetId = null;
       if (event.newLeafId === target.targetLeafId) return;
     }
     if (!this.followSessionTree) return;
@@ -300,43 +321,21 @@ export class SessionQueueService {
       } catch {
         // 保留已有拓扑，兼容宿主暂时无法读取会话树的情况。
       }
+      const resolved = this.resolveLeafTarget(ctx.sessionManager, event.newLeafId ?? null);
+      if (!resolved) return;
       const queue = this.queueStore.load(this.activeWorkspace, this.sessionId);
       if (queue.entries.length === 0) return;
 
-      // session_before_tree 提供用户实际选中的 entry；选择 user 时，宿主会把 leaf 放到该 user 的 parent。
-      // 没有 preparation 信息时，再使用 newLeafId 和当前 branch 兼容旧事件。
-      const targetId = this.pendingTreeTargetId;
-      this.pendingTreeTargetId = null;
-      let idx = -1;
-      let targetIsUser = false;
-      if (targetId) {
-        const selectedEntry = ctx.sessionManager?.getEntry?.(targetId);
-        targetIsUser = selectedEntry?.type === "message" && selectedEntry?.message?.role === "user";
-        idx = queue.entries.findIndex((entry) => entry.sessionEntryId === targetId && !entry.residual);
-      }
-      if (idx < 0 && event.newLeafId) {
-        idx = queue.entries.findIndex(
-          (entry) => entry.sessionEntryId === event.newLeafId && !entry.residual,
-        );
-      }
-      if (idx < 0) {
-        const navUserMsgId = this.findNavigationUserMessageId(event, ctx);
-        if (!navUserMsgId) return;
-        idx = queue.entries.findIndex((entry) => entry.sessionEntryId === navUserMsgId && !entry.residual);
-        if (!targetId) targetIsUser = true;
-      }
-      if (idx < 0 || idx >= queue.entries.length) return;
-
-      // 选择 user 对话时，pi 已将 leaf 放到 user 发送前；选择其他节点时使用节点完成后的状态。
-      const mode: NodeMode = targetIsUser || (!targetId && event.newLeafId && this.userParentMap.has(event.newLeafId))
-        ? "before"
-        : "after";
+      const { idx, mode } = resolved;
+      // leaf 未变且语义未变时 applyNodeState 幂等，跳过以免无谓写盘与刷屏。
+      if (queue.currentIndex === idx && queue.currentMode === mode) return;
 
       this.processing = true;
       try {
         const execution = this.executeNodeSwitchUnlocked(queue, idx, false, mode);
-        this.lastAppliedMode = mode;
         const result = execution.result;
+        // 目标状态与磁盘一致时静默返回（幂等重放）。
+        if (result.restored === 0 && result.deleted === 0 && result.skipped.length === 0) return;
         const parts: string[] = [];
         if (result.restored > 0) parts.push(`还原 ${result.restored}`);
         if (result.deleted > 0) parts.push(`删除 ${result.deleted}`);
@@ -482,7 +481,6 @@ export class SessionQueueService {
     this.queueStore.clear(this.activeWorkspace, this.sessionId);
     this.lastFlushedUserMsgId = null;
     this.lastAppliedMode = null;
-    this.pendingTreeTargetId = null;
     this.pendingRollbackNavigation = null;
     this.changeTracker.reset();
   }
@@ -585,39 +583,6 @@ export class SessionQueueService {
   // ---------------------------------------------------------------------
   // 内部工具
   // ---------------------------------------------------------------------
-
-  private findNavigationUserMessageId(event: any, ctx: any): string | null {
-    try {
-      const leafEntry = ctx.sessionManager.getLeafEntry?.();
-      const leafId = (leafEntry as any)?.id ?? event.newLeafId ?? null;
-
-      if (leafId != null) {
-        const children = (ctx.sessionManager as any).getChildren?.(leafId) ?? [];
-        for (const child of children) {
-          if (child?.type === "message" && child.message?.role === "user") {
-            return child.id ?? null;
-          }
-        }
-      }
-
-      if (leafEntry?.type === "message" && leafEntry.message?.role === "user") {
-        return leafEntry.id ?? null;
-      }
-
-      const branch = ctx.sessionManager.getBranch();
-      if (Array.isArray(branch)) {
-        for (let i = branch.length - 1; i >= 0; i--) {
-          const entry = branch[i];
-          if (entry?.type === "message" && entry.message?.role === "user") {
-            return entry.id ?? null;
-          }
-        }
-      }
-    } catch {
-      // ignore
-    }
-    return null;
-  }
 
   /**
    * 持久化前修正所有 entry 的 parentEntryId：
