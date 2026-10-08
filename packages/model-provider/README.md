@@ -1,13 +1,14 @@
 # @liziy/model-provider
 
-统一管理 pi 模型供应商的扩展。内置 MiniMax Local，同时支持通过 `/model-provider` 添加 OpenAI Chat Completions、OpenAI Responses 和 Claude Messages 兼容供应商。
+统一管理 pi 模型供应商的扩展。内置 MiniMax Local 与 Command Code（GO 套餐），同时支持通过 `/model-provider` 添加 OpenAI Chat Completions、OpenAI Responses 和 Claude Messages 兼容供应商。
 
 ## 功能
 
 - **MiniMax Local**：直接调用 MiniMax API，支持 `service_tier`、`thinking`、`reasoning_split`、`temperature`、`top_p` 和 `max_completion_tokens`；作为内置固定供应商出现在“管理模型”列表中，参数配置在 `配置管理` 菜单内。
+- **Command Code（GO 套餐）**：内置固定供应商，通过 `/login` 的「Sign in with an account」登录。GO 套餐只能走 `/alpha/generate` 通道（`/provider/v1/*` 返回 403），因此内置了专用传输层；模型目录从 `/provider/v1/models` 拉取，登录后可在“刷新模型”中一键导入。
 - **通用供应商**：按供应商名称、API 格式和 API 前缀统一管理多个服务。
 - **三种官方 API 格式**：`openai-completions`、`openai-responses`、`anthropic-messages`。
-- **统一认证**：普通供应商通过 `/login <供应商名称>` 登录，密钥保存在 pi 的 `auth.json`，不写入扩展配置。
+- **统一认证**：普通供应商通过 `/login <供应商名称>` 登录，密钥保存在 pi 的 `auth.json`，不写入扩展配置。Command Code 走 `/login` →「Sign in with an account」，可浏览器登录或粘贴密钥。
 - **模型管理**：支持从 `{baseUrl}/models` 手动刷新模型，也支持手动添加模型；手动新增的模型**自动勾选启用**，无需再手动勾一次。通过勾选控制模型是否启用，未勾选的模型不在 `/model` 中显示，勾选启用的模型始终排在列表最上面。TUI 模式下与内置 `/scoped-models` 交互一致：↑↓ 选择、enter 切换、ctrl+a 全选、ctrl+x 清空、ctrl+s 保存、esc 取消，支持搜索过滤。
 - **连接检查**：新增或编辑供应商时检查 `{baseUrl}/models`；检查失败会返回地址输入并允许修改重试。
 - **登录后刷新**：`/login <供应商名称>` 成功输入 API 密钥后，只刷新当前供应商一次；本地编辑或勾选模型不会触发远程刷新。
@@ -165,8 +166,24 @@ max       需要模型声明支持的扩展档位
 
 | 命令 | 说明 |
 |---|---|
-| `/model-provider` | 管理内置 MiniMax 与通用供应商、模型管理；MiniMax 参数经 `管理模型` → `配置管理` 进入 |
+| `/model-provider` | 管理内置 MiniMax、Command Code 与通用供应商、模型管理；MiniMax 参数经 `管理模型` → `配置管理` 进入 |
 | `/login <名称>` | 使用 pi 内置认证流程登录供应商 |
+
+## Command Code（GO 套餐）
+
+GO 套餐与 Provider 套餐的能力边界不同，扩展已适配：
+
+| 端点 | GO 套餐 |
+|------|---------|
+| `GET /provider/v1/models` | 可用，模型目录能正常拉取 |
+| `POST /provider/v1/chat/completions` \| `/responses` \| `/messages` | 403 `upgrade_required`（需升级套餐） |
+| `POST /alpha/generate` | 可用，唯一的对话通道 |
+
+因此该供应商自带传输层：请求体为 Command Code CLI 的私有格式，响应为 **NDJSON**（每行一个 JSON，非标准 SSE），事件为 `text-delta` / `reasoning-delta` / `tool-input-*` / `tool-call` / `finish` 等，上游另有汇总用的 `tool-call` 事件与 `tool-input-*` 重复，扩展已做去重。
+
+**思考等级**：`/settings` 的档位会映射为 `reasoning_effort` 一并下发（`off` / `low` / `medium` / `high` / `xhigh` / `max`）。实测**不指定时服务端按最高强度推理，首 token 延迟反而最大**，因此关闭思考时需下发 `off` 而非省略字段。
+
+**登录**：执行 `/login` →「Sign in with an account」→ Command Code，可选浏览器登录或粘贴密钥。官方 `/studio/auth/cli` 授权页在中文下会因站点 locale 重定向丢失参数而报 `Missing callback or state`，此时改用「粘贴 API 密钥」。
 
 ## 说明
 
@@ -182,6 +199,7 @@ max       需要模型声明支持的扩展档位
 
 ## 版本历史
 
+- **v0.2.8** — 新增内置供应商 Command Code（GO 套餐）：`/login` 账号登录、模型目录导入、专用传输层（NDJSON 流解析）；新增模型自动勾选启用；管理模型中内置供应商排到最后
 - **v0.2.7** — 修复 MiniMax 工具与系统提示词丢失（适配 pi 新 transcript 协议）、思考回传规范（Interleaved 多段保留）、reasoning_effort 档位
 - **v0.2.6** — 模型管理新增删除模型
 - **v0.2.5** — MiniMax 改为内置固定供应商，专属代码拆分至 `minimax.ts`
