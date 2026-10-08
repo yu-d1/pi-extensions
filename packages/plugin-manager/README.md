@@ -34,9 +34,12 @@ pi install npm:@liziy/plugin-manager
 
 配置保存在 `~/.pi/agent/extensions/plugin-manager/config.json`。
 
+MCP 工具的归属从 pi 实际注册的工具名（`mcp__<服务器>__<工具>`）反解得出，不依赖外部配置文件。MCP 由 pi 内置管理，本扩展不读 `mcp-cache.json`。
+
 ## 版本历史
 
-- **0.4.2** — 修复经 `imports` 引入的 MCP 服务器不显示也无法禁用；工具名前缀失配时告警；技能过滤不再误伤相邻条目；footer 计数不再为负；移除不可用的非 TUI 菜单
+- **0.4.3** — MCP 归属改为从实际注册的工具名（`mcp__<服务器>__<工具>`）反解，不再读 `mcp.json` / `mcp-cache.json`，也不复刻外部适配器的命名规则
+- **0.4.2** — 修复技能过滤误伤相邻条目；footer 计数不再为负；移除不可用的非 TUI 菜单
 - **0.4.1** — ctrl+s 实时保存并留在界面，修复异步保存后不刷新
 - **0.4.0** — 改为勾选式批量管理，搜索过滤直达
 

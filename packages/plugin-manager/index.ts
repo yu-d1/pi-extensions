@@ -38,8 +38,6 @@ import { homedir } from "node:os";
 // ── 路径 ────────────────────────────────────────────────
 const CONFIG_DIR = join(homedir(), ".pi/agent/extensions/plugin-manager");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
-const MCP_CONFIG_FILE = join(homedir(), ".pi/agent/mcp.json");
-const MCP_CACHE_FILE = join(homedir(), ".pi/agent/mcp-cache.json");
 const SKILLS_DIR = join(homedir(), ".pi/agent/skills");
 
 // ── 类型 ────────────────────────────────────────────────
@@ -171,41 +169,54 @@ async function saveConfig(config: Config): Promise<void> {
 }
 
 // ── Manifest 构建 ───────────────────────────────────────
-/** MCP 工具名前缀模式 — 复刻 pi-mcp-adapter/types.ts 定义 */
-type ToolPrefix = "server" | "none" | "short";
+// MCP 工具名的约定来自 pi 内置实现（dist/core/mcp-servers.js）：
+//   export function isMcpToolName(name) {
+//     return name.startsWith("mcp__") || MCP_RESOURCE_TOOLS.has(name);
+//   }
+// 即 `mcp__<server>__<tool>`（双下划线）。资源工具 list_mcp_resources /
+// read_mcp_resource 等是全局的，没有服务器前缀，不参与按服务器分组。
+//
+// 这里完全从 pi.getAllTools() 的实际注册名反解归属，不读 mcp.json /
+// mcp-cache.json，也不复刻任何外部实现：内置 MCP 由 pi 自己管理，而
+// mcp-cache.json 在 pi 内部没有任何写入方，是外部遗留文件（实测已过期，
+// 会把早已卸载的服务器当成真实来源列进 /plugins）。
 
-interface McpCacheFile {
-  version: number;
-  servers: Record<string, {
-    configHash: string;
-    tools: Array<{ name: string }>;
-    /** MCP 资源会被适配器注册为 read 类型的工具，工具名规则：get_{resourceNameToToolName(name)} */
-    resources?: Array<{ uri: string; name: string; description?: string }>;
-  }>;
+/** MCP 工具名前缀，与 pi 内置 isMcpToolName 保持一致。 */
+const MCP_TOOL_PREFIX = "mcp__";
+
+interface McpServerInfo {
+  /** 该服务器注册的工具名（来自 getAllTools 的真实名字） */
+  tools: string[];
+  totalTokens: number;
 }
 
-interface McpConfigFile {
-  mcpServers: Record<string, unknown>;
-  settings?: { toolPrefix?: ToolPrefix };
-  imports?: string[];
-}
-
-async function readMcpCache(): Promise<McpCacheFile> {
-  if (!existsSync(MCP_CACHE_FILE)) return { version: 1, servers: {} };
-  try {
-    return JSON.parse(await readFile(MCP_CACHE_FILE, "utf-8"));
-  } catch {
-    return { version: 1, servers: {} };
+/**
+ * 从实际注册的工具名反解「服务器 → 工具集」。
+ *
+ * 只用前缀切分，因此服务器名里不能含 `__`。这是保守切分：宁可漏判也不
+ * 误归属——误归属会让禁用一个服务器时连带停掉另一个的公共工具。
+ */
+function collectMcpTools(
+  allTools: ToolInfo[],
+  tokenMap: Map<string, number>,
+): Map<string, McpServerInfo> {
+  const byServer = new Map<string, McpServerInfo>();
+  for (const t of allTools) {
+    if (!t.name.startsWith(MCP_TOOL_PREFIX)) continue;
+    const rest = t.name.slice(MCP_TOOL_PREFIX.length);
+    const sep = rest.indexOf("__");
+    if (sep <= 0) continue;
+    const server = rest.slice(0, sep);
+    let entry = byServer.get(server);
+    if (!entry) {
+      entry = { tools: [], totalTokens: 0 };
+      byServer.set(server, entry);
+    }
+    entry.tools.push(t.name);
+    entry.totalTokens += tokenMap.get(t.name) ?? 0;
   }
-}
-
-async function readMcpConfig(): Promise<McpConfigFile> {
-  if (!existsSync(MCP_CONFIG_FILE)) return { mcpServers: {} };
-  try {
-    return JSON.parse(await readFile(MCP_CONFIG_FILE, "utf-8"));
-  } catch {
-    return { mcpServers: {} };
-  }
+  for (const entry of byServer.values()) entry.tools.sort();
+  return byServer;
 }
 
 async function readSkillsDir(): Promise<string[]> {
@@ -264,77 +275,6 @@ function buildManifestFromTools(allTools: ToolInfo[], tokenMap: Map<string, numb
   return grouped;
 }
 
-/**
- * 列出一个 MCP 服务器注册后的全部工具名。
- *
- * 名字拼接复刻 pi-mcp-adapter（formatToolName / resourceNameToToolName），
- * 属于外部约定：适配器改名时这里会静默对不上。用 verify 回调报告命中率，
- * 由调用方决定是否告警——静默失效会表现为「禁用了但工具还在」。
- *
- * @returns names 推出的工具名；matched 其中能在实际工具列表里命中的个数
- */
-function resolveMcpToolNames(
-  serverName: string,
-  cacheServer: McpCacheFile["servers"][string] | undefined,
-  prefixMode: ToolPrefix,
-  tokenMap?: Map<string, number>,
-): { names: string[]; totalTokens: number; matched: number } {
-  const names: string[] = [];
-  let totalTokens = 0;
-  // tools 数组（缓存中的名字无前缀）
-  for (const t of cacheServer?.tools ?? []) {
-    const fullName = formatMcpToolName(t.name, serverName, prefixMode);
-    names.push(fullName);
-    totalTokens += tokenMap?.get(fullName) ?? 0;
-  }
-  // resources 会被适配器注册成 read 工具，同样占上下文
-  for (const r of cacheServer?.resources ?? []) {
-    const fullName = formatMcpToolName(
-      `get_${resourceNameToToolName(r.name ?? "")}`,
-      serverName,
-      prefixMode,
-    );
-    names.push(fullName);
-    totalTokens += tokenMap?.get(fullName) ?? 0;
-  }
-  names.sort();
-  return { names, totalTokens, matched: tokenMap ? names.filter((n) => tokenMap.has(n)).length : 0 };
-}
-
-/** 已告警过前缀对不上的服务器，避免每次 /plugins 重复刷屏 */
-const prefixWarned = new Set<string>();
-
-/**
- * 推出的工具名几乎全部对不上实际注册名 → 前缀复刻已失效。
- * 不阻断功能（仍按推出的名字过滤），但要告诉用户禁用可能不生效。
- */
-function warnOnPrefixMismatch(serverName: string, total: number, matched: number): void {
-  if (total === 0 || matched > 0 || prefixWarned.has(serverName)) return;
-  prefixWarned.add(serverName);
-  console.warn(
-    `[plugin-manager] MCP "${serverName}"：推出 ${total} 个工具名但一个都对不上实际注册名。` +
-    `可能是 pi-mcp-adapter 改了命名规则，禁用该服务器可能不生效。`,
-  );
-}
-
-/**
- * 服务器集合 = mcp-cache 的键 ∪ mcp.json.mcpServers 的键。
- *
- * 只认 mcpServers 会漏掉通过 imports 引入的配置——那种情况下 mcpServers
- * 为空而 cache 里全是已加载的服务器，导致 /plugins 里一个都不显示、
- * 它们的工具却仍全额注入。cache 是适配器解析 imports 后的真实产物，以它
- * 为主；并上 mcpServers 则能覆盖「声明了但尚未连接成功」的情况。
- */
-function collectMcpServerNames(
-  mcpConfig: McpConfigFile,
-  mcpCache: McpCacheFile,
-): string[] {
-  return [...new Set([
-    ...Object.keys(mcpCache.servers ?? {}),
-    ...Object.keys(mcpConfig.mcpServers ?? {}),
-  ])].sort();
-}
-
 async function buildCurrentManifest(pi: ExtensionAPI): Promise<Manifest> {
   // 0. 构建工具名→token 估算的查找表
   const allTools = pi.getAllTools();
@@ -343,20 +283,10 @@ async function buildCurrentManifest(pi: ExtensionAPI): Promise<Manifest> {
   // 1. 扩展工具（通过 getAllTools + sourceInfo）
   const extensions = buildManifestFromTools(allTools, tokenMap);
 
-  // 2. MCP 服务器（mcp-cache 为准，见 collectMcpServerNames）
-  const mcpConfig = await readMcpConfig();
-  const mcpCache = await readMcpCache();
-  const prefixMode: ToolPrefix = mcpConfig.settings?.toolPrefix ?? "server";
+  // 2. MCP 服务器（从实际注册的工具名反解，见 collectMcpTools）
   const mcpServers: Record<string, ManifestSource> = {};
-  for (const serverName of collectMcpServerNames(mcpConfig, mcpCache)) {
-    const resolved = resolveMcpToolNames(
-      serverName,
-      mcpCache.servers?.[serverName],
-      prefixMode,
-      tokenMap,
-    );
-    warnOnPrefixMismatch(serverName, resolved.names.length, resolved.matched);
-    mcpServers[serverName] = { tools: resolved.names, totalTokens: resolved.totalTokens };
+  for (const [server, info] of collectMcpTools(allTools, tokenMap)) {
+    mcpServers[server] = { tools: info.tools, totalTokens: info.totalTokens };
   }
 
   // 3. 技能（扫描 skills 目录）
@@ -435,31 +365,13 @@ function computeEnabledToolNames(
   allTools: ToolInfo[],
   optOut: Config["opt_out"],
 ): string[] {
-  // 把 mcp_servers 的禁用意图转换为注册后的 tool 名集合。
-  // 拼接规则与 manifest 共用 resolveMcpToolNames，避免两处实现漂移。
-  let mcpCache: McpCacheFile = { version: 1, servers: {} };
-  let mcpConfig: McpConfigFile = { mcpServers: {} };
-  try {
-    if (existsSync(MCP_CACHE_FILE)) {
-      mcpCache = JSON.parse(readFileSync(MCP_CACHE_FILE, "utf-8"));
-    }
-    if (existsSync(MCP_CONFIG_FILE)) {
-      mcpConfig = JSON.parse(readFileSync(MCP_CONFIG_FILE, "utf-8"));
-    }
-  } catch { /* ignore */ }
-
-  const prefixMode: ToolPrefix = mcpConfig.settings?.toolPrefix ?? "server";
+  // 把 mcp_servers 的禁用意图转换为真实注册的 tool 名集合。
+  // 与 manifest 共用 collectMcpTools，两处不会漂移。
   const tokenMap = buildTokenMap(allTools);
+  const mcpTools = collectMcpTools(allTools, tokenMap);
   const disabledMcpToolNames = new Set<string>();
   for (const serverName of Object.keys(optOut.mcp_servers)) {
-    const resolved = resolveMcpToolNames(
-      serverName,
-      mcpCache.servers?.[serverName],
-      prefixMode,
-      tokenMap,
-    );
-    warnOnPrefixMismatch(serverName, resolved.names.length, resolved.matched);
-    for (const n of resolved.names) disabledMcpToolNames.add(n);
+    for (const n of mcpTools.get(serverName)?.tools ?? []) disabledMcpToolNames.add(n);
   }
 
   const disabledExtSources = new Set(Object.keys(optOut.extensions));
@@ -599,43 +511,6 @@ function removeDisabledSkills(systemPrompt: string, disabledSkillNames: string[]
   }
   kept.push(systemPrompt.slice(cursor));
   return kept.join("");
-}
-
-/**
- * 复刻 pi-mcp-adapter 的工具名前缀逻辑。
- * 默认 prefix = "server"，输出形如 `postgres_gt_cloud_query`。
- * 参考: pi-mcp-adapter/types.ts formatToolName
- */
-function getMcpServerPrefix(serverName: string, mode: ToolPrefix): string {
-  if (mode === "none") return "";
-  if (mode === "short") {
-    let short = serverName.replace(/-?mcp$/i, "").replace(/-/g, "_");
-    if (!short) short = "mcp";
-    return short;
-  }
-  return serverName.replace(/-/g, "_");
-}
-
-function formatMcpToolName(toolName: string, serverName: string, mode: ToolPrefix): string {
-  const p = getMcpServerPrefix(serverName, mode);
-  return p ? `${p}_${toolName}` : toolName;
-}
-
-/**
- * 复刻 pi-mcp-adapter/resource-tools.ts 的 resourceNameToToolName。
- * MCP 资源名（如 `"table_name" database schema`）会先转成 tool basename，再加 `get_` 前缀。
- */
-function resourceNameToToolName(name: string): string {
-  let result = name
-    .replace(/[^a-zA-Z0-9]/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+/, "")
-    .replace(/_+$/, "")
-    .toLowerCase();
-  if (!result || /^\d/.test(result)) {
-    result = "resource" + (result ? "_" + result : "");
-  }
-  return result;
 }
 
 // ── /plugins 命令 ───────────────────────────────────────
