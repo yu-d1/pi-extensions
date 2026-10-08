@@ -750,12 +750,12 @@ async function addCommonFlow(ctx: any): Promise<void> {
 }
 
 /**
- * 选择供应商。includeBuiltin = true 时，内置 MiniMax 固定显示在最前（仅“管理模型”入口使用）。
+ * 选择供应商。includeBuiltin = true 时，内置 MiniMax 固定显示在最后（仅“管理模型”入口使用）。
  */
 async function selectProvider(ctx: any, title: string, includeBuiltin = false): Promise<ProviderEntry | undefined> {
 	const entries: ProviderEntry[] = [
-		...(includeBuiltin ? store.providers.filter((p): p is BuiltinEntry => p.kind === "builtin") : []),
 		...getCommonEntries(),
+		...(includeBuiltin ? store.providers.filter((p): p is BuiltinEntry => p.kind === "builtin") : []),
 	];
 	if (entries.length === 0) {
 		ctx.ui.notify("暂无供应商，请先“添加供应商”。", "warning");
@@ -887,7 +887,8 @@ async function addModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 				...(thinking.reasoning ? { reasoning: true, thinkingLevelMap: thinking.thinkingLevelMap } : {}),
 				input,
 				contextWindow: DEFAULT_CONTEXT_WINDOW,
-				enabled: false,
+				// 新增即勾选启用，省去再去「启用模型」里手动找一遍
+				enabled: true,
 			});
 			added++;
 		}
@@ -895,7 +896,8 @@ async function addModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 	entry.models = sortModels(entry.models);
 	reRegisterEntry(entry);
 	await saveStore();
-	ctx.ui.notify(`已处理 ${list.length} 个模型，新增 ${added} 个（默认未启用）；请到“启用模型”中勾选后使用。`, "info");
+	const summary = added > 0 ? `新增 ${added} 个，已自动勾选启用` : "均已存在，仅更新了输入能力";
+	ctx.ui.notify(`已处理 ${list.length} 个模型：${summary}。`, "info");
 }
 
 /**
