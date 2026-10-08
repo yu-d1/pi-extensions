@@ -720,6 +720,8 @@ const QUOTA_STYLE_ITEMS: { value: QuotaStyle; label: string; preview: string }[]
   { value: "with-clock-7d", label: "各自带倒计时（精确到分）", preview: "5h: 89% ⏱ 4h15m 7d: 72% ⏱ 2d" },
   { value: "nearest-clock-7d", label: "仅最近一个倒计时", preview: "5h: 89% 7d: 72% ⏱ 4h15m" },
   { value: "largest-unit", label: "倒计时只显示最大单位", preview: "5h: 89% ⏱ 4h 7d: 72% ⏱ 2d" },
+  { value: "with-balance", label: "月度余额 + 最近倒计时", preview: "$9.96 5h: 89% 7d: 72% ⏱ 4h15m" },
+  { value: "with-balance-largest", label: "月度余额 + 倒计时最大单位", preview: "$9.96 5h: 89% ⏱ 4h 7d: 72% ⏱ 2d" },
 ];
 
 /** 显示内容分组（面板按组展示，组内顺序即 footer 中的顺序） */
@@ -1281,7 +1283,7 @@ function isSpeedStyle(v: unknown): v is SpeedStyle {
   return typeof v === "string" && ["t/s", "tok/s", "T/s", "liveAt"].includes(v);
 }
 function isQuotaStyle(v: unknown): v is QuotaStyle {
-  return typeof v === "string" && ["compact", "with-clock-7d", "nearest-clock-7d", "largest-unit"].includes(v);
+  return typeof v === "string" && ["compact", "with-clock-7d", "nearest-clock-7d", "largest-unit", "with-balance", "with-balance-largest"].includes(v);
 }
 
 async function saveDisplayConfig(cfg: DisplayConfig) {

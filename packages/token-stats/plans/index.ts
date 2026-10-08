@@ -9,8 +9,9 @@ import { glmPlan } from "./glm";
 import { kimiPlan } from "./kimi";
 import { deepseekPlan } from "./deepseek";
 import { mimoPlan } from "./mimo";
+import { commandCodeGoPlan } from "./commandcodego";
 
-export const BUILTIN_PLANS: TokenPlan[] = [minimaxPlan, glmPlan, kimiPlan, deepseekPlan, mimoPlan];
+export const BUILTIN_PLANS: TokenPlan[] = [minimaxPlan, glmPlan, kimiPlan, deepseekPlan, mimoPlan, commandCodeGoPlan];
 
 export { checkLoginPlanPrereq, mimoLog, bindMimoFeedback, resetMimoLoginBackoff } from "./mimo";
 export type { PlanFormatContext, QuotaStyle, TokenPlan } from "./shared";

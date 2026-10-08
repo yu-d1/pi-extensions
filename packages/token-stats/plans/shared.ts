@@ -6,7 +6,7 @@
  * 汇总清单见 index.ts。数字格式化统一走 ../format.ts（与状态栏同一套精度）。
  */
 
-import { formatDuration, formatDurationLargest, formatPercent } from "../format";
+import { formatAmount, formatDuration, formatDurationLargest, formatPercent } from "../format";
 
 export type QuotaColor = "ok" | "warn" | "err";
 
@@ -21,7 +21,15 @@ export interface PlanFormatContext {
 }
 
 /** 配额展示样式（对应展示配置里的 quotaStyle） */
-export type QuotaStyle = "compact" | "with-clock-7d" | "nearest-clock-7d" | "largest-unit";
+export type QuotaStyle =
+  | "compact"
+  | "with-clock-7d"
+  | "nearest-clock-7d"
+  | "largest-unit"
+  /** 月度余额 + 最近一个倒计时；套餐无余额时自动省略余额，退化为 nearest-clock-7d */
+  | "with-balance"
+  /** 月度余额 + 倒计时只显示最大单位；无余额时退化为 largest-unit */
+  | "with-balance-largest";
 
 export interface TokenPlan {
   id: string;
@@ -61,8 +69,13 @@ export function formatTokenPlanDisplay(
   weeklyResetMs?: number | null,
   style: QuotaStyle = "with-clock-7d",
   percentDigits = 0,
+  /** 月度余额（with-balance 样式用）；null/undefined 或 0 时该段整段省略 */
+  balance?: { amount: number; digits: number } | null,
 ): string {
   const pct = (value: number) => formatPercent(value, percentDigits);
+  /** 余额前缀：仅 with-balance 且金额为正时显示 */
+  const balancePrefix = (): string =>
+    balance && balance.amount > 0 ? `${formatAmount(balance.amount, balance.digits, "$")} ` : "";
   const formatClock = (resetMs?: number | null) => {
     if (!resetMs || resetMs <= 0) return "";
     const diff = resetMs - Date.now();
@@ -82,6 +95,20 @@ export function formatTokenPlanDisplay(
   const weeklyLabel = "7d";
   const weekly = `${weeklyLabel}: ${pct(weeklyRemaining)}`;
   if (style === "compact") return `${interval} ${weekly}`;
+  if (style === "with-balance" || style === "with-balance-largest") {
+    // 余额为空时整段省略，只退化为对应的无余额形态，不留多余空白
+    let body: string;
+    if (style === "with-balance-largest") {
+      body = `${interval}${formatClockLargest(intervalResetMs)} ${weekly}${formatClockLargest(weeklyResetMs)}`;
+    } else {
+      const resets = [intervalResetMs, weeklyResetMs].filter(
+        (value): value is number => typeof value === "number" && value > Date.now(),
+      );
+      const nearest = resets.length > 0 ? Math.min(...resets) : null;
+      body = `${interval} ${weekly}${formatClock(nearest)}`;
+    }
+    return `${balancePrefix()}${body}`;
+  }
   if (style === "largest-unit") {
     return `${interval}${formatClockLargest(intervalResetMs)} ${weekly}${formatClockLargest(weeklyResetMs)}`;
   }
