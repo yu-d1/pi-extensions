@@ -22,7 +22,8 @@ pi install npm:@liziy/plan-guard
 |------|------|
 | **Tab 键** | 切换 Plan / Act 模式 |
 | `/model` 选模型 | 当前模式会记住该模型，切换时自动恢复 |
-| `/todos` | 查看任务面板（`ctrl+shift+t` 折叠） |
+| `/todos` | Todo 菜单：执行全部待办 / 检查状态标注 / 查看列表 |
+| `/todos exec` `/todos check` `/todos list` | 直达对应动作，跳过菜单 |
 | `/plan config` | 开关 Todo 面板 / 提问对话框（切换后 `/reload` 生效） |
 
 **Plan 模式**禁用 `edit`、`write`、删除类 bash 等修改工具，`bash` 仅可执行只读命令（禁止 `rm`、重定向、`sed -i`、`git commit` 等）；可用 read / bash / mcp / ask_user_question 及 chrome 系列工具。
@@ -31,6 +32,7 @@ pi install npm:@liziy/plan-guard
 
 ## 版本历史
 
+- **2.1.0** — `/todos` 改为菜单：执行全部待办（自动续跑至全部完成）、检查状态标注（让模型核对已完成未标记项）、查看列表；直接入口 `/todos exec|check|list`；todo `action` 增加必填提示与调用示例；移除内嵌 rpiv-config / rpiv-i18n 依赖
 - **2.0.1** — `/plan config` 改为循环菜单，可连续调整
 - **2.0.0** — 内嵌 Todo 任务面板与提问对话框，新增 `/plan config` 开关
 

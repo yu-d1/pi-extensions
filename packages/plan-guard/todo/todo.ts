@@ -1,11 +1,12 @@
 /**
- * todo tool + /todos command — thin registration shell.
+ * todo tool + todo text renderer — thin registration shell.
  *
  * Tool/command identity, schema, types, reducer, store, replay, response
  * envelope, selectors, and view formatters live in the layered modules under
  * `tool/`, `state/`, and `view/`. This file is the package-root registration
- * surface — it mirrors `packages/rpiv-ask-user-question/ask-user-question.ts`
- * which keeps the tool registration at the package root.
+ * surface. The `/todos` slash command now lives in the plan-guard root
+ * extension (its menu drives exec/check/list); this package registers only
+ * the `todo` tool and exports `renderTodosText` for that menu to call.
  *
  * Public re-exports below preserve the pre-refactor import surface so that
  * `index.ts`, `todo-overlay.ts`, and the global `test/setup.ts` `beforeEach`
@@ -14,24 +15,19 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig, validateGuidanceFields } from "./config.js";
-import { formatStatusLabel, t } from "./state/i18n-bridge.js";
 import { selectTasksByStatus, selectTodoCounts, selectVisibleTasks } from "./state/selectors.js";
 import { applyTaskMutation } from "./state/state-reducer.js";
 import { commitState, getRenderState, getState, sid } from "./state/store.js";
 import { buildToolResult } from "./tool/response-envelope.js";
 import {
-	COMMAND_NAME,
-	ERR_REQUIRES_INTERACTIVE,
-	MSG_NO_TODOS,
 	type TaskMutationParams,
 	TOOL_LABEL,
 	TOOL_NAME,
 	TodoParamsSchema,
 } from "./tool/types.js";
-import { formatCommandTaskLine, renderTodoCall, renderTodoResult } from "./view/format.js";
+import { formatCommandTaskLine, formatStatusLabel, renderTodoCall, renderTodoResult } from "./view/format.js";
 
-// English fallbacks for localized /todos section headers — the box-drawing
-// decoration is part of the localized string so translators can adjust spacing.
+// /todos section headers — the box-drawing decoration is part of the string.
 const SECTION_PENDING = "── Pending ──";
 const SECTION_IN_PROGRESS = "── In Progress ──";
 const SECTION_COMPLETED = "── Completed ──";
@@ -53,6 +49,7 @@ export { TOOL_NAME } from "./tool/types.js";
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_PROMPT_SNIPPET = "Manage a task list to track multi-step progress";
+
 export const DEFAULT_PROMPT_GUIDELINES: string[] = [
 	"Use `todo` for complex work with 3+ steps, when the user gives you a list of tasks, or immediately after receiving new instructions to capture requirements. Skip it for single trivial tasks and purely conversational requests.",
 	"When starting any task, mark it in_progress BEFORE beginning work. Mark it completed IMMEDIATELY when done — never batch completions. Exactly one task should be in_progress at a time.",
@@ -103,43 +100,38 @@ export function registerTodoTool(pi: ExtensionAPI): void {
 // /todos slash command
 // ---------------------------------------------------------------------------
 
-export function registerTodosCommand(pi: ExtensionAPI): void {
-	pi.registerCommand(COMMAND_NAME, {
-		description: "Show all todos on the current branch, grouped by status",
-		handler: async (_args, ctx) => {
-			if (!ctx.hasUI) {
-				ctx.ui.notify(t("command.requires_interactive", ERR_REQUIRES_INTERACTIVE), "error");
-				return;
-			}
-			const state = getState(sid(ctx));
-			const visible = selectVisibleTasks(state);
-			if (visible.length === 0) {
-				ctx.ui.notify(t("command.no_todos", MSG_NO_TODOS), "info");
-				return;
-			}
-			const groups = selectTasksByStatus(state);
-			const counts = selectTodoCounts(state);
+/**
+ * 渲染当前分支的全部 todo 文本，按 pending / in_progress / completed 分组。
+ * 无可见任务时返回 null，交给调用方决定提示文案。
+ *
+ * `/todos` 命令已由 plan-guard 主扩展注册（菜单含 执行/检查/查看 三个动作），
+ * 本包只提供渲染能力，自身不再注册任何 slash 命令。
+ */
+export function renderTodosText(ctx: { sessionManager: { getSessionId(): string } }): string | null {
+	const state = getState(sid(ctx));
+	const visible = selectVisibleTasks(state);
+	if (visible.length === 0) return null;
+	const groups = selectTasksByStatus(state);
+	const counts = selectTodoCounts(state);
 
-			const header: string[] = [];
-			if (counts.completed > 0) header.push(`${counts.completed}/${counts.total} ${formatStatusLabel("completed")}`);
-			if (counts.inProgress > 0) header.push(`${counts.inProgress} ${formatStatusLabel("in_progress")}`);
-			if (counts.pending > 0) header.push(`${counts.pending} ${formatStatusLabel("pending")}`);
+	const header: string[] = [];
+	if (counts.completed > 0) header.push(`${counts.completed}/${counts.total} ${formatStatusLabel("completed")}`);
+	if (counts.inProgress > 0) header.push(`${counts.inProgress} ${formatStatusLabel("in_progress")}`);
+	if (counts.pending > 0) header.push(`${counts.pending} ${formatStatusLabel("pending")}`);
 
-			const lines: string[] = [header.join(" · ")];
-			if (groups.pending.length > 0) {
-				lines.push(t("command.section.pending", SECTION_PENDING));
-				for (const task of groups.pending) lines.push(formatCommandTaskLine(task, "○"));
-			}
-			if (groups.inProgress.length > 0) {
-				lines.push(t("command.section.in_progress", SECTION_IN_PROGRESS));
-				for (const task of groups.inProgress) lines.push(formatCommandTaskLine(task, "◐"));
-			}
-			if (groups.completed.length > 0) {
-				lines.push(t("command.section.completed", SECTION_COMPLETED));
-				for (const task of groups.completed) lines.push(formatCommandTaskLine(task, "✓"));
-			}
-
-			ctx.ui.notify(lines.join("\n"), "info");
-		},
-	});
+	const lines: string[] = [header.join(" · ")];
+	if (groups.pending.length > 0) {
+		lines.push(SECTION_PENDING);
+		for (const task of groups.pending) lines.push(formatCommandTaskLine(task, "○"));
+	}
+	if (groups.inProgress.length > 0) {
+		lines.push(SECTION_IN_PROGRESS);
+		for (const task of groups.inProgress) lines.push(formatCommandTaskLine(task, "◐"));
+	}
+	if (groups.completed.length > 0) {
+		lines.push(SECTION_COMPLETED);
+		for (const task of groups.completed) lines.push(formatCommandTaskLine(task, "✓"));
+	}
+	return lines.join("\n");
 }
+

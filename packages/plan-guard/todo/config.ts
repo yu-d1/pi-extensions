@@ -1,5 +1,29 @@
-import type { GuidanceFields } from "../rpiv-config.js";
-import { loadJsonConfigWithLegacyFallback, validateGuidanceFields } from "../rpiv-config.js";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
+
+export interface GuidanceFields {
+	promptSnippet?: string;
+	promptGuidelines?: string[];
+}
+
+/** 校验并提取 guidance 字段，仅保留合法项。 */
+export function validateGuidanceFields(fields: unknown): GuidanceFields {
+	if (!fields || typeof fields !== "object") return {};
+	const g = fields as Record<string, unknown>;
+	const result: GuidanceFields = {};
+	if (typeof g.promptSnippet === "string" && g.promptSnippet.length > 0) {
+		result.promptSnippet = g.promptSnippet;
+	}
+	if (
+		Array.isArray(g.promptGuidelines) &&
+		g.promptGuidelines.length > 0 &&
+		g.promptGuidelines.every((s) => typeof s === "string" && s.length > 0)
+	) {
+		result.promptGuidelines = g.promptGuidelines;
+	}
+	return result;
+}
 
 interface TodoConfig {
 	guidance?: GuidanceFields;
@@ -26,8 +50,27 @@ export const DEFAULT_COLLAPSE_KEY: CollapseKeySpec = "ctrl+shift+t";
 /** Sentinel value for `collapseKey` that disables the collapse shortcut entirely. */
 export const COLLAPSE_KEY_OFF: CollapseKeySpec = "off";
 
+/** 配置文件路径：`~/.config/rpiv-todo/config.json`（遵循 XDG_CONFIG_HOME 绝对路径）。 */
+function configFilePath(): string {
+	const xdg = process.env.XDG_CONFIG_HOME?.trim();
+	const base = xdg && isAbsolute(xdg) ? xdg : join(homedir(), ".config");
+	return join(base, "rpiv-todo", "config.json");
+}
+
+function loadConfigFile(): TodoConfig {
+	const path = configFilePath();
+	if (!existsSync(path)) return {};
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		return parsed as TodoConfig;
+	} catch {
+		return {};
+	}
+}
+
 export function loadConfig(): TodoConfig {
-	return loadJsonConfigWithLegacyFallback<TodoConfig>("rpiv-todo");
+	return loadConfigFile();
 }
 
 /** Content-row budget for the overlay, read fresh on every call (per-render —
@@ -97,5 +140,3 @@ export function resolveCollapseKey(): CollapseKeySpec {
 	if (raw === COLLAPSE_KEY_OFF) return COLLAPSE_KEY_OFF;
 	return isValidCollapseKeySpec(raw) ? raw : DEFAULT_COLLAPSE_KEY;
 }
-
-export { validateGuidanceFields };

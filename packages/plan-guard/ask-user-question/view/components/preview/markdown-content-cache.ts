@@ -1,6 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Markdown, type MarkdownTheme, visibleWidth } from "@earendil-works/pi-tui";
-import { t } from "../../../state/i18n-bridge.js";
 import type { QuestionData } from "../../../tool/types.js";
 import { stripFenceMarkers } from "./preview-box-renderer.js";
 
@@ -58,7 +57,7 @@ export class MarkdownContentCache {
 		}
 		const text = this.previewTexts.get(optionIndex);
 		if (!text) {
-			const placeholder = this.theme.fg("dim", t("preview.no_preview", NO_PREVIEW_TEXT));
+			const placeholder = this.theme.fg("dim", NO_PREVIEW_TEXT);
 			const pad = Math.max(0, innerWidth - visibleWidth(placeholder));
 			return [placeholder + " ".repeat(pad)];
 		}

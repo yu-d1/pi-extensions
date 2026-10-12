@@ -15,10 +15,9 @@
 import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type TUI, truncateToWidth } from "@earendil-works/pi-tui";
 import { COLLAPSE_KEY_OFF, getMaxWidgetLines, resolveCollapseKey } from "./config.js";
-import { formatStatusLabel, t } from "./state/i18n-bridge.js";
 import { selectHasActive, selectOverlayLayout, selectShowTaskIds, selectTodoCounts } from "./state/selectors.js";
 import { getRenderState } from "./state/store.js";
-import { formatOverlayTaskLine } from "./view/format.js";
+import { formatOverlayTaskLine, formatStatusLabel } from "./view/format.js";
 
 const WIDGET_KEY = "rpiv-todos";
 
@@ -148,7 +147,7 @@ export class TodoOverlay {
 
 		const headingColor = hasActive ? "accent" : "dim";
 		const headingIcon = hasActive ? "●" : "○";
-		const headingText = `${t("overlay.heading", OVERLAY_HEADING)} (${counts.completed}/${counts.total})`;
+		const headingText = `${OVERLAY_HEADING} (${counts.completed}/${counts.total})`;
 		const heading = truncate(`${theme.fg(headingColor, headingIcon)} ${theme.fg(headingColor, headingText)}`);
 
 		// Collapsed view: just the heading + a dim "└─" expand hint, then the
@@ -164,8 +163,8 @@ export class TodoOverlay {
 			const key = resolveCollapseKey();
 			const hint =
 				key === COLLAPSE_KEY_OFF
-					? t("overlay.collapsed", OVERLAY_COLLAPSED)
-					: t("overlay.expandHint", OVERLAY_EXPAND_HINT).replace("{key}", key);
+					? OVERLAY_COLLAPSED
+					: OVERLAY_EXPAND_HINT.replace("{key}", key);
 			return this.withTrailingSpacer([heading, truncate(`${theme.fg("dim", "└─")} ${theme.fg("dim", hint)}`)]);
 		}
 
@@ -199,7 +198,7 @@ export class TodoOverlay {
 		const overflowParts: string[] = [];
 		if (layout.hiddenCompleted > 0) overflowParts.push(`${layout.hiddenCompleted} ${formatStatusLabel("completed")}`);
 		if (layout.truncatedTail > 0) overflowParts.push(`${layout.truncatedTail} ${formatStatusLabel("pending")}`);
-		const more = t("overlay.more", OVERLAY_MORE);
+		const more = OVERLAY_MORE;
 		const summary =
 			overflowParts.length > 0 ? `+${totalHidden} ${more} (${overflowParts.join(", ")})` : `+${totalHidden} ${more}`;
 		lines.push(truncate(`${theme.fg("dim", "└─")} ${theme.fg("dim", summary)}`));

@@ -7,11 +7,10 @@ import {
 	type AskUserBlockedEventPayload,
 	type AskUserPromptEventPayload,
 } from "./events.js";
-// Static import is fine — rpc-fallback pulls only types + the i18n bridge,
+// Static import is fine — rpc-fallback pulls only types + row-intent labels,
 // none of the ~560ms TUI render graph that QuestionnaireSession lazy-loads.
 import { hasDialogUI, runRpcQuestionnaire } from "./rpc-fallback.js";
-import { displayLabel, t } from "./state/i18n-bridge.js";
-import { sentinelsToAppend } from "./state/row-intent.js";
+import { ROW_INTENT_META, sentinelsToAppend } from "./state/row-intent.js";
 import { buildQuestionnaireResponse, buildToolResult } from "./tool/response-envelope.js";
 import {
 	MAX_OPTIONS,
@@ -125,7 +124,7 @@ export function buildItemsForQuestion(question: QuestionData): WrappingSelectIte
 		description: o.description,
 	}));
 	for (const kind of sentinelsToAppend(question)) {
-		items.push({ kind, label: displayLabel(kind) });
+		items.push({ kind, label: ROW_INTENT_META[kind].label });
 	}
 	return items;
 }
@@ -274,7 +273,7 @@ Preview content is rendered as markdown in a monospace box. Multi-line text with
 									return await editWithExternalEditor(tui, editorCommand, value);
 								} catch (error) {
 									const message = error instanceof Error ? error.message : String(error);
-									ctx.ui.notify(`${t("editor.failed", "External editor failed")}: ${message}`, "error");
+									ctx.ui.notify(`External editor failed: ${message}`, "error");
 									return undefined;
 								}
 							},

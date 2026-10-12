@@ -4,7 +4,7 @@ import type { PreviewPaneProps } from "../../view/components/preview/preview-pan
 import type { SubmitPickerProps } from "../../view/components/submit-picker.js";
 import type { TabBarProps } from "../../view/components/tab-bar.js";
 import type { DialogProps } from "../../view/dialog-builder.js";
-import { displayLabel } from "../i18n-bridge.js";
+import { ROW_INTENT_META } from "../row-intent.js";
 import type { GlobalSelector, PerTabSelector } from "./contract.js";
 import { selectConfirmedIndicator } from "./derivations.js";
 
@@ -20,7 +20,7 @@ export const selectMultiSelectProps: PerTabSelector<MultiSelectViewProps> = (sta
 				inputCursorOffset: ctx.inputCursorOffset,
 			},
 			nextActive: false,
-			nextLabel: displayLabel("next"),
+			nextLabel: ROW_INTENT_META.next.label,
 		};
 	}
 	const focused = ctx.activeView === "options";
@@ -34,7 +34,7 @@ export const selectMultiSelectProps: PerTabSelector<MultiSelectViewProps> = (sta
 	const otherActive = focused && state.optionIndex === question.options.length;
 	const nextActive = focused && state.optionIndex === question.options.length + 1;
 	const isLastQuestion = ctx.i === ctx.questions.length - 1;
-	const nextLabel = isLastQuestion ? MULTI_SUBMIT_LABEL : displayLabel("next");
+	const nextLabel = isLastQuestion ? MULTI_SUBMIT_LABEL : ROW_INTENT_META.next.label;
 	return {
 		rows,
 		other: {

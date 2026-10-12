@@ -5,7 +5,6 @@ import type { WrappingSelectItem } from "../view/components/wrapping-select.js";
 import { COLLAPSED_HINT } from "../view/dialog-builder.js";
 import type { QuestionnairePropsAdapter } from "../view/props-adapter.js";
 import { buildQuestionnaire } from "./build-questionnaire.js";
-import { t } from "./i18n-bridge.js";
 import { type QuestionnaireAction, routeKey } from "./key-router.js";
 import type { QuestionnaireRuntime, QuestionnaireState } from "./state.js";
 import { type ApplyContext, type Effect, reduce } from "./state-reducer.js";
@@ -108,7 +107,7 @@ export class QuestionnaireSession {
 		// behind it becomes readable (#47). The overlay stays focused and in the
 		// stack, so Ctrl+] still routes here to expand.
 		const collapsedRender = (_width: number): string[] => [
-			theme.fg("dim", ` ${t("hint.expand_line", COLLAPSED_HINT)} `),
+			theme.fg("dim", ` ${COLLAPSED_HINT} `),
 		];
 
 		this.component = {

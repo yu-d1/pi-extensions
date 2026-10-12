@@ -10,14 +10,11 @@ import { type Static, Type } from "typebox";
 
 export const TOOL_NAME = "todo";
 export const TOOL_LABEL = "Todo";
-export const COMMAND_NAME = "todos";
 
 // ---------------------------------------------------------------------------
 // User-facing strings (kept stable for /todos UX parity).
 // ---------------------------------------------------------------------------
 
-export const ERR_REQUIRES_INTERACTIVE = "/todos requires interactive mode";
-export const MSG_NO_TODOS = "No todos yet. Ask the agent to add some!";
 
 // ---------------------------------------------------------------------------
 // Public domain types
@@ -79,7 +76,10 @@ export interface TaskMutationParams {
 // ---------------------------------------------------------------------------
 
 export const TodoParamsSchema = Type.Object({
-	action: StringEnum(["create", "update", "list", "get", "delete", "clear"] as const),
+	action: StringEnum(["create", "update", "list", "get", "delete", "clear"] as const, {
+		description:
+			'Required on every call — never omit. One of: create, update, list, get, delete, clear. Examples: {"action":"create","subject":"…"} new task; {"action":"update","id":1,"status":"in_progress"} change status.',
+	}),
 	subject: Type.Optional(Type.String({ description: "Task subject line (required for create)" })),
 	description: Type.Optional(Type.String({ description: "Long-form task description" })),
 	activeForm: Type.Optional(

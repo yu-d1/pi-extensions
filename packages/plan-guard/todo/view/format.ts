@@ -1,14 +1,9 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { formatStatusLabel } from "../state/i18n-bridge.js";
 import { selectTaskSubjectById } from "../state/selectors.js";
 import type { TaskState } from "../state/state.js";
 import { sanitizeTerminalText } from "../tool/sanitize.js";
 import type { Task, TaskAction, TaskDetails, TaskMutationParams, TaskStatus } from "../tool/types.js";
-
-// Re-export so legacy import paths (todo.ts, tests) continue to resolve;
-// the canonical definition lives in the i18n bridge.
-export { formatStatusLabel };
 
 // ---------------------------------------------------------------------------
 // Status presentation tables — the single source of truth for glyph/color.
@@ -20,6 +15,18 @@ export const STATUS_GLYPH: Record<TaskStatus, string> = {
 	completed: "●",
 	deleted: "⊘",
 };
+
+/** English status labels — localization removed with the rpiv-i18n bridge. */
+const STATUS_LABEL: Record<TaskStatus, string> = {
+	pending: "pending",
+	in_progress: "in progress",
+	completed: "completed",
+	deleted: "deleted",
+};
+
+export function formatStatusLabel(status: TaskStatus): string {
+	return STATUS_LABEL[status];
+}
 
 /**
  * Color palette for the renderResult status echo. `deleted` uses `muted` so a

@@ -1,6 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, type Editor, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { t } from "../state/i18n-bridge.js";
 import { formatAnswerScalar } from "../tool/format-answer.js";
 import type { QuestionData } from "../tool/types.js";
 import type { PreviewPane, PreviewPaneProps } from "./components/preview/preview-pane.js";
@@ -123,7 +122,7 @@ export class QuestionTabStrategy implements TabContentStrategy {
 	midRows(state: DialogState): Component[] {
 		if (!state.notesVisible) return [];
 		return [
-			new Text(this.config.theme.fg("muted", t("notes.header", NOTES_HEADER)), 1, 0),
+			new Text(this.config.theme.fg("muted", NOTES_HEADER), 1, 0),
 			this.config.notesInput,
 			new Spacer(1),
 		];
@@ -163,7 +162,7 @@ export class SubmitTabStrategy implements TabContentStrategy {
 
 	headingRows(_state: DialogState): Component[] {
 		return [
-			new Text(this.config.theme.bold(this.config.theme.fg("accent", t("review.heading", REVIEW_HEADING))), 1, 0),
+			new Text(this.config.theme.bold(this.config.theme.fg("accent", REVIEW_HEADING)), 1, 0),
 			new Spacer(1),
 		];
 	}
@@ -205,10 +204,10 @@ export class SubmitTabStrategy implements TabContentStrategy {
 		}
 		const promptText =
 			missing.length === 0
-				? this.config.theme.fg("muted", t("review.ready", READY_PROMPT))
+				? this.config.theme.fg("muted", READY_PROMPT)
 				: this.config.theme.fg(
 						"warning",
-						`${t("review.incomplete", INCOMPLETE_WARNING_PREFIX)} ${missing.join(", ")}`,
+						`${INCOMPLETE_WARNING_PREFIX} ${missing.join(", ")}`,
 					);
 		const out: Component[] = [new Spacer(1), new Text(promptText, 1, 0), new Spacer(1)];
 		if (this.config.submitPicker) {
@@ -237,13 +236,13 @@ export class SubmitTabStrategy implements TabContentStrategy {
  * appended at the far right while input mode is active.
  */
 export function buildHintText(question: QuestionData | undefined, isMulti: boolean, state: DialogState): string {
-	const parts: string[] = [t("hint.enter", HINT_PART_ENTER), t("hint.navigate", HINT_PART_NAV)];
-	if (question?.multiSelect === true) parts.push(t("hint.toggle", HINT_PART_TOGGLE));
-	if (question && !state.notesVisible && !state.inputMode) parts.push(t("hint.notes", HINT_PART_NOTES));
-	if (isMulti) parts.push(t("hint.tab", HINT_PART_TAB));
-	parts.push(t("hint.cancel", HINT_PART_CANCEL));
-	parts.push(t("hint.collapse", HINT_PART_COLLAPSE));
-	if (state.notesVisible || state.inputMode) parts.push(t("hint.newline", HINT_PART_NEW_LINE));
+	const parts: string[] = [HINT_PART_ENTER, HINT_PART_NAV];
+	if (question?.multiSelect === true) parts.push(HINT_PART_TOGGLE);
+	if (question && !state.notesVisible && !state.inputMode) parts.push(HINT_PART_NOTES);
+	if (isMulti) parts.push(HINT_PART_TAB);
+	parts.push(HINT_PART_CANCEL);
+	parts.push(HINT_PART_COLLAPSE);
+	if (state.notesVisible || state.inputMode) parts.push(HINT_PART_NEW_LINE);
 	if (state.inputMode) parts.push(t("hint.clear", HINT_PART_CLEAR));
 	return parts.join(" · ");
 }
