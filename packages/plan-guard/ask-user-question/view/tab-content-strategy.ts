@@ -243,6 +243,6 @@ export function buildHintText(question: QuestionData | undefined, isMulti: boole
 	parts.push(HINT_PART_CANCEL);
 	parts.push(HINT_PART_COLLAPSE);
 	if (state.notesVisible || state.inputMode) parts.push(HINT_PART_NEW_LINE);
-	if (state.inputMode) parts.push(t("hint.clear", HINT_PART_CLEAR));
+	if (state.inputMode) parts.push(HINT_PART_CLEAR);
 	return parts.join(" · ");
 }
