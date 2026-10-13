@@ -695,6 +695,20 @@ export function streamCommandCodeGo(
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
+		/**
+		 * 事件携带的 `partial` 必须是**当帧快照**，不能是 output 的 live 引用。
+		 *
+		 * 上游 NDJSON 的 delta 是 burst 型（一次网络包塞几十个 text/thinking-delta），
+		 * 而 pi TUI 按帧渲染，消费慢于推送。若多个排队事件共享同一个 output 对象，
+		 * 消费时读到的都是“已被后续 delta 更新过”的同一份 mush 快照 —— 表现为
+		 * 思考看着流畅（到达节奏慢而均匀），正文却“一口气涌出”（瞬发密集）。
+		 * 逐帧浅拷贝切断引用，让每个事件保留自己的中间态。
+		 */
+		const snapshot = (): AssistantMessage => ({
+			...output,
+			content: output.content.map((b) => ({ ...(b as object) })) as AssistantMessage["content"],
+			usage: { ...output.usage, cost: { ...output.usage.cost } },
+		});
 
 		try {
 			const apiKey = options?.apiKey ?? "";
@@ -786,13 +800,13 @@ export function streamCommandCodeGo(
 
 			const endText = () => {
 				if (textIndex < 0) return;
-				stream.push({ type: "text_end", contentIndex: textIndex, content: textBuf, partial: output } as any);
+				stream.push({ type: "text_end", contentIndex: textIndex, content: textBuf, partial: snapshot() } as any);
 				textIndex = -1;
 				textBuf = "";
 			};
 			const endThinking = () => {
 				if (thinkingIndex < 0) return;
-				stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: thinkingBuf, partial: output } as any);
+				stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: thinkingBuf, partial: snapshot() } as any);
 				thinkingIndex = -1;
 				thinkingBuf = "";
 			};
@@ -813,7 +827,7 @@ export function streamCommandCodeGo(
 						output.content.push({ type: "text", text: "" } satisfies TextContent);
 						textIndex = output.content.length - 1;
 						textBuf = "";
-						stream.push({ type: "text_start", contentIndex: textIndex, partial: output } as any);
+						stream.push({ type: "text_start", contentIndex: textIndex, partial: snapshot() } as any);
 						break;
 					}
 					case "text-delta": {
@@ -821,11 +835,11 @@ export function streamCommandCodeGo(
 						if (textIndex < 0) {
 							output.content.push({ type: "text", text: "" } satisfies TextContent);
 							textIndex = output.content.length - 1;
-							stream.push({ type: "text_start", contentIndex: textIndex, partial: output } as any);
+							stream.push({ type: "text_start", contentIndex: textIndex, partial: snapshot() } as any);
 						}
 						textBuf += ev.text;
 						(output.content[textIndex] as TextContent).text = textBuf;
-						stream.push({ type: "text_delta", contentIndex: textIndex, delta: ev.text, partial: output } as any);
+						stream.push({ type: "text_delta", contentIndex: textIndex, delta: ev.text, partial: snapshot() } as any);
 						break;
 					}
 					case "text-end": {
@@ -838,7 +852,7 @@ export function streamCommandCodeGo(
 						output.content.push({ type: "thinking", thinking: "" } satisfies ThinkingContent);
 						thinkingIndex = output.content.length - 1;
 						thinkingBuf = "";
-						stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output } as any);
+						stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: snapshot() } as any);
 						break;
 					}
 					case "reasoning-delta": {
@@ -846,11 +860,11 @@ export function streamCommandCodeGo(
 						if (thinkingIndex < 0) {
 							output.content.push({ type: "thinking", thinking: "" } satisfies ThinkingContent);
 							thinkingIndex = output.content.length - 1;
-							stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output } as any);
+							stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: snapshot() } as any);
 						}
 						thinkingBuf += ev.text;
 						(output.content[thinkingIndex] as ThinkingContent).thinking = thinkingBuf;
-						stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta: ev.text, partial: output } as any);
+						stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta: ev.text, partial: snapshot() } as any);
 						break;
 					}
 					case "reasoning-end": {
@@ -869,7 +883,7 @@ export function streamCommandCodeGo(
 						} as ToolCall);
 						const index = output.content.length - 1;
 						toolBlocks.set(ev.id, { index, json: "" });
-						stream.push({ type: "toolcall_start", contentIndex: index, partial: output } as any);
+						stream.push({ type: "toolcall_start", contentIndex: index, partial: snapshot() } as any);
 						break;
 					}
 					case "tool-input-delta": {
@@ -877,7 +891,7 @@ export function streamCommandCodeGo(
 						const blk = toolBlocks.get(ev.id);
 						if (!blk || typeof ev.delta !== "string" || !ev.delta) break;
 						blk.json += ev.delta;
-						stream.push({ type: "toolcall_delta", contentIndex: blk.index, delta: ev.delta, partial: output } as any);
+						stream.push({ type: "toolcall_delta", contentIndex: blk.index, delta: ev.delta, partial: snapshot() } as any);
 						break;
 					}
 					case "tool-input-end": {
@@ -898,8 +912,8 @@ export function streamCommandCodeGo(
 						} as ToolCall);
 						const index = output.content.length - 1;
 						closedToolIds.add(ev.toolCallId);
-						stream.push({ type: "toolcall_start", contentIndex: index, partial: output } as any);
-						stream.push({ type: "toolcall_end", contentIndex: index, toolCall: output.content[index] as ToolCall, partial: output } as any);
+						stream.push({ type: "toolcall_start", contentIndex: index, partial: snapshot() } as any);
+						stream.push({ type: "toolcall_end", contentIndex: index, toolCall: output.content[index] as ToolCall, partial: snapshot() } as any);
 						break;
 					}
 					case "finish": {
@@ -935,7 +949,7 @@ export function streamCommandCodeGo(
 					}
 				}
 				(call as any).arguments = args;
-				stream.push({ type: "toolcall_end", contentIndex: blk.index, toolCall: call, partial: output } as any);
+				stream.push({ type: "toolcall_end", contentIndex: blk.index, toolCall: call, partial: snapshot() } as any);
 			}
 
 			for (;;) {
