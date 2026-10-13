@@ -2,9 +2,14 @@
  * 套餐配额查询 —— mimo（小米）
  * =============================================================================
  * 控制台账户余额：/api/v1/balance，凭据是网页登录 Cookie（不是推理用的 api key）。
- * Cookie 通过 Chrome + CDP 续期：弹出有头 Chrome 打开控制台，CDP 轮询到
- * serviceToken 就落盘并自动关窗；中途出错**不杀窗口**，让用户能从容登录，
- * 下次刷新走 reuse-running-instance 复用同一个实例再回收。
+ * Cookie 通过 Chrome + CDP 续期，分两级：
+ *   ① headless 静默续期：profile 里有小米 SSO 长期凭据 passToken 时，无头实例打开
+ *      控制台即可自动换到 api-platform_serviceToken（实测 0.3s），全程无窗口、无交互；
+ *   ② 有头登录：headless 拿不到（首次使用 / passToken 过期）才弹窗，CDP 轮询到
+ *      serviceToken 就落盘；中途出错**不杀窗口**，让用户能从容登录。
+ * 关键：收尾一律走 CDP Browser.close **优雅退出**，而不是 taskkill 强杀 —— passToken
+ * 是「随进程消亡」的会话凭据，只有 Chrome 正常退出才会落盘（有效期约 30 天）。强杀会让
+ * 它永远存不下来，表现为每次刷新都要重新登录。限时未退出才降级强杀。
  * 零 npm 依赖：WebSocket 用 Node 内置，CDP 协议手写。
  *
  * 两个曾把窗口秒退的坑，已在此规避：
@@ -13,12 +18,11 @@
  *      实例相同的端口号），拿死端口 fetch /json/version 直接 ECONNREFUSED，
  *      异常一路冒泡到 finally，把刚弹出的窗口 kill 掉。
  *      现在：spawn 前清陈旧端口，且读到后必须探活才算数。
- *   2. 无头实例与有头实例共用一个 --user-data-dir，被 kill 的无头 Chrome 会留下
- *      仍持有 profile 句柄的子进程，把紧接着启的有头窗口挤掉。
- *      现在：只保留有头阶段，不再有无头/有头争抢同一 profile。
+ *   2. 实例间争抢同一 --user-data-dir 会被转发后秒退。现在 headless 实例
+ *      结束后（优雅退出、等 exit 事件）才启有头实例，绝不并发。
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readlinkSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -49,8 +53,10 @@ const MIMO_LOGIN_RETRY_MS = 10 * 60_000;
 const MIMO_LOGIN_TIMEOUT_MS = 300_000;
 /** 关窗后等 Chrome 真正退出的上限（profile 句柄释放有延迟，立刻启下一个会被挤掉） */
 const MIMO_KILL_GRACE_MS = 3_000;
-/** cookie 有效期约 24h，提前 4h 主动续期（避免每天首个请求浪费一次 401） */
-const MIMO_COOKIE_TTL = 20 * 3600_000;
+/** headless 静默续期等待上限：passToken 有效时实测 0.3s 即命中，留足冷启动余量 */
+const MIMO_HEADLESS_WAIT_MS = 15_000;
+/** 优雅退出（CDP Browser.close）等待上限，超时才降级强杀 */
+const MIMO_GRACEFUL_CLOSE_MS = 8_000;
 /** 排查日志上限，超过即清空重建 */
 const MIMO_LOG_MAX_BYTES = 1_000_000;
 
@@ -87,7 +93,7 @@ export function mimoLog(step: string, detail = ""): void {
   } catch {}
 }
 
-/** 读 cookie 文件（含捕获时间）；兼容早期纯文本格式（capturedAt=0 视为需续期）。 */
+/** 读 cookie 文件（含捕获时间）；兼容早期纯文本格式（capturedAt=0 表示未知）。 */
 function readMimoCookieFile(): { cookie: string; capturedAt: number } | null {
   try {
     if (!existsSync(MIMO_COOKIE_FILE)) return null;
@@ -220,13 +226,29 @@ async function runMimoLogin(): Promise<boolean> {
   if (!chrome) return false;
   mkdirSync(MIMO_PROFILE_DIR, { recursive: true });
 
-  // 进行中只显示轻量状态行（完成即消失），失败才通知
+  // ① 先试 headless 静默续期：passToken 有效时无需任何交互（实测 0.3s 命中），用户无感。
+  try {
+    setQuotaStatus?.("mimo 续期检查中…");
+  } catch {}
+  mimoLog("login-headless-begin");
+  try {
+    if (await cdpCollectCookies(chrome, MIMO_HEADLESS_WAIT_MS, true)) {
+      try { setQuotaStatus?.(""); } catch {}
+      mimoLog("login-headless-ok", "静默续期成功");
+      return true;
+    }
+    mimoLog("login-headless-miss", "未拿到凭据，降级有头登录");
+  } catch (e: any) {
+    mimoLog("login-headless-error", String(e?.message ?? e));
+  }
+
+  // ② 降级有头：首次使用 / passToken 过期。进行中只显示轻量状态行，失败才通知
   try {
     setQuotaStatus?.("mimo 登录中：在 Chrome 窗口完成登录，完成后自动关闭");
   } catch {}
   mimoLog("login-headed-begin");
   try {
-    const ok = await cdpCollectCookies(chrome, MIMO_LOGIN_TIMEOUT_MS);
+    const ok = await cdpCollectCookies(chrome, MIMO_LOGIN_TIMEOUT_MS, false);
     try { setQuotaStatus?.(""); } catch {}
     mimoLog(ok ? "login-headed-ok" : "login-headed-unfinished");
     if (!ok) {
@@ -255,26 +277,6 @@ async function runMimoLogin(): Promise<boolean> {
   }
 }
 
-/**
- * profile 是否被一个「存活」的 Chrome 占用。
- * 存在两种情况：上一次没关干净（可复用它的调试端口）或用户正在里面登录。
- */
-function profileLockedByLiveProcess(): boolean {
-  try {
-    if (!existsSync(join(MIMO_PROFILE_DIR, "SingletonLock"))) return false;
-    const pid = Number(readlinkSync(join(MIMO_PROFILE_DIR, "SingletonLock")).replace(/^.*-/, ""));
-    if (!Number.isInteger(pid) || pid <= 0) return false;
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (e: any) {
-      return e?.code === "EPERM"; // 进程存在但无权限发信号
-    }
-  } catch {
-    return false;
-  }
-}
-
 /** 读 Chrome 写入的调试端口（无则空串） */
 function readDevToolsPort(): string {
   try {
@@ -288,16 +290,14 @@ function readDevToolsPort(): string {
 /**
  * 取「确实还活着」的 Chrome 实例的调试端口，无则返回空串。
  *
- * 不能只看 SingletonLock：该文件在 Windows 上可能不创建、或退化成普通文件，
- * 此时 readlinkSync 抛错 → 判定为无实例，实际上用户那个窗口还开着。
- * 结果是又去启一个 Chrome 抢同一 profile（转发后秒退），而且我们主动保留的
- * 窗口再也接不回来。因此用「端口能不能探活」做兜底判据 —— 能连上 /json/version
- * 就说明确实有个 Chrome 活着，与锁文件无关。
+ * 以端口探活为唯一判据：SingletonLock 在 Windows 上可能不创建、或退化成普通文件，
+ * readlinkSync 抛错只能说明「判不了」，不能据此断定没有活实例 —— 一旦误判，就会
+ * 再启一个 Chrome 去抢同一 profile（转发后秒退），且用户那个窗口再也接不回来。
+ * 能连上 /json/version 就说明确实有个 Chrome 活着，与锁文件无关。
  */
 async function liveDevToolsPort(): Promise<string> {
   const port = readDevToolsPort();
   if (!port) return "";
-  if (profileLockedByLiveProcess()) return port;
   return (await probeCdp(port, 1_500)) ? port : "";
 }
 
@@ -311,7 +311,8 @@ async function liveDevToolsPort(): Promise<string> {
  * 仅在确认没有活实例时清理；有活实例一律走 reuse 分支。
  */
 function cleanStaleProfileArtifacts(): void {
-  if (profileLockedByLiveProcess()) return;
+  // 调用方已确认没有活实例（liveDevToolsPort 探活失败），此处一律清理残留。
+  // 若还看 SingletonLock 决定清不清，锁文件判不了时会把残留留下，新实例会被转发后秒退。
   for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"]) {
     try { unlinkSync(join(MIMO_PROFILE_DIR, name)); } catch {}
   }
@@ -330,7 +331,7 @@ async function probeCdp(port: string, timeoutMs = 3_000): Promise<string | null>
 }
 
 /**
- * 杀 Chrome 并等它真正退出。
+ * 杀 Chrome 并等它真正退出（**仅作优雅退出的超时兜底**）。
  * Windows 上 proc.kill() 只是 TerminateProcess 主进程，zygote / network service 等
  * 子进程会变孤儿并继续持有 profile 句柄，导致紧接着启的窗口秒退；因此走
  * taskkill /T 杀整棵进程树，并等 exit 事件（上限 MIMO_KILL_GRACE_MS）。
@@ -352,17 +353,51 @@ async function killChromeTree(proc: any): Promise<void> {
 }
 
 /**
- * 启一个有头 Chrome 打开控制台页面，轮询等登录 cookie 出现。
+ * 优雅关闭 Chrome：先发 CDP Browser.close 让 Chrome 走正常退出流程，
+ * 小米的长期 SSO 凭据 passToken 才会落盘（有效期约 30 天）。
+ *
+ * 这是「登录一次、之后 headless 静默续期」的前提：taskkill 强杀会让 passToken
+ * 随进程内存消亡、永远存不下来，表现为每次刷新都要重新登录。
+ * 限时未退出（Chrome 卡住 / CDP 无响应）才降级 killChromeTree 强杀。
+ * 必须用**尚未关闭**的 ws 发指令，所以调用方不能先 ws.close()。
+ */
+async function gracefulCloseChrome(ws: any, proc: any): Promise<void> {
+  if (!proc?.pid) return;
+  const exited = new Promise<void>((resolve) => {
+    if (proc.exitCode !== null || proc.signalCode) return resolve();
+    proc.once("exit", () => resolve());
+  });
+  if (ws) {
+    try {
+      ws.send(JSON.stringify({ id: 999_999, method: "Browser.close" }));
+    } catch (e: any) {
+      mimoLog("graceful-close-send-error", String(e?.message ?? e));
+    }
+  }
+  const ok = await Promise.race([exited.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), MIMO_GRACEFUL_CLOSE_MS))]);
+  if (ok) {
+    mimoLog("graceful-close-ok", "Chrome 已优雅退出（passToken 有机会落盘）");
+    // profile 句柄释放略有延迟，立刻启下一个会被挤掉
+    await new Promise((r) => setTimeout(r, 300));
+  } else {
+    mimoLog("graceful-close-timeout", "未在限时内退出，降级强杀");
+    await killChromeTree(proc);
+  }
+}
+
+/**
+ * 启 Chrome 打开控制台页面，轮询等登录 cookie 出现。
+ * headless=true 时加 --headless=new：用于 passToken 有效时的静默续期（无窗口）。
  *
  * 取端口必须探活：DevToolsActivePort 是残留文件，读到即用会拿到上一轮的死端口，
  * fetch 失败后 finally 会把刚开的窗口 kill 掉 —— 这正是用户看到的「没登录就自动关闭」。
  *
  * 收尾分三种：
- *   - 拿到 cookie  → 关窗（正常路径）；
- *   - 等满 MIMO_LOGIN_TIMEOUT_MS → 关窗并提示；
+ *   - 拿到 cookie  → **优雅关窗**（正常路径，让 passToken 落盘）；
+ *   - 等满 waitMs   → 优雅关窗（headless 失败降级有头 / 用户一直没登录）；
  *   - 中途异常      → **保留窗口**，让用户继续登录，下次刷新走 reuse 分支回收。
  */
-async function cdpCollectCookies(chrome: string, waitMs: number): Promise<boolean> {
+async function cdpCollectCookies(chrome: string, waitMs: number, headless = false): Promise<boolean> {
   let proc: any;
   let ws: any;
   let reused = false;
@@ -382,11 +417,12 @@ async function cdpCollectCookies(chrome: string, waitMs: number): Promise<boolea
     // ② 没有活实例 → 清残留后启一个
     if (!port) {
       const args = [
+        ...(headless ? ["--headless=new"] : []),
         "--remote-debugging-port=0",
         `--user-data-dir=${MIMO_PROFILE_DIR}`,
         "--no-first-run",
         "--no-default-browser-check",
-        // 上一次是被 kill 强杀的，别弹「上次未正确关闭」的恢复气泡挡住页面
+        // 上一次是被强杀的，别弹「上次未正确关闭」的恢复气泡挡住页面
         "--disable-session-crashed-bubble",
         "--new-window",
         `${MIMO_BASE}/console/plan-manage`,
@@ -394,7 +430,7 @@ async function cdpCollectCookies(chrome: string, waitMs: number): Promise<boolea
       // 关键：必须先清掉上一轮残留的端口文件，否则下面的等待循环会 1ms 内读到它就 break
       cleanStaleProfileArtifacts();
       proc = spawn(chrome, args, { stdio: "ignore" });
-      mimoLog("chrome-spawned", `pid=${proc.pid}`);
+      mimoLog("chrome-spawned", `pid=${proc.pid} headless=${headless}`);
       const startDeadline = Date.now() + 15_000;
       let probeFailStreak = 0;
       while (Date.now() < startDeadline) {
@@ -470,12 +506,17 @@ async function cdpCollectCookies(chrome: string, waitMs: number): Promise<boolea
     settled = true;
     return false;
   } finally {
-    try { ws?.close(); } catch {}
     if (reused) {
-      // 复用的实例是用户/上次的进程，绝不能杀
-    } else if (settled) {
-      await killChromeTree(proc);
+      // 复用的实例是用户/上次的进程，绝不能杀；关掉 ws 即可
+      try { ws?.close(); } catch {}
+    } else if (settled || headless) {
+      // 有头异常时保留窗口供用户继续登录；headless 无窗口可留，一律优雅关闭，
+      // 否则残留无头实例会占住 profile，让紧接着的有头登录起不来。
+      // 优雅退出：发完 Browser.close 再关 ws，让 passToken 有机会落盘
+      await gracefulCloseChrome(ws, proc);
+      try { ws?.close(); } catch {}
     } else {
+      try { ws?.close(); } catch {}
       mimoLog("window-kept", "中途异常，保留 Chrome 窗口供用户继续登录（下次刷新复用）");
     }
   }
@@ -504,7 +545,7 @@ async function mimoApi(path: string, cookie: string): Promise<any> {
 
 /**
  * 查询账户余额（与 DeepSeek 套餐同款：只显金额）。
- * cookie 缺失 / 临近过期 / 401 时拉起 Chrome 续期一次后重试。
+ * cookie 缺失 / 服务端返回 401 时拉起 Chrome 续期一次后重试。
  */
 async function fetchMimoQuota(): Promise<{ amount: number }> {
   const run = async (cookie: string) => {
@@ -515,13 +556,16 @@ async function fetchMimoQuota(): Promise<{ amount: number }> {
   };
 
   const cred = readMimoCookieFile();
-  const fresh = !!cred && Date.now() - cred.capturedAt < MIMO_COOKIE_TTL;
-  if (cred && fresh) {
+  // 有凭据就直接用：只有服务端真的返回 401（凭据失效）才拉起浏览器重新登录。
+  // 不再按本地 capturedAt 提前续期 —— 凭据是内存态 session cookie，本地无从得知
+  // 真实有效期，提前续期只会平白多弹一次窗口（实测本地 20h 到期时 cookie 仍有效）。
+  if (cred) {
     try {
       return await run(cred.cookie);
     } catch (e: any) {
       // 只在登录过期时续期；网络 / 服务端错误不该拉起浏览器
       if (e?.message !== "__mimo_unauthorized__") throw e;
+      mimoLog("cookie-expired", "服务端返回 401，凭据已失效，需重新登录");
     }
   }
   // 退避期内：若用户之前那个 Chrome 窗口还开着（可能正在登录），仍允许复用它，
@@ -534,11 +578,11 @@ async function fetchMimoQuota(): Promise<{ amount: number }> {
     }
     mimoLog("backoff-bypass-live", `退避期内检测到活实例 port=${livePort}，直接复用`);
   }
-  mimoLog("login-required", cred ? (fresh ? "cookie 已失效" : "cookie 临近过期，主动续期") : "无 cookie");
+  mimoLog("login-required", cred ? "cookie 已失效（服务端 401）" : "无 cookie");
   const ok = await silentMimoLogin();
   mimoLoginBlockedUntil = ok ? 0 : Date.now() + MIMO_LOGIN_RETRY_MS;
   if (ok) return run(readMimoCookie());
-  // 保守 TTL 提前续期失败时，旧 cookie 可能仍在有效期内，最后兜底试一次
+  // 登录未完成（窗口被关 / 超时）时，旧 cookie 可能仍被服务端认可，最后兜底试一次
   if (cred) {
     try { return await run(cred.cookie); } catch {}
   }
