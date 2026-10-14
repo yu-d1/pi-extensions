@@ -157,8 +157,13 @@ export default function planGuardExtension(pi: ExtensionAPI) {
 
   // ── 持久化 ──────────────────────────────────────────
 
+  // 快照必须自包含：undefined 字段会被 JSON 省略，所以未配置的一侧也要显式写 null。
   const persistState = () => {
-    pi.appendEntry("plan-guard-state", state);
+    pi.appendEntry("plan-guard-state", {
+      mode: state.mode,
+      planModelId: state.planModelId ?? null,
+      actModelId: state.actModelId ?? null,
+    });
   };
 
   const restoreState = (ctx: ExtensionContext) => {
@@ -166,11 +171,13 @@ export default function planGuardExtension(pi: ExtensionAPI) {
     const saved = [...entries]
       .reverse()
       .find((e: any) => e.type === "custom" && e.customType === "plan-guard-state") as any;
-    if (saved?.data) {
-      state.mode = saved.data.mode === "plan" ? "plan" : "act";
-      state.planModelId = saved.data.planModelId;
-      state.actModelId = saved.data.actModelId;
-    }
+    const data = saved?.data;
+    if (!data) return;
+    state.mode = data.mode === "plan" ? "plan" : "act";
+    // 只覆盖快照里存在的字段：旧版写的 mode-only 快照没有模型字段，
+    // 无条件赋值会把它们置成 undefined，丢掉已配置的模式偏好。
+    if ("planModelId" in data) state.planModelId = data.planModelId ?? undefined;
+    if ("actModelId" in data) state.actModelId = data.actModelId ?? undefined;
   };
 
   // ── UI ──────────────────────────────────────────────
@@ -194,25 +201,54 @@ export default function planGuardExtension(pi: ExtensionAPI) {
 
   // ── 模型自动切换 ────────────────────────────────────
 
+  /**
+   * 程序化切模型的深度计数。
+   *
+   * pi 的 extensionRunner.emit 逐个 `await handler(...)`，且 _emitModelSelect
+   * 被 setModel await，所以 `await pi.setModel()` 返回时 model_select handler
+   * 必已执行完 —— 同步计数即可可靠区分「本扩展切的」与「用户在 /model 里选的」。
+   * 事件本身无从判断：两者触发的 source 都是 "set"。
+   */
+  let switchingModelDepth = 0;
+
+  /**
+   * 让 targetMode 的偏好对齐当前模型。返回 true 表示状态已变，
+   * 由调用方统一落库（一次模式切换最多追加一条快照）。
+   */
   const switchModelForMode = async (ctx: ExtensionContext, targetMode: "plan" | "act") => {
     const targetModelId = targetMode === "plan" ? state.planModelId : state.actModelId;
-    if (!targetModelId) return;
+    if (!targetModelId) {
+      // 首次进入该模式且无偏好：把当前模型播种为该模式偏好。
+      // 缺这一步则另一模式永远为空，切换时静默沿用当前模型，
+      // 表现上就是「两个模式没有各自配置」。当前模型不变，下次切换才生效。
+      if (!ctx.model) return false;
+      const currentModelId = `${ctx.model.provider}/${ctx.model.id}`;
+      if (targetMode === "plan") state.planModelId = currentModelId;
+      else state.actModelId = currentModelId;
+      return true;
+    }
     const slashIdx = targetModelId.indexOf("/");
-    if (slashIdx === -1) return;
+    if (slashIdx === -1) return false;
     // 当前已是目标模型时跳过，避免无意义的 setModel 调用
-    if (ctx.model && `${ctx.model.provider}/${ctx.model.id}` === targetModelId) return;
+    if (ctx.model && `${ctx.model.provider}/${ctx.model.id}` === targetModelId) return false;
     const model = ctx.modelRegistry.find(
       targetModelId.slice(0, slashIdx),
       targetModelId.slice(slashIdx + 1),
     );
     if (!model) {
       ctx.ui.notify(`找不到模型 ${targetModelId}，请重新选择`, "error");
-      return;
+      return false;
     }
-    const ok = await pi.setModel(model);
-    if (!ok) {
-      ctx.ui.notify(`模型 ${targetModelId} 无可用 API key`, "error");
+    switchingModelDepth++;
+    try {
+      const ok = await pi.setModel(model);
+      if (!ok) {
+        ctx.ui.notify(`模型 ${targetModelId} 无可用 API key`, "error");
+      }
+    } finally {
+      switchingModelDepth--;
     }
+    return false;
   };
 
   // ── 切换核心 ────────────────────────────────────────
@@ -220,12 +256,18 @@ export default function planGuardExtension(pi: ExtensionAPI) {
   const toggleMode = async (ctx: ExtensionContext) => {
     state.mode = state.mode === "plan" ? "act" : "plan";
     updateUI(ctx);
-    persistState();
     if (execRun) {
       const c = todoCounts(ctx);
       finishExec(ctx, `已切换模式，自动执行中止（完成 ${c.done}/${c.total}）`);
     }
-    await switchModelForMode(ctx, state.mode);
+    // 统一在此落库：switchModelForMode 不再自行持久化（播种的偏好一并写入），
+    // model_select 又被深度计数挡掉，故一次切换恰好一条快照。
+    // try/finally 保证 setModel 抛错时模式变更也不会丢。
+    try {
+      await switchModelForMode(ctx, state.mode);
+    } finally {
+      persistState();
+    }
   };
 
 
@@ -516,12 +558,17 @@ export default function planGuardExtension(pi: ExtensionAPI) {
     }
   });
 
-  // ── 模型偏好追踪（自动记录各模式下的模型选择）───────
-  // 注意：source 为 "restore"（pi 会话恢复时自动恢复上次模型）不记录，
-  // 否则会把恢复的模型误写进当前模式的偏好，污染 planModelId/actModelId。
+  // ── 模型偏好追踪（只记用户显式选择的模型）───────────
+  // 两道闸：
+  // 1) switchingModelDepth > 0 —— 本扩展切模式模型触发的也是 source "set"，
+  //    事件本身区分不了，必须靠深度计数挡掉，否则切模式会把目标模型
+  //    回写成当前模式的偏好（自我覆盖）。
+  // 2) source === "restore" —— 会话恢复路径，防御性保留。
+  // 残留风险：pi 内部 fallback/故障转移同样发 source "set"，仍会被记入。
 
   pi.on("model_select", async (event) => {
     if (!event.model || event.source === "restore") return;
+    if (switchingModelDepth > 0) return;
     const modelId = `${event.model.provider}/${event.model.id}`;
     if (state.mode === "plan") {
       if (state.planModelId === modelId) return;
@@ -539,6 +586,8 @@ export default function planGuardExtension(pi: ExtensionAPI) {
     restoreState(ctx);
     updateUI(ctx);
     // 恢复该模式对应的偏好模型（幂等：与当前模型相同则跳过）
-    await switchModelForMode(ctx, state.mode);
+    const seeded = await switchModelForMode(ctx, state.mode);
+    // 仅在播种出新偏好时落库，避免每次 resume 都追加一条冗余快照
+    if (seeded) persistState();
   });
 }
