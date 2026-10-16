@@ -57,6 +57,12 @@ const MIMO_KILL_GRACE_MS = 3_000;
 const MIMO_HEADLESS_WAIT_MS = 15_000;
 /** 优雅退出（CDP Browser.close）等待上限，超时才降级强杀 */
 const MIMO_GRACEFUL_CLOSE_MS = 8_000;
+/**
+ * serviceToken 主动换票阈值。服务端寿命约 48h（实测 10-12 08:58 签发、
+ * 10-14 09:23 首次 401），取一半做余量：到点就静默换一次票，用户不会撞上 401。
+ * 换票失败不影响现状 —— 旧票可能仍被服务端认可。
+ */
+const MIMO_TOKEN_REFRESH_MS = 24 * 3600_000;
 /** 排查日志上限，超过即清空重建 */
 const MIMO_LOG_MAX_BYTES = 1_000_000;
 
@@ -114,6 +120,16 @@ function readMimoCookieFile(): { cookie: string; capturedAt: number } | null {
 
 function readMimoCookie(): string {
   return readMimoCookieFile()?.cookie ?? "";
+}
+
+/**
+ * 取出当前 cookie 里的 api-platform_serviceToken 值，用于判断续期是否真换了新票。
+ * 取值口径必须和 writeMimoCookie 一致（都去掉引号）：Chrome 会把服务端 Set-Cookie
+ * 带的引号保留在 value 里，不归一化的话同一个 token 也会被判定成「换了新的」。
+ */
+function readMimoServiceToken(): string {
+  const m = /(?:^|;\s*)api-platform_serviceToken="([^"]*)"/.exec(readMimoCookie());
+  return m?.[1] ?? "";
 }
 
 function writeMimoCookie(cookie: string): void {
@@ -203,24 +219,62 @@ function cdpGetCookies(wsUrl: string, timeoutMs: number): Promise<any[]> {
 }
 
 /**
+ * 取 SSO 登录直链。平台自己不渲染登录表单，登录态由小米账号 SSO 发票：
+ * /api/v1/genLoginUrl 会 302 到 account.xiaomi.com/pass/serviceLogin，并带上服务端
+ * 签名好的 callback（指向 /sts?sign=…）。浏览器访问这个链接，passToken 有效时自动
+ * 过检并换到新的 api-platform_serviceToken（实测约 0.8s）。
+ */
+async function genMimoLoginUrl(): Promise<string> {
+  try {
+    const r = await fetch(`${MIMO_BASE}/api/v1/genLoginUrl?currentPath=%2Fconsole%2Fplan-manage`, {
+      redirect: "manual",
+      headers: { Accept: "application/json, text/plain, */*", Referer: MIMO_BASE + "/", Origin: MIMO_BASE },
+      signal: AbortSignal.timeout(8_000),
+    });
+    const loc = r.headers.get("location");
+    return loc && loc.startsWith("http") ? loc : "";
+  } catch {
+    return "";
+  }
+}
+
+/** 在浏览器里新开一个标签页访问指定 URL（浏览器级命令，无需 attach 到页面） */
+function cdpCreateTarget(wsUrl: string, url: string, timeoutMs = 5_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(wsUrl);
+    const timer = setTimeout(() => { try { ws.close(); } catch {} resolve(false); }, timeoutMs);
+    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: "Target.createTarget", params: { url } }));
+    ws.onmessage = (ev: any) => {
+      let msg: any;
+      try { msg = JSON.parse(typeof ev.data === "string" ? ev.data : String(ev.data)); } catch { return; }
+      if (msg.id !== 1) return;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      resolve(!msg.error);
+    };
+    ws.onerror = () => { clearTimeout(timer); resolve(false); };
+  });
+}
+
+/**
  * 弹有头 Chrome 窗口让用户登录控制台，CDP 轮询到 serviceToken 就落盘并自动关窗。
  *
  * 单飞：定时刷新 / provider 变化 / 手动刷新可能同时打进来，重复启 Chrome 会互相
  * 抢 profile，表现为窗口刚弹出就被另一个实例挤掉。这里共用同一个 in-flight Promise。
  */
-async function silentMimoLogin(): Promise<boolean> {
+async function silentMimoLogin(prevToken = ""): Promise<boolean> {
   if (mimoLoginInFlight) {
     mimoLog("login-inflight-reuse", "登录流程进行中，复用同一个窗口");
     return mimoLoginInFlight;
   }
-  const p = runMimoLogin().finally(() => {
+  const p = runMimoLogin(prevToken).finally(() => {
     mimoLoginInFlight = null;
   });
   mimoLoginInFlight = p;
   return p;
 }
 
-async function runMimoLogin(): Promise<boolean> {
+async function runMimoLogin(prevToken = ""): Promise<boolean> {
   const chrome = findChrome();
   mimoLog("login-begin", `chrome=${chrome ?? "未找到"}`);
   if (!chrome) return false;
@@ -232,7 +286,7 @@ async function runMimoLogin(): Promise<boolean> {
   } catch {}
   mimoLog("login-headless-begin");
   try {
-    if (await cdpCollectCookies(chrome, MIMO_HEADLESS_WAIT_MS, true)) {
+    if (await cdpCollectCookies(chrome, MIMO_HEADLESS_WAIT_MS, true, prevToken)) {
       try { setQuotaStatus?.(""); } catch {}
       mimoLog("login-headless-ok", "静默续期成功");
       return true;
@@ -248,7 +302,7 @@ async function runMimoLogin(): Promise<boolean> {
   } catch {}
   mimoLog("login-headed-begin");
   try {
-    const ok = await cdpCollectCookies(chrome, MIMO_LOGIN_TIMEOUT_MS, false);
+    const ok = await cdpCollectCookies(chrome, MIMO_LOGIN_TIMEOUT_MS, false, prevToken);
     try { setQuotaStatus?.(""); } catch {}
     mimoLog(ok ? "login-headed-ok" : "login-headed-unfinished");
     if (!ok) {
@@ -397,13 +451,17 @@ async function gracefulCloseChrome(ws: any, proc: any): Promise<void> {
  *   - 等满 waitMs   → 优雅关窗（headless 失败降级有头 / 用户一直没登录）；
  *   - 中途异常      → **保留窗口**，让用户继续登录，下次刷新走 reuse 分支回收。
  */
-async function cdpCollectCookies(chrome: string, waitMs: number, headless = false): Promise<boolean> {
+async function cdpCollectCookies(chrome: string, waitMs: number, headless = false, prevToken = ""): Promise<boolean> {
   let proc: any;
   let ws: any;
   let reused = false;
   /** 已明确收尾（拿到 cookie / 等满超时 / 启动阶段失败）才关窗；异常中断一律保留 */
   let settled = false;
   try {
+    // SSO 登录直链。必须主动访问它：只靠启动参数打开控制台首页是不够的 ——
+    // 页面看到 profile 里还躺着那个已过期的 serviceToken，就认为已登录、不再跳
+    // serviceLogin，实测等 20s token 也毫无变化，续期从未真正发生过。
+    const loginUrl = await genMimoLoginUrl();
     let port = "";
     let wsUrl = "";
     // ① 已有 Chrome 正占用该 profile：直接复用它的调试端口，
@@ -424,8 +482,8 @@ async function cdpCollectCookies(chrome: string, waitMs: number, headless = fals
         "--no-default-browser-check",
         // 上一次是被强杀的，别弹「上次未正确关闭」的恢复气泡挡住页面
         "--disable-session-crashed-bubble",
-        "--new-window",
-        `${MIMO_BASE}/console/plan-manage`,
+        // 有登录直链时不开默认页：下面用 Target.createTarget 精确控制访问哪个 URL
+        ...(loginUrl ? [] : ["--new-window", `${MIMO_BASE}/console/plan-manage`]),
       ];
       // 关键：必须先清掉上一轮残留的端口文件，否则下面的等待循环会 1ms 内读到它就 break
       cleanStaleProfileArtifacts();
@@ -483,6 +541,13 @@ async function cdpCollectCookies(chrome: string, waitMs: number, headless = fals
       ws.onerror = () => { clearTimeout(t); reject(new Error("CDP 连接失败")); };
     });
 
+    // 关键一步：访问 SSO 登录直链，逼着重新走一次换票。passToken 有效时自动过检，
+    // 无需任何交互；失效时落到小米登录页，由用户手动登录（有头模式）。
+    if (loginUrl) {
+      const ok = await cdpCreateTarget(wsUrl, loginUrl);
+      mimoLog("sso-target", ok ? `已访问登录直链 ${loginUrl.slice(0, 48)}…` : "创建登录标签页失败，等待页面自行跳转");
+    }
+
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline) {
       let cookies: any[] = [];
@@ -494,13 +559,23 @@ async function cdpCollectCookies(chrome: string, waitMs: number, headless = fals
         return false;
       }
       const keep = cookies.filter((c: any) => MIMO_COOKIE_NAMES.includes(c?.name));
-      if (keep.some((c: any) => c.name === "api-platform_serviceToken")) {
+      const rawToken = keep.find((c: any) => c.name === "api-platform_serviceToken")?.value;
+      // 与 writeMimoCookie 同样去掉引号再比：Chrome 会把服务端 Set-Cookie 带的引号
+      // 保留在 value 里，不归一化时「同一个 token」也会被判定成换了新的。
+      const token = rawToken ? String(rawToken).replace(/"/g, "") : "";
+      // 成功条件不是「有 token」而是「token 换了新的」。它是 session cookie 却被 Chrome
+      // 落盘，重启后原样读回旧值；只判存在时等待循环第一轮（约 60ms）就命中，而页面
+      // 此时还没走完 SSO 换票 —— 结果每次都把同一个已过期的 token 又写回文件，表现为
+      // 「静默续期成功，但两天后照样 401」，且退避永远不生效（一天空转 200+ 次）。
+      // 判「换了新的」就会一直等到 SSO 真的换票完成（实测约 1.4s）。
+      if (token && token !== prevToken) {
         writeMimoCookie(keep.map((c: any) => `${c.name}="${String(c.value).replace(/"/g, "")}"`).join("; "));
-        mimoLog("cookie-captured", `${keep.length} 个`);
+        mimoLog("cookie-captured", `${keep.length} 个（serviceToken ${prevToken ? "已换新" : "首次获取"}）`);
         settled = true;
         return true;
       }
-      await new Promise((r) => setTimeout(r, 1500));
+      // headless 要尽快发现换票完成（实测约 1.4s），有头是等用户扫码，不必那么密
+      await new Promise((r) => setTimeout(r, headless ? 300 : 1500));
     }
     // 等满仍没抓到：属于「用户一直没登录」，关窗并提示（下次会重新弹）
     settled = true;
@@ -555,8 +630,26 @@ async function fetchMimoQuota(): Promise<{ amount: number }> {
     return { amount: isFinite(amount) ? amount : 0 };
   };
 
-  const cred = readMimoCookieFile();
-  // 有凭据就直接用：只有服务端真的返回 401（凭据失效）才拉起浏览器重新登录。
+  let cred = readMimoCookieFile();
+
+  // ① 凭据临近过期时先静默换票，用户就不会撞上 401。失败不破坏现状：旧票可能仍被
+  //    服务端认可，照常往下走；退避也在这里置上，否则每隔一个刷新周期就白拉一次 Chrome。
+  if (cred?.capturedAt && Date.now() - cred.capturedAt > MIMO_TOKEN_REFRESH_MS && Date.now() >= mimoLoginBlockedUntil) {
+    const fresh = await refreshMimoToken();
+    if (fresh) {
+      // 后续分支一律改用新凭据：新票仍被拒时若拿旧票再试一遍，只是白费一次请求
+      cred = fresh;
+      try {
+        return await run(fresh.cookie);
+      } catch (e: any) {
+        if (e?.message !== "__mimo_unauthorized__") throw e;
+        mimoLog("refresh-still-401", "换到的新票仍被服务端拒绝，回退旧凭据");
+        mimoLoginBlockedUntil = Date.now() + MIMO_LOGIN_RETRY_MS;
+      }
+    }
+  }
+
+  // ② 有凭据就直接用：只有服务端真的返回 401（凭据失效）才拉起浏览器重新登录。
   // 不再按本地 capturedAt 提前续期 —— 凭据是内存态 session cookie，本地无从得知
   // 真实有效期，提前续期只会平白多弹一次窗口（实测本地 20h 到期时 cookie 仍有效）。
   if (cred) {
@@ -579,14 +672,45 @@ async function fetchMimoQuota(): Promise<{ amount: number }> {
     mimoLog("backoff-bypass-live", `退避期内检测到活实例 port=${livePort}，直接复用`);
   }
   mimoLog("login-required", cred ? "cookie 已失效（服务端 401）" : "无 cookie");
-  const ok = await silentMimoLogin();
+  // prevToken 传当前值：只有真换到新票才算续期成功。不传就会把磁盘上的死 token
+  // 又读一遍当成成功，陷入「401 → 拉 Chrome → 还是 401」的死循环。
+  const ok = await silentMimoLogin(readMimoServiceToken());
   mimoLoginBlockedUntil = ok ? 0 : Date.now() + MIMO_LOGIN_RETRY_MS;
-  if (ok) return run(readMimoCookie());
+  if (ok) {
+    try {
+      return await run(readMimoCookie());
+    } catch (e: any) {
+      if (e?.message !== "__mimo_unauthorized__") throw e;
+      // 刚换的新票仍被拒：服务端会话异常。若就此抛出，index.ts 的兜底会把
+      // "__mimo_unauthorized__" 当普通错误渲染成 `❌ __mimo_unauthorized__` 显示在状态行。
+      // 降级成静默错误并退避，避免下一轮定时器立刻再拉一次 Chrome。
+      mimoLog("relogin-still-401", "新换到的凭据仍被服务端拒绝");
+      mimoLoginBlockedUntil = Date.now() + MIMO_LOGIN_RETRY_MS;
+    }
+  }
   // 登录未完成（窗口被关 / 超时）时，旧 cookie 可能仍被服务端认可，最后兜底试一次
   if (cred) {
     try { return await run(cred.cookie); } catch {}
   }
   throw silentError("mimo 登录态不可用");
+}
+
+/**
+ * 静默换一次票：只有真拿到「新的」serviceToken 才算成功（判定逻辑在
+ * cdpCollectCookies 里，靠值变化而非存在性）。失败时置退避。
+ */
+async function refreshMimoToken(): Promise<{ cookie: string; capturedAt: number } | null> {
+  mimoLog("token-aging", "凭据临近过期，尝试静默换票");
+  try {
+    if (await silentMimoLogin(readMimoServiceToken())) {
+      const fresh = readMimoCookieFile();
+      if (fresh) return fresh;
+    }
+  } catch (e: any) {
+    mimoLog("refresh-error", String(e?.message ?? e));
+  }
+  mimoLoginBlockedUntil = Date.now() + MIMO_LOGIN_RETRY_MS;
+  return null;
 }
 
 // ── 前置检查 ────────────────────────────────────────────────────────────
