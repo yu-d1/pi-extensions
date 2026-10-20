@@ -32,6 +32,7 @@ import {
 	CCGO_LABEL,
 	CCGO_PROVIDER_ID,
 	DEFAULT_CCGO,
+	fetchCommandCodeGoModels,
 	asCommandCodeGoConfig,
 	buildCommandCodeGoConfig,
 	setCommandCodeGoConfig,
@@ -927,10 +928,28 @@ async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void
 		} catch {
 			key = undefined;
 		}
-		// 内置 MiniMax 的模型目录固定走官方 /v1（OpenAI 兼容 /models）。
-		const apiType = entry.kind === "builtin" ? "openai-completions" : entry.api;
-		const baseUrl = entry.kind === "builtin" ? MINIMAX_BASE_URL : entry.baseUrl;
-		const list = await fetchModelsByApi(apiType, baseUrl, key);
+		let list: StoredModel[];
+		if (entry.kind === "builtin" && entry.name === "commandcodego") {
+			// Command Code GO 的模型目录在 {baseUrl}/provider/v1/models，与内置 MiniMax 既不同站也不同路径，
+			// 必须走它自己的拉取函数；套用 MiniMax 的 /v1/models 会拿 GO 的 key 打 MiniMax，必然认证失败。
+			const remote = await fetchCommandCodeGoModels(key, entry.commandcodeGo.baseUrl);
+			if (remote.length === 0) {
+				throw new Error(`${entry.commandcodeGo.baseUrl}/provider/v1/models 返回为空，请先 /login 登录 Command Code GO 账号`);
+			}
+			// 不写 reasoning/thinkingLevelMap：注册时 buildCommandCodeGoConfig 会补 CCGO 专属档位映射。
+			list = remote.map((m) => ({
+				id: m.id,
+				name: m.name || m.id,
+				input: normalizeInput(m.input),
+				...(m.contextWindow > 0 ? { contextWindow: m.contextWindow } : {}),
+				enabled: false,
+			}));
+		} else {
+			// 内置 MiniMax 的模型目录固定走官方 /v1（OpenAI 兼容 /models）。
+			const apiType = entry.kind === "builtin" ? "openai-completions" : entry.api;
+			const baseUrl = entry.kind === "builtin" ? MINIMAX_BASE_URL : entry.baseUrl;
+			list = await fetchModelsByApi(apiType, baseUrl, key);
+		}
 		const knownIds = new Set(entry.models.map((m) => m.id));
 		const added = list.filter((m) => !knownIds.has(m.id)).length;
 		entry.models = mergeModels(entry.models, list);
@@ -1461,8 +1480,8 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 	while (true) {
 		const enabledCount = entry.models.filter(isModelEnabled).length;
 		const items = [
-			// 内置 MiniMax 独有：参数配置菜单（思考模式/服务层级/温度等）。
-			...(entry.kind === "builtin" ? ["配置管理"] : []),
+			// 配置管理目前只有内置 MiniMax 有参数菜单；commandcodego 不展示，避免误入 MiniMax 配置。
+			...(entry.kind === "builtin" && entry.name === "minimax_local" ? ["配置管理"] : []),
 			"启用模型",
 			"刷新模型",
 			"新增模型",
