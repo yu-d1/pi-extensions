@@ -1,0 +1,1897 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token 统计</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --border: #e3e6ea;
+  --text: #1f2328;
+  --text-dim: #6b7280;
+  --text-faint: #9aa1ab;
+  --accent: #2f6feb;
+  --accent-soft: #e8effd;
+  --good: #1a7f45;
+  --mid: #b06a00;
+  --bad: #c0392b;
+  --grid: #eceef1;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --panel: #1e2127;
+    --border: #2c313a;
+    --text: #e6e8eb;
+    --text-dim: #98a0ab;
+    --text-faint: #6b7280;
+    --accent: #6ea8ff;
+    --accent-soft: #1d2939;
+    --good: #4ade80;
+    --mid: #fbbf24;
+    --bad: #f87171;
+    --grid: #262b33;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 24px 28px 64px;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+.wrap { max-width: 1240px; margin: 0 auto; }
+h1 { margin: 0 0 4px; font-size: 20px; font-weight: 650; letter-spacing: -.2px; }
+.head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+.sub { color: var(--text-dim); font-size: 12.5px; }
+/* 服务状态卡：固定在右上角，紧凑三行——状态 / 时间信息 / 操作 */
+/* 固定宽度：内容变化（状态字长度、时间字符串）不能改变卡片尺寸 */
+.svc {
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 11px 14px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; font-size: 12.5px;
+  width: 470px; flex: 0 0 470px; box-sizing: border-box;
+  position: relative;
+}
+.svc-row { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+.svc .dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint);
+  flex: 0 0 auto; transition: background .2s;
+}
+.svc .dot.on {
+  background: var(--good);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent);
+}
+.svc .dot.err { background: var(--bad); }
+.svc .dot.wait { background: var(--mid); }
+/* 状态字右对齐并锁定最小宽度：不同文案（运行中/未连接/统计出错）不改变布局 */
+.svc-name { color: var(--text-faint); }
+.svc-val {
+  font-weight: 600; margin-left: auto; font-variant-numeric: tabular-nums;
+  min-width: 66px; text-align: right;
+}
+.svc-val.on { color: var(--good); }
+.svc-val.off { color: var(--text-dim); }
+.svc-val.err { color: var(--bad); }
+/* 固定两行高度：时间信息行数变化不改变卡片高度 */
+.svc-meta {
+  color: var(--text-dim); font-size: 11.5px; line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+  height: 36px; overflow: hidden;
+}
+/* 操作失败的红色提示：短暂闪烁后自动淡出，不打断阅读（替代 alert 弹窗） */
+/* 错误浮层：绝对定位于卡片下方，显示时不改变卡片宽高 */
+.svc-err {
+  display: none; position: absolute; left: 0; right: 0; top: calc(100% + 6px);
+  z-index: 25; font-size: 11.5px; line-height: 1.5; color: var(--bad);
+  padding: 6px 9px; border-radius: 6px; word-break: break-all;
+  background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .16);
+}
+.svc-err.show { display: block; animation: svcFlash 1.4s ease-out; }
+@keyframes svcFlash {
+  0%   { background: color-mix(in srgb, var(--bad) 42%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 30%, transparent); }
+  40%  { background: color-mix(in srgb, var(--bad) 10%, transparent); box-shadow: 0 0 0 0 transparent; }
+  70%  { background: color-mix(in srgb, var(--bad) 34%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 24%, transparent); }
+  100% { background: color-mix(in srgb, var(--bad) 12%, transparent); box-shadow: 0 0 0 0 transparent; }
+}
+/* 面板整体也闪一下边框，让错误更显眼 */
+.svc.failed { animation: svcPulse 1s ease-out; }
+@keyframes svcPulse {
+  0%, 100% { border-color: var(--border); }
+  25%      { border-color: var(--bad); }
+  60%      { border-color: color-mix(in srgb, var(--bad) 50%, var(--border)); }
+}
+.svc-act { display: flex; gap: 6px; align-items: center; height: 26px; flex-wrap: nowrap; }
+/* nowrap + 不收缩：按钮文字永不断行，操作栏高度恒定 */
+.svc-btn {
+  font: inherit; font-size: 12px; padding: 4px 11px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  cursor: pointer; transition: border-color .15s, color .15s, background .15s;
+  white-space: nowrap; flex: 0 0 auto; line-height: 16px;
+}
+.svc-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.svc-btn:disabled { opacity: .45; cursor: default; }
+.svc-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.svc-btn.primary:hover:not(:disabled) { background: var(--accent); color: #fff; opacity: .88; }
+.svc-btn.stop:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+.svc-btn.busy .ico { animation: spin .9s linear infinite; display: inline-block; }
+.svc-sel {
+  font: inherit; font-size: 12px; padding: 4px 7px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer;
+  white-space: nowrap; flex: 0 0 auto; line-height: 16px;
+}
+@media (max-width: 900px) {
+  /* 窄屏放不下四个控件：允许操作栏换行，但卡片宽度仍占满，高度由内容决定 */
+  .svc { width: 100%; flex: 1 1 100%; }
+  .svc-act { height: auto; flex-wrap: wrap; }
+}
+/* 日期筛选：日期框常显 + 右侧快捷按钮 */
+.dates {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px;
+  padding: 9px 13px; background: var(--panel); border: 1px solid var(--border); border-radius: 9px;
+  font-size: 12.5px; color: var(--text-dim);
+}
+.dates .label { color: var(--text-faint); }
+.dates input[type=date] {
+  font: inherit; font-size: 12.5px; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.dates .sep { color: var(--text-faint); }
+.dates .apply {
+  font: inherit; font-size: 12px; padding: 4px 12px; border-radius: 5px;
+  border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer;
+}
+.dates .quick { display: flex; gap: 4px; margin-left: auto; }
+.dates .quick button {
+  font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text-dim); cursor: pointer;
+}
+.dates .quick button:hover { color: var(--accent); border-color: var(--accent); }
+.dates .quick button.on { color: #fff; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 11px; padding: 16px 18px; margin-bottom: 16px; }
+/* 趋势 + 热力图 并排 */
+.row2 { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
+.row2 .card { margin-bottom: 0; }
+.row2 .col-trend { flex: 7 1 0; min-width: 0; }
+/* 热力图占约 3/10（原等分宽度的 3/5）：单月 5~6 列仍能铺满，格子不至于过大 */
+.row2 .col-cal { flex: 3 1 0; min-width: 0; }
+.card > h2 { margin: 0 0 14px; font-size: 13px; font-weight: 650; color: var(--text-dim); letter-spacing: .3px; text-transform: uppercase; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.tile { border: 1px solid var(--border); border-radius: 9px; padding: 11px 13px; }
+.tile .k { font-size: 11.5px; color: var(--text-dim); margin-bottom: 3px; }
+.tile .v { font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.4px; }
+.tile .u { font-size: 11.5px; color: var(--text-faint); font-weight: 400; margin-left: 2px; }
+.tile.hl .v { color: var(--accent); }
+.warn {
+  margin-top: 13px; padding: 8px 11px; border-radius: 7px; font-size: 12.5px;
+  background: color-mix(in srgb, var(--mid) 12%, transparent);
+  color: var(--mid); border: 1px solid color-mix(in srgb, var(--mid) 30%, transparent);
+}
+/* 模型占比 */
+.mrow { display: grid; grid-template-columns: 340px 1fr 58px 70px 54px; align-items: center; gap: 10px; padding: 5px 0; }
+.mrow + .mrow { border-top: 1px solid var(--grid); }
+.mrow.clickable { cursor: pointer; }
+.mrow.clickable:hover { background: var(--accent-soft); }
+.mrow.active { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.mname .pick { color: var(--accent); font-size: 11px; margin-right: 5px; }
+.filterbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; font-size: 12.5px; color: var(--text-dim); }
+.filterbar select {
+  font: inherit; font-size: 12.5px; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.filterbar .reset {
+  font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 5px; cursor: pointer;
+  border: 1px solid var(--accent); background: var(--accent-soft); color: var(--accent);
+}
+/* 日历热力图 */
+.cal-head { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; font-size: 12px; color: var(--text-dim); }
+.cal-head .nav {
+  font: inherit; font-size: 13px; line-height: 1; width: 20px; height: 20px; padding: 0;
+  border-radius: 4px; border: 1px solid var(--border); background: var(--panel);
+  color: var(--text-dim); cursor: pointer;
+}
+.cal-head .nav:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.cal-head .nav:disabled { opacity: .35; cursor: default; }
+.cal-head .month { font-weight: 600; color: var(--text); min-width: 62px; text-align: center; font-variant-numeric: tabular-nums; }
+/* 热力图：宽度铺满卡片，高度由卡片固定高度驱动，格子按行均分 */
+.cal { display: flex; gap: 8px; padding-bottom: 2px; }
+.cal-weekdays {
+  display: grid; grid-template-rows: repeat(7, 1fr); gap: 3px;
+  font-size: 10.5px; color: var(--text-faint); flex: 0 0 auto;
+  margin-top: 18px; align-self: stretch;
+}
+.cal-weekdays span { display: flex; align-items: center; width: 18px; font-size: 10.5px; }
+.cal-body { display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-width: 0; }
+.cal-months { display: grid; grid-auto-flow: column; grid-template-rows: 14px; gap: 3px; font-size: 10px; color: var(--text-faint); }
+.cal-months span { white-space: nowrap; overflow: visible; padding-left: 1px; }
+.cal-grid {
+  display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 1fr);
+  gap: 3px;
+}
+.cal-grid i {
+  border-radius: 3px; display: block;
+  background: var(--grid); transition: outline .1s;
+}
+.cal-grid i.lv1 { background: color-mix(in srgb, var(--accent) 20%, var(--grid)); }
+.cal-grid i.lv2 { background: color-mix(in srgb, var(--accent) 42%, var(--grid)); }
+.cal-grid i.lv3 { background: color-mix(in srgb, var(--accent) 66%, var(--grid)); }
+.cal-grid i.lv4 { background: var(--accent); }
+.cal-grid i:hover { outline: 2px solid var(--text); outline-offset: 1px; }
+.cal-grid i.blank { visibility: hidden; }
+.cal-foot {
+  display: flex; gap: 18px; flex-wrap: wrap; align-items: baseline;
+  margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--grid);
+  font-size: 12px; color: var(--text-dim);
+}
+.cal-foot b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.mname { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar { height: 15px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--text-dim); }
+.ch { text-align: right; font-variant-numeric: tabular-nums; font-size: 12.5px; font-weight: 600; }
+.ch.good { color: var(--good); } .ch.mid { color: var(--mid); } .ch.bad { color: var(--bad); } .ch.na { color: var(--text-faint); }
+/* 图表 */
+.chart { position: relative; }
+.chart canvas { display: block; width: 100%; height: 190px; }
+/* 趋势 / 热力图两张卡片：固定 250px 高（内容区，不含 padding），内部纵向分配到 canvas / 日历 */
+.card.eq { display: flex; flex-direction: column; height: 250px; box-sizing: content-box; }
+.card.eq .chart { flex: 1 1 auto; min-height: 0; }
+.card.eq .chart canvas { height: 100%; }
+.card.eq > h2, .card.eq .legend, .card.eq .cal-foot { flex: 0 0 auto; }
+/* 热力图：日历区域吃掉卡片剩余高度，格子按行均分 */
+.card.eq .cal { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+.card.eq .cal-body { flex: 1 1 auto; min-height: 0; }
+.card.eq .cal-grid { flex: 1 1 auto; min-height: 0; }
+.card.eq .cal-weekdays { align-self: stretch; }
+/* 卡片高度固定后要给格子让地方：收紧固定部件的外边距 */
+#calCard > h2 { margin-bottom: 8px; }
+#calCard .cal-head { margin-bottom: 6px; }
+#calCard .cal-foot { margin-top: 7px; padding-top: 6px; }
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-dim); margin-top: 8px; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 11px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+/* 明细 */
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 11px; }
+.toolbar input, .toolbar select {
+  font: inherit; font-size: 12.5px; padding: 5px 9px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.toolbar input { flex: 1 1 220px; min-width: 140px; }
+.toolbar .count { font-size: 12px; color: var(--text-dim); margin-left: auto; }
+/* 刷新：重新拉取索引（并清空分片缓存），用于 pi 侧自动重建后同步页面 */
+.toolbar .refresh {
+  font: inherit; font-size: 12.5px; padding: 5px 11px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text-dim);
+  cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+}
+.toolbar .refresh:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.toolbar .refresh:disabled { opacity: .6; cursor: default; }
+.toolbar .refresh .ico { display: inline-block; font-size: 13px; line-height: 1; }
+.toolbar .refresh.busy .ico { animation: spin .8s linear infinite; }
+.refresh-err { padding: 9px 12px; border-radius: 7px; font-size: 12.5px;
+  background: color-mix(in srgb, var(--bad) 12%, var(--panel)); color: var(--bad);
+  border: 1px solid color-mix(in srgb, var(--bad) 30%, var(--border)); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.table-scroll { overflow-x: auto; }
+table.detail { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+table.detail th {
+  text-align: right; font-weight: 600; color: var(--text-dim); padding: 7px 9px;
+  border-bottom: 1px solid var(--border); white-space: nowrap; cursor: pointer; user-select: none;
+}
+table.detail th:first-child, table.detail th:nth-child(2) { text-align: left; }
+table.detail th:hover { color: var(--text); }
+table.detail th.sorted { color: var(--accent); }
+table.detail td { padding: 6px 9px; border-bottom: 1px solid var(--grid); text-align: right; font-variant-numeric: tabular-nums; }
+table.detail td:first-child, table.detail td:nth-child(2) { text-align: left; }
+table.detail td.model { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+table.detail tr:hover td { background: var(--accent-soft); }
+/* 累计列：弱化，避免与本轮抢注意力（它是参考值，本轮才是这一行的结论） */
+table.detail td.cum { color: var(--text-dim); }
+table.detail td.cum.good, table.detail td.cum.mid, table.detail td.cum.bad { color: var(--text-dim); }
+table.detail td.cum.na { color: var(--text-faint); }
+/* 可点击单元格：明细表内的时间与模型列（点了就按该维度筛选） */
+table.detail td.clickable { cursor: pointer; }
+table.detail td.clickable:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+table.detail td.tm.clickable { color: var(--text-dim); }
+table.detail td.tm.clickable:hover { color: var(--accent); }
+.pager { display: flex; gap: 6px; align-items: center; justify-content: center; margin-top: 13px; font-size: 12.5px; }
+.pager button {
+  font: inherit; font-size: 12.5px; padding: 4px 11px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer;
+}
+.pager button:disabled { opacity: .4; cursor: default; }
+.pager .info { color: var(--text-dim); padding: 0 8px; }
+.pager select, .pager input[type=number] {
+  font: inherit; font-size: 12.5px; padding: 4px 8px; border-radius: 6px; margin-left: 10px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer;
+}
+/* 页码数字框：窄一些，够放 4 位数 */
+.pager input[type=number] { width: 64px; text-align: center; cursor: text; }
+.pager input[type=number]::-webkit-outer-spin-button,
+.pager input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.pager input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+
+/* 页码下拉：原生 select 的展开高度由浏览器决定、无法限制，
+   所以自绘一个面板，固定显示 10 项，超出滚动 */
+.pagenav { position: relative; display: inline-block; margin-left: 10px; }
+.pagenav .btn {
+  font: inherit; font-size: 12.5px; padding: 4px 24px 4px 9px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  cursor: pointer; font-variant-numeric: tabular-nums; position: relative;
+}
+.pagenav .btn::after {
+  content: ""; position: absolute; right: 8px; top: 50%; margin-top: -2px;
+  border: 4px solid transparent; border-top-color: var(--text-dim); border-bottom-width: 0;
+}
+.pagenav .btn:hover { border-color: var(--accent); color: var(--accent); }
+.pagenav.open .btn { border-color: var(--accent); color: var(--accent); }
+.pagenav .panel {
+  position: absolute; bottom: calc(100% + 5px); left: 0; z-index: 30;
+  display: none; min-width: 100%; box-sizing: border-box;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 7px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .16);
+  /* 固定 10 项高度：每项 26px，超出滚动 */
+  max-height: 256px; overflow-y: auto; padding: 3px;
+}
+.pagenav.open .panel { display: block; }
+.pagenav .panel i {
+  display: block; padding: 5px 10px; border-radius: 4px; cursor: pointer;
+  font-size: 12.5px; font-style: normal; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.pagenav .panel i:hover { background: var(--accent-soft); color: var(--accent); }
+.pagenav .panel i.on { background: var(--accent); color: #fff; font-weight: 600; }
+.empty-state { padding: 40px 0; text-align: center; color: var(--text-faint); font-size: 13px; }
+.err { padding: 16px; border-radius: 9px; background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad); color: var(--bad); font-size: 13px; }
+footer { margin-top: 22px; text-align: center; font-size: 11.5px; color: var(--text-faint); }
+/* 自绘 tooltip：替代原生 title，悬停立即显示 */
+.tipbox {
+  position: fixed; z-index: 40; pointer-events: none;
+  padding: 6px 9px; border-radius: 7px; font-size: 11.5px; line-height: 1.5;
+  background: rgba(32, 35, 42, .96); color: #f2f4f7;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .24);
+  opacity: 0; transform: translateY(2px); transition: opacity .06s linear;
+  white-space: pre-line; max-width: 320px;
+}
+.tipbox.on { opacity: 1; transform: translateY(0); }
+.tipbox .k { color: #a9b1bd; }
+.tipbox b { font-weight: 650; font-variant-numeric: tabular-nums; }
+@media (prefers-color-scheme: dark) {
+  .tipbox { background: rgba(12, 14, 18, .97); border: 1px solid var(--border); }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <div>
+      <h1>Token 统计</h1>
+      <div class="sub" id="rangeLabel">加载中…</div>
+    </div>
+    <div class="svc" id="svc">
+      <div class="svc-row">
+        <span class="dot" id="svcDot"></span>
+        <span class="svc-name">统计服务</span>
+        <span class="svc-val" id="svcState">连接中…</span>
+      </div>
+      <div class="svc-meta" id="svcMeta"></div>
+      <div class="svc-err" id="svcErr"></div>
+      <div class="svc-act">
+        <button id="svcToggle" class="svc-btn">暂停自动统计</button>
+        <select id="svcInterval" class="svc-sel" title="定时统计间隔">
+          <option value="60">1 分钟</option>
+          <option value="300">5 分钟</option>
+          <option value="900">15 分钟</option>
+          <option value="1800">30 分钟</option>
+          <option value="3600">60 分钟</option>
+        </select>
+        <button id="svcRunNow" class="svc-btn primary">立刻统计</button>
+        <button id="svcShutdown" class="svc-btn stop" title="释放端口，之后需在 pi 里重新执行统计查询">停止服务</button>
+      </div>
+    </div>
+  </div>
+  <div class="dates">
+    <span class="label">统计区间</span>
+    <input type="date" id="dateFrom">
+    <span class="sep">→</span>
+    <input type="date" id="dateTo">
+    <button class="apply" id="applyRange">应用</button>
+    <span class="quick">
+      <button data-quick="today">当天</button>
+      <button data-quick="d7">近 7 天</button>
+      <button data-quick="d30">近 30 天</button>
+      <button data-quick="d90">近 90 天</button>
+    </span>
+  </div>
+  <div id="app"><div class="empty-state">正在读取统计数据…</div></div>
+  <div class="tipbox" id="tipbox"></div>
+  <footer id="foot"></footer>
+</div>
+
+<script id="reportIndexScript" src="report-index.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  var EXPECTED_VERSION = 2;
+  var PAGE_SIZES = [20, 100, 500];   // 明细每页可选行数
+  var PAGE_LIST_MAX = 300;           // 页数超过此值时页码改用数字输入（避免几千个 option）
+  // 本地服务地址：由 pi 在 /stats 统计查询时拉起，页面只做状态展示与控制
+  var SERVICE_URL = "http://127.0.0.1:7788";
+  var SERVICE_POLL_MS = 15000;       // 状态轮询间隔
+
+  var app = document.getElementById("app");
+  var rangeLabel = document.getElementById("rangeLabel");
+  var foot = document.getElementById("foot");
+
+  function fatal(html) {
+    app.innerHTML = '<div class="err">' + html + "</div>";
+    rangeLabel.textContent = "";
+  }
+
+  // ── 数据：索引常驻 + 按天分片按需加载 ────────────────────
+  // 索引里有模型/会话字典和日期列表；逐轮记录在 report-day-YYYY-MM-DD.js 里。
+  // 这样新增一天只需重算当天（毫秒级），历史分片永不再算。
+  var IDX = window.__REPORT_INDEX__;
+  if (!IDX) {
+    fatal("未找到统计数据（report-index.js 缺失）。<br>请在 pi 里执行 <code>/stats html</code> 重新生成。");
+    return;
+  }
+  if (IDX.version !== EXPECTED_VERSION) {
+    fatal("数据格式版本不匹配：模板期望 v" + EXPECTED_VERSION +
+      "，索引是 v" + IDX.version + "。<br>请执行 <code>/stats html</code> 重新生成数据。");
+    return;
+  }
+
+  // 用 var + 重新赋值（而非 const）是为了让「刷新数据」能整份换掉
+  var dates = [];
+  var modelName = [];
+  var sessionName = [];
+  var unpacked = Object.create(null);
+  /** 已加载的分片：日期 → PackedTurn[] */
+  var shards = Object.create(null);
+  /** 正在加载/已尝试且失败的分片，避免重复注入 */
+  var loading = Object.create(null);
+
+  /** 从索引恢复字典与日期列表（首次加载与刷新都走这里） */
+  function resetFromIndex() {
+    dates = IDX.dates.slice();
+    modelName = IDX.models;
+    sessionName = IDX.sessions;
+    unpacked = Object.create(null);
+    shards = Object.create(null);
+    loading = Object.create(null);
+    // 清掉上一次注入留下的全局，防止 onload 读到过期分片
+    try { delete window.__REPORT_DAY__; } catch (e) { window.__REPORT_DAY__ = undefined; }
+  }
+  resetFromIndex();
+
+  function unpack(list) {
+    var out = new Array(list.length);
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      out[i] = {
+        sec: r[0], model: r[1], input: r[2], output: r[3],
+        cacheRead: r[4], cacheWrite: r[5], speed: r[6] / 10, session: r[7]
+      };
+    }
+    return out;
+  }
+  // 只在需要时解包，避免全量数万行一次建对象。
+  // 分片还没加载时返回空数组：调用方要么已经 await 过 ensureShards，要么容忍暂时为空。
+  function turnsOf(date) {
+    var hit = unpacked[date];
+    if (hit) return hit;
+    var raw = shards[date];
+    if (!raw) return [];
+    return (unpacked[date] = unpack(raw));
+  }
+
+  /**
+   * 确保给定日期的分片都已加载。
+   *
+   * 用 <script src> 注入而不是 fetch：file:// 下 fetch 会被 CORS 拦死。
+   * 分片回调统一写 window.__REPORT_DAY__，所以必须串行注入，不能并发——
+   * 并发时后一个的赋值会覆盖前一个还没读走的数据。
+   */
+  function ensureShards(list) {
+    var need = [];
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i];
+      if (!shards[d] && !loading[d]) need.push(d);
+    }
+    if (!need.length) return Promise.resolve();
+
+    return new Promise(function (resolve) {
+      var pos = 0;
+      function next() {
+        if (pos >= need.length) return resolve();
+        var date = need[pos++];
+        loading[date] = true;
+        var el = document.createElement("script");
+        el.src = "report-day-" + date + ".js";
+        el.onload = function () {
+          var day = window.__REPORT_DAY__;
+          // 分片自己的 date 才算数：串行注入下它一定是刚加载那个
+          if (day && day.date === date && day.version === EXPECTED_VERSION) {
+            shards[date] = day.turns || [];
+          } else {
+            shards[date] = shards[date] || [];
+          }
+          next();
+        };
+        el.onerror = function () {
+          // 分片缺失（数据被清过 / 还没生成）：当作该日无记录，不让整页失败
+          shards[date] = [];
+          next();
+        };
+        document.body.appendChild(el);
+      }
+      next();
+    });
+  }
+
+  /** 当前区间里哪些日期还没有分片数据 */
+  function missingShards(list) {
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      if (!shards[list[i]]) out.push(list[i]);
+    }
+    return out;
+  }
+
+  function promptOf(t) { return t.input + t.cacheRead + t.cacheWrite; }
+
+  // ── 区间 ────────────────────────────────────────────────
+  function pad(n) { return n < 10 ? "0" + n : "" + n; }
+  function isoOf(d) { return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()); }
+
+  var todayStr = isoOf(new Date());
+
+  /** 按起止日期（含）筛选已有日志的日期 */
+  function datesBetween(from, to) {
+    return dates.filter(function (d) { return d >= from && d <= to; });
+  }
+  function shiftDay(base, delta) {
+    var d = new Date(base + "T00:00:00");
+    d.setDate(d.getDate() + delta);
+    return isoOf(d);
+  }
+
+  // ── 聚合 ────────────────────────────────────────────────
+  function emptyBucket() {
+    return { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, speedSum: 0 };
+  }
+  function addTo(b, t) {
+    b.turns++; b.input += t.input; b.output += t.output;
+    b.cacheRead += t.cacheRead; b.cacheWrite += t.cacheWrite; b.speedSum += t.speed;
+  }
+  // 分母为 0 时返回 null（"无数据"），与 0% 命中率区分开
+  function hitRate(b) {
+    var denom = b.input + b.cacheRead + b.cacheWrite;
+    return denom > 0 ? (b.cacheRead / denom) * 100 : null;
+  }
+  function promptTokens(b) { return b.input + b.cacheRead + b.cacheWrite; }
+
+  /**
+   * 聚合。modelFilter 为 null 时算全部模型；否则只算选中模型。
+   * byModel 始终统计全部模型（占比列表需要完整数据），筛选只作用于 total / byDate。
+   */
+  function aggregate(selDates, modelFilter) {
+    var total = emptyBucket();
+    var byModel = new Map();
+    var byDate = new Map();
+
+    for (var i = 0; i < selDates.length; i++) {
+      var date = selDates[i];
+      var list = turnsOf(date);
+      var dayBucket = emptyBucket();
+      for (var j = 0; j < list.length; j++) {
+        var t = list[j];
+        var mb = byModel.get(t.model);
+        if (!mb) { mb = emptyBucket(); byModel.set(t.model, mb); }
+        addTo(mb, t);
+        // 筛选后的总量
+        if (modelFilter !== null && t.model !== modelFilter) continue;
+        addTo(total, t);
+        addTo(dayBucket, t);
+      }
+      byDate.set(date, dayBucket);
+    }
+    return { total: total, byModel: byModel, byDate: byDate };
+  }
+
+  // ── 格式化 ──────────────────────────────────────────────
+  function fmtTokens(n) {
+    if (!n) return "0";
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 1 : 2) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
+    return String(Math.round(n));
+  }
+  function fmtNum(n) { return Math.round(n).toLocaleString("zh-CN"); }
+  function fmtPct(v, digits) { return v === null ? "—" : v.toFixed(digits === undefined ? 1 : digits) + "%"; }
+
+  // ── 统一定位 tooltip ────────────────────────────────────
+  var tipEl = document.getElementById("tipbox");
+
+  /** 在鼠标位置附近显示提示，自动避免超出视口 */
+  function showTip(html, clientX, clientY) {
+    if (!tipEl) return;
+    tipEl.innerHTML = html;
+    tipEl.classList.add("on");
+    moveTip(clientX, clientY);
+  }
+
+  /** 只调整位置（内容不变时避免重排闪烁） */
+  function moveTip(clientX, clientY) {
+    if (!tipEl) return;
+    var r = tipEl.getBoundingClientRect();
+    var x = clientX + 14;
+    var y = clientY - r.height - 12;
+    if (x + r.width > window.innerWidth - 8) x = clientX - r.width - 14;
+    if (y < 8) y = clientY + 18;
+    if (x < 8) x = 8;
+    tipEl.style.left = x + "px";
+    tipEl.style.top = y + "px";
+  }
+
+  function hideTip() {
+    if (tipEl) tipEl.classList.remove("on");
+  }
+  function chClass(v) { return v === null ? "na" : v >= 80 ? "good" : v >= 50 ? "mid" : "bad"; }
+  // 模型名截断保留尾部：同家模型的差异常在后段（…-Flash vs …-Flash-Preview）
+  function shortModel(name, width) {
+    if (name.length <= width) return name;
+    return "…" + name.slice(name.length - width + 1);
+  }
+  // 完整年月日时分秒（local 时间，raw 里的 sec 已经是本地当天秒数）
+  function fmtDateTime(date, sec) {
+    return date + " " + pad(Math.floor(sec / 3600)) + ":" +
+      pad(Math.floor(sec % 3600 / 60)) + ":" + pad(sec % 60);
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  // ── 状态 ────────────────────────────────────────────────
+  var state = {
+    // 顶部统计区间：只存实际起止，快捷按钮是否高亮由 markQuick() 反推
+    from: todayStr, to: todayStr,
+    // 热力图按自然月展示，默认当月，可翻到其它月份
+    calMonth: todayStr.slice(0, 7),
+    model: null,                    // 按模型筛选（null = 全部）
+    page: 0, query: "", sortKey: "sec", sortDesc: true,
+    pageSize: 20,                   // 明细每页行数
+  };
+  var current = { selDates: [], agg: null, rows: [] };
+
+  // ── 渲染：总览 ──────────────────────────────────────────
+  function renderTiles(agg) {
+    var b = agg.total;
+    var ch = hitRate(b);
+    // 选了具体模型就不再是混算，此时命中率就是该模型的真实值
+    var filtered = state.model !== null;
+    var multi = !filtered && agg.byModel.size > 1;
+    var avgIn = b.turns ? b.input / b.turns : 0;
+    var avgOut = b.turns ? b.output / b.turns : 0;
+    var speed = b.turns ? b.speedSum / b.turns : 0;
+
+    var html = '<div class="card"><h2>总览' +
+      (filtered ? '　<span style="font-weight:400;text-transform:none;letter-spacing:0">仅 ' +
+        esc(shortModel(modelName[state.model], 44)) + '</span>' : "") +
+      '</h2><div class="tiles">' +
+      tile("对话次数", fmtNum(b.turns), "", false) +
+      tile("新增输入", fmtTokens(b.input), "平均 " + fmtTokens(avgIn) + "/次", false) +
+      tile("缓存输入", fmtTokens(b.cacheRead), "", false) +
+      tile("总输出", fmtTokens(b.output), "平均 " + fmtTokens(avgOut) + "/次", false) +
+      tile("总 token", fmtTokens(promptTokens(b)), "新增 + 缓存", false) +
+      tile("平均速率", speed.toFixed(1), "t/s", false) +
+      tile("缓存命中率", fmtPct(ch), multi ? "跨模型混算" : (filtered ? "本模型" : ""), true) +
+      "</div>";
+    if (multi) {
+      html += '<div class="warn">上方命中率为跨模型混算值（' + fmtPct(ch) +
+        '）。不同模型的缓存机制隔离，这个数字没有工程意义 —— 请以下方按模型明细为准。</div>';
+    }
+    return html + "</div>";
+  }
+  function tile(k, v, u, hl) {
+    return '<div class="tile' + (hl ? " hl" : "") + '"><div class="k">' + k +
+      '</div><div class="v">' + v + (u ? '<span class="u">' + u + "</span>" : "") + "</div></div>";
+  }
+
+  // ── 渲染：按模型占比 ────────────────────────────────────
+  // 行可点击：选中后总览/趋势/热力图/明细全部只看该模型（本行占比仍按全量算，便于对比）
+  function renderModels(agg) {
+    var grand = promptTokens(agg.total) || 1;
+    var rows = [];
+    agg.byModel.forEach(function (b, idx) { rows.push({ idx: idx, b: b }); });
+    rows.sort(function (x, y) { return promptTokens(y.b) - promptTokens(x.b); });
+
+    var html = '<div class="card"><h2>按模型占比' +
+      (state.model === null ? '　<span style="font-weight:400;text-transform:none;letter-spacing:0">点行可只看该模型</span>' : '') +
+      "</h2>";
+    if (!rows.length) return html + '<div class="empty-state">该区间没有记录</div></div>';
+
+    // 选中模型时给一个清除入口
+    if (state.model !== null && agg.byModel.has(state.model)) {
+      html += '<div class="filterbar">只统计：<b>' + esc(modelName[state.model]) + '</b>' +
+        '<button class="reset" id="clearModel">看全部模型</button></div>';
+    }
+
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var share = (promptTokens(r.b) / grand) * 100;
+      var ch = hitRate(r.b);
+      var active = state.model === r.idx;
+      html += '<div class="mrow clickable' + (active ? " active" : "") + '" data-model="' + r.idx + '" ' +
+        'title="点击只看 ' + esc(modelName[r.idx]) + '">' +
+        '<div class="mname">' + (active ? '<span class="pick">●</span>' : "") +
+        esc(shortModel(modelName[r.idx], 46)) + "</div>" +
+        '<div class="bar"><i style="width:' + share.toFixed(2) + '%"></i></div>' +
+        '<div class="num">' + share.toFixed(1) + "%</div>" +
+        '<div class="num">' + fmtTokens(promptTokens(r.b)) + "</div>" +
+        '<div class="ch ' + chClass(ch) + '">' + fmtPct(ch) + "</div>" +
+        "</div>";
+    }
+    return html + "</div>";
+  }
+
+  // ── 渲染：逐日趋势 ──────────────────────────────────────
+  var trendHit = -1;   // 趋势图当前高亮的日期索引（-1 = 无）
+
+  function renderTrend(agg) {
+    var ds = current.selDates.slice().sort();
+    var html = '<div class="card eq" id="trendCard"><h2>逐日趋势' +
+      (state.model !== null ? '　<span style="font-weight:400;text-transform:none;letter-spacing:0">仅 ' +
+        esc(shortModel(modelName[state.model], 44)) + '</span>' : "") + "</h2>";
+    html += '<div class="chart"><canvas id="trendCanvas"></canvas></div>' +
+      '<div class="legend"><span><i style="background:var(--accent)"></i>prompt token（新增 + 缓存）</span>' +
+      '<span><i style="background:var(--good)"></i>缓存命中率（右轴）</span></div></div>';
+    // 画布要等插入 DOM 后再画；悬停事件只绑一次，重绘不会重复绑定
+    trendHit = -1;
+    setTimeout(function () {
+      drawTrend(ds, agg);
+      var cv = document.getElementById("trendCanvas");
+      if (cv) bindTrendHover(cv, ds, agg);
+    }, 0);
+    return html;
+  }
+
+  function drawTrend(ds, agg, active) {
+    if (active === undefined) active = trendHit;
+    var canvas = document.getElementById("trendCanvas");
+    if (!canvas) return;
+    var dpr = window.devicePixelRatio || 1;
+    var w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    var ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    var css = getComputedStyle(document.documentElement);
+    var gridC = css.getPropertyValue("--grid").trim();
+    var dimC = css.getPropertyValue("--text-faint").trim();
+    var accentC = css.getPropertyValue("--accent").trim();
+    var goodC = css.getPropertyValue("--good").trim();
+
+    var padL = 52, padR = 44, padT = 10, padB = 22;
+    var plotW = w - padL - padR, plotH = h - padT - padB;
+
+    var maxTok = 0;
+    for (var i = 0; i < ds.length; i++) {
+      var v = promptTokens(agg.byDate.get(ds[i]));
+      if (v > maxTok) maxTok = v;
+    }
+    maxTok = maxTok || 1;
+    var nice = Math.pow(10, Math.floor(Math.log10(maxTok)));
+    maxTok = Math.ceil(maxTok / nice * 2) / 2 * nice;
+
+    function xAt(i) { return padL + (ds.length === 1 ? plotW / 2 : (i / (ds.length - 1)) * plotW); }
+    function yTok(v) { return padT + plotH - (v / maxTok) * plotH; }
+    function yCh(v) { return padT + plotH - (v / 100) * plotH; }
+
+    // 横向网格 + 左轴（token）
+    ctx.font = "10px system-ui, sans-serif";
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (var g = 0; g <= 4; g++) {
+      var val = maxTok * g / 4;
+      var y = yTok(val);
+      ctx.strokeStyle = gridC; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, y + 0.5); ctx.lineTo(padL + plotW, y + 0.5); ctx.stroke();
+      ctx.fillStyle = dimC; ctx.fillText(fmtTokens(val), padL - 7, y);
+    }
+    // 右轴（命中率）
+    ctx.textAlign = "left";
+    for (var g2 = 0; g2 <= 4; g2++) {
+      ctx.fillStyle = dimC;
+      ctx.fillText((g2 * 25) + "%", padL + plotW + 7, yCh(g2 * 25));
+    }
+    // x 轴刻度（最多 7 个，避免挤压）
+    ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillStyle = dimC;
+    var step = Math.max(1, Math.ceil(ds.length / 7));
+    for (var s = 0; s < ds.length; s += step) {
+      ctx.fillText(ds[s].slice(5), xAt(s), padT + plotH + 6);
+    }
+
+    // prompt token 面积（实心）+ 折线；仅 1 天时退化为圆点
+    if (ds.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(xAt(0), padT + plotH);
+      for (var a = 0; a < ds.length; a++) ctx.lineTo(xAt(a), yTok(promptTokens(agg.byDate.get(ds[a]))));
+      ctx.lineTo(xAt(ds.length - 1), padT + plotH);
+      ctx.closePath();
+      var grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+      grad.addColorStop(0, accentC + "55");
+      grad.addColorStop(1, accentC + "08");
+      ctx.fillStyle = grad; ctx.fill();
+      ctx.beginPath();
+      for (var b2 = 0; b2 < ds.length; b2++) {
+        var px = xAt(b2), py = yTok(promptTokens(agg.byDate.get(ds[b2])));
+        b2 ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+      ctx.strokeStyle = accentC; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.stroke();
+    } else {
+      // 单点：居中画一个大圆点，让人看得出这是「一天的数据」
+      var onlyV = promptTokens(agg.byDate.get(ds[0]));
+      ctx.beginPath();
+      ctx.arc(xAt(0), yTok(onlyV), 5, 0, Math.PI * 2);
+      ctx.fillStyle = accentC; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+    }
+
+    // 命中率折线：命中率为 null 的点断开，不能连成直线（会伪造数据）
+    ctx.beginPath();
+    var pen = false;
+    for (var c = 0; c < ds.length; c++) {
+      var chv = hitRate(agg.byDate.get(ds[c]));
+      if (chv === null) { pen = false; continue; }
+      var cx = xAt(c), cy = yCh(chv);
+      if (pen) ctx.lineTo(cx, cy); else { ctx.moveTo(cx, cy); pen = true; }
+    }
+    ctx.strokeStyle = goodC; ctx.lineWidth = 2; ctx.setLineDash([4, 3]); ctx.stroke();
+    ctx.setLineDash([]);
+    // 命中率散点，让断点后的孤立值也能看见
+    for (var d2 = 0; d2 < ds.length; d2++) {
+      var chv2 = hitRate(agg.byDate.get(ds[d2]));
+      if (chv2 === null) continue;
+      ctx.beginPath();
+      ctx.arc(xAt(d2), yCh(chv2), 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = goodC; ctx.fill();
+    }
+
+    // 悬停高亮：竖向辅助线 + 两轴上的实心点
+    if (active >= 0 && active < ds.length) {
+      var hx = xAt(active);
+      var hb = agg.byDate.get(ds[active]);
+      var hv = promptTokens(hb);
+      ctx.save();
+      ctx.strokeStyle = dimC; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(hx + 0.5, padT); ctx.lineTo(hx + 0.5, padT + plotH); ctx.stroke();
+      ctx.setLineDash([]);
+
+      if (hv > 0) {
+        ctx.beginPath(); ctx.arc(hx, yTok(hv), 4, 0, Math.PI * 2);
+        ctx.fillStyle = accentC; ctx.fill();
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+      var hch = hitRate(hb);
+      if (hch !== null) {
+        ctx.beginPath(); ctx.arc(hx, yCh(hch), 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = goodC; ctx.fill();
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+  }
+
+  // ── 趋势图悬停：十字线 + 数据点高亮 + tooltip ───────────
+  function bindTrendHover(canvas, ds, agg) {
+    var padL = 52, padR = 44;   // 与 drawTrend 保持一致
+
+    function xToIndex(mx) {
+      if (ds.length === 1) return 0;
+      var plotW = canvas.clientWidth - padL - padR;
+      var ratio = (mx - padL) / plotW;
+      var idx = Math.round(ratio * (ds.length - 1));
+      return Math.max(0, Math.min(ds.length - 1, idx));
+    }
+
+    canvas.onmousemove = function (e) {
+      var r = canvas.getBoundingClientRect();
+      var mx = e.clientX - r.left;
+      var idx = xToIndex(mx);
+      if (idx !== trendHit) {
+        trendHit = idx;
+        drawTrend(ds, agg, idx);
+      }
+      var date = ds[idx];
+      var b = agg.byDate.get(date);
+      var lines = [date + "（周" + "日一二三四五六".charAt(new Date(date + "T00:00:00").getDay()) + "）"];
+      if (!b || !b.turns) {
+        lines.push("无记录");
+      } else {
+        lines.push("prompt " + fmtTokens(promptTokens(b)) + "　（新增 " + fmtTokens(b.input) + " + 缓存 " + fmtTokens(b.cacheRead + b.cacheWrite) + "）");
+        lines.push("输出 " + fmtTokens(b.output) + "　对话 " + fmtNum(b.turns) + " 轮");
+        lines.push("缓存命中率 " + fmtPct(hitRate(b)));
+      }
+      showTip(lines.join("\n"), e.clientX, e.clientY);
+    };
+
+    canvas.onmouseleave = function () {
+      if (trendHit !== -1) { trendHit = -1; drawTrend(ds, agg, -1); }
+      hideTip();
+    };
+  }
+
+  // ── 渲染：日历热力图 ────────────────────────────────────
+  // 每天一格，颜色深浅 = 当日 token 用量。
+  // 有自己的日期范围筛选（不跟上方总览区间联动）：默认近 30 天，
+  // 但模型筛选是共享的 —— 看某个模型的用量分布才是有用的。
+
+  /**
+   * 热力图固定展示一个自然月。
+   * 按月取整而不是取 30 天，格子才能稳定排成 5~6 列，宽度不会撑开。
+   */
+  function monthBounds(month) {
+    var first = new Date(month + "-01T00:00:00");
+    var last = new Date(first.getFullYear(), first.getMonth() + 1, 0);
+    return { from: isoOf(first), to: isoOf(last) };
+  }
+  function calDates() {
+    var b = monthBounds(state.calMonth);
+    // 该月可能没有日志，但格子仍要按整月画出来
+    return datesBetween(b.from, b.to);
+  }
+  function shiftMonth(month, delta) {
+    var d = new Date(month + "-01T00:00:00");
+    d.setMonth(d.getMonth() + delta);
+    return isoOf(d).slice(0, 7);
+  }
+  function hasMonth(month) {
+    if (!dates.length) return false;
+    var b = monthBounds(month);
+    return dates.some(function (d) { return d >= b.from && d <= b.to; });
+  }
+
+  function renderCalendar(agg) {
+    var html = '<div class="card eq" id="calCard"><h2>用量热力图' +
+      (state.model !== null ? '　<span style="font-weight:400;text-transform:none;letter-spacing:0">仅 ' +
+        esc(shortModel(modelName[state.model], 44)) + '</span>' : "") + "</h2>";
+
+    // 按月翻页：固定单月展示，宽度稳定，不会随区间撑开
+    var monthLabel = state.calMonth.slice(0, 4) + " 年 " + Number(state.calMonth.slice(5, 7)) + " 月";
+    html += '<div class="cal-head">' +
+      '<button class="nav" data-cal-nav="-1" title="上一月"' +
+      (hasMonth(shiftMonth(state.calMonth, -1)) ? "" : " disabled") + ">‹</button>" +
+      '<span class="month">' + monthLabel + "</span>" +
+      '<button class="nav" data-cal-nav="1" title="下一月"' +
+      (hasMonth(shiftMonth(state.calMonth, 1)) ? "" : " disabled") + ">›</button>" +
+      "</div>";
+
+    var ds = calDates();          // 该月「有日志」的日期，用于统计
+    var bounds = monthBounds(state.calMonth);
+
+    if (!ds.length) {
+      return html + '<div class="empty-state">' + state.calMonth + ' 没有记录</div></div>';
+    }
+
+    // 热力图区间与总览区间可能不同，只有完全一致时才复用 agg
+    var sameRange = ds.length === current.selDates.length &&
+      ds[0] === current.selDates[0] && ds[ds.length - 1] === current.selDates[current.selDates.length - 1];
+    var calAgg = sameRange ? agg : aggregate(ds, state.model);
+
+    // 格子按整月画（含无记录的日期），首尾补齐到整周
+    var first = new Date(bounds.from + "T00:00:00");
+    var last = new Date(bounds.to + "T00:00:00");
+    var startPad = (first.getDay() + 6) % 7; // 周一=0
+    var cells = [];
+    for (var p = 0; p < startPad; p++) cells.push(null);
+    var cursor = new Date(first.getTime());
+    while (cursor <= last) {
+      cells.push(isoOf(cursor));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    while (cells.length % 7 !== 0) cells.push(null);
+
+    var usage = {};
+    var maxUse = 0;
+    var sumUse = 0;
+    for (var i = 0; i < ds.length; i++) {
+      var b = calAgg.byDate.get(ds[i]);
+      var v = b ? promptTokens(b) : 0;
+      usage[ds[i]] = v;
+      sumUse += v;
+      if (v > maxUse) maxUse = v;
+    }
+
+    function level(v) {
+      if (!v || maxUse <= 0) return 0;
+      var r = v / maxUse;
+      return r >= 0.75 ? 4 : r >= 0.5 ? 3 : r >= 0.25 ? 2 : 1;
+    }
+
+    /** 单个格子的提示：日期 + 用量 + 占峰值比例 */
+    function tipCal(date, v) {
+      var wd = "日一二三四五六".charAt(new Date(date + "T00:00:00").getDay());
+      var head = date + "（周" + wd + "）";
+      if (!v) return head + "\n无记录";
+      var pct = maxUse > 0 ? Math.round((v / maxUse) * 100) : 0;
+      return head + "\nprompt " + fmtTokens(v) + "  占峰值 " + pct + "%";
+    }
+
+    var weeks = cells.length / 7;
+    // 月份刻度：某列第一格进入新月份时打标签
+    var monthCells = [];
+    for (var w = 0; w < weeks; w++) {
+      var cellDate = cells[w * 7];
+      var label = "";
+      if (cellDate) {
+        var m = cellDate.slice(5, 7);
+        var prev = w > 0 ? cells[(w - 1) * 7] : null;
+        if (!prev || prev.slice(5, 7) !== m) label = Number(m) + "月";
+      }
+      monthCells.push('<span>' + label + "</span>");
+    }
+
+    html += '<div class="cal">' +
+      '<div class="cal-weekdays"><span>一</span><span>二</span><span>三</span><span>四</span>' +
+      "<span>五</span><span>六</span><span>日</span></div>" +
+      '<div class="cal-body">' +
+      '<div class="cal-months" style="grid-template-columns:repeat(' + weeks + ',1fr)">' + monthCells.join("") + "</div>" +
+      '<div class="cal-grid" style="grid-template-columns:repeat(' + weeks + ',1fr)">';
+
+    for (var c = 0; c < cells.length; c++) {
+      var d = cells[c];
+      if (!d) { html += '<i class="blank"></i>'; continue; }
+      var v = usage[d] || 0;
+      html += '<i class="lv' + level(v) + '" data-tip="' + esc(tipCal(d, v)) + '"></i>';
+    }
+    html += "</div></div></div>";
+
+    // 底部统计：只留峰值与总量（日均/有记录天数信息量低，占了位置）
+    html += '<div class="cal-foot">' +
+      "<span>峰值 <b>" + fmtTokens(maxUse) + " / 天</b></span>" +
+      "<span>总量 <b>" + fmtTokens(sumUse) + "</b></span>" +
+      "</div></div>";
+    return html;
+  }
+
+  // ── 渲染：明细表 ────────────────────────────────────────
+  function renderDetail(agg) {
+    var total = current.rows.length;
+    var html = '<div class="card" id="detailCard"><h2>逐轮明细' +
+      (state.model !== null ? '　<span style="font-weight:400;text-transform:none;letter-spacing:0">仅 ' +
+        esc(shortModel(modelName[state.model], 44)) + '</span>' : "") + "</h2>" +
+      '<div class="toolbar">' +
+      '<input id="q" type="search" placeholder="搜索模型名或会话 ID…" value="' + esc(state.query) + '">' +
+      '<select id="sortSel">' +
+      '<option value="sec">按时间</option>' +
+      '<option value="prompt">按总 token</option>' +
+      '<option value="output">按输出</option>' +
+      '<option value="ch">按命中率</option>' +
+      "</select>" +
+      '<span class="count" id="cnt">' + fmtNum(total) + " 条</span>" +
+      '<button class="refresh" id="reloadData" title="重新读取当前区间的明细数据">' +
+      '<span class="ico">⟳</span>刷新明细</button>' +
+      "</div>";
+    if (!total) {
+      return html + '<div class="empty-state">该区间没有符合条件的记录</div></div>';
+    }
+    html += '<div class="table-scroll"><table class="detail"><thead><tr>' +
+      '<th>时间</th><th>模型</th><th>新增输入</th><th>缓存输入</th><th>输出</th>' +
+      '<th>总 token</th><th>速率</th><th title="本行这一轮的缓存命中率">本轮</th>' +
+      '<th title="从区间起点累计到本轮的命中率">累计</th>' +
+      "</tr></thead><tbody id=\"detailBody\"></tbody></table></div>" +
+      '<div class="pager" id="pager"></div></div>';
+    setTimeout(renderDetailPage, 0);
+    return html;
+  }
+
+  function filteredRows() {
+    var q = state.query.trim().toLowerCase();
+    var rows = current.rows;
+    if (q) {
+      rows = [];
+      for (var i = 0; i < current.rows.length; i++) {
+        var r = current.rows[i];
+        if (modelName[r.model].toLowerCase().indexOf(q) >= 0 ||
+            (sessionName[r.session] || "").toLowerCase().indexOf(q) >= 0) {
+          rows.push(r);
+        }
+      }
+    }
+    var key = state.sortKey, desc = state.sortDesc;
+    if (key !== "sec") {
+      rows = rows.slice(); // 不改原数组顺序
+      rows.sort(function (a, b) {
+        var av, bv;
+        if (key === "prompt") { av = promptOf(a); bv = promptOf(b); }
+        else if (key === "output") { av = a.output; bv = b.output; }
+        else { av = rowHit(a); bv = rowHit(b); av = av === null ? -1 : av; bv = bv === null ? -1 : bv; }
+        return desc ? bv - av : av - bv;
+      });
+    }
+    return rows;
+  }
+  function rowHit(t) {
+    var denom = t.input + t.cacheRead + t.cacheWrite;
+    return denom > 0 ? (t.cacheRead / denom) * 100 : null;
+  }
+
+  function renderDetailPage() {
+    var body = document.getElementById("detailBody");
+    var pager = document.getElementById("pager");
+    var cnt = document.getElementById("cnt");
+    if (!body) return;
+
+    var rows = filteredRows();
+    if (cnt) cnt.textContent = fmtNum(rows.length) + " 条";
+    var size = state.pageSize;
+    var pages = Math.max(1, Math.ceil(rows.length / size));
+    if (state.page >= pages) state.page = pages - 1;
+    if (state.page < 0) state.page = 0;
+    var start = state.page * size;
+    var slice = rows.slice(start, start + size);
+
+    var html = "";
+    for (var i = 0; i < slice.length; i++) {
+      var t = slice[i];
+      var ch = rowHit(t);
+      html += "<tr>" +
+        '<td class="tm clickable" data-date="' + t.date + '" title="点击只看这一天">' +
+          fmtDateTime(t.date, t.sec) + "</td>" +
+        '<td class="model clickable" data-model="' + t.model + '" title="点击只看该模型：' +
+          esc(modelName[t.model]) + '">' + esc(shortModel(modelName[t.model], 46)) + "</td>" +
+        "<td>" + fmtTokens(t.input) + "</td>" +
+        "<td>" + fmtTokens(t.cacheRead) + "</td>" +
+        "<td>" + fmtTokens(t.output) + "</td>" +
+        "<td>" + fmtTokens(promptOf(t)) + "</td>" +
+        "<td>" + t.speed.toFixed(1) + "</td>" +
+        '<td class="ch ' + chClass(ch) + '">' + fmtPct(ch, 2) + "</td>" +
+        '<td class="ch cum ' + chClass(t.cumHit) + '">' + fmtPct(t.cumHit, 2) + "</td></tr>";
+    }
+    body.innerHTML = html;
+    bindDetailRowClicks(body);
+
+    // 页码跳转：页数少时用下拉（直观），页数多时用数字输入。
+    // 下拉是自绘面板而非 <select>：原生展开高度由浏览器决定，无法限制成 10 项滚动；
+    // 页数过多时几千个选项也会拖慢渲染，所以超阈值改用数字框。
+    var pageCtrl = "";
+    if (pages <= PAGE_LIST_MAX) {
+      var pageOpts = "";
+      for (var pi = 0; pi < pages; pi++) {
+        pageOpts += '<i data-page="' + pi + '"' + (pi === state.page ? ' class="on"' : "") +
+          ">第 " + (pi + 1) + " 页</i>";
+      }
+      pageCtrl = '<span class="pagenav" id="pageNav">' +
+        '<button class="btn" type="button">第 ' + (state.page + 1) + " 页</button>" +
+        '<span class="panel">' + pageOpts + "</span></span>";
+    } else {
+      pageCtrl = '<input id="pageInput" type="number" min="1" max="' + pages +
+        '" value="' + (state.page + 1) + '" title="输入页码后按回车跳转">';
+    }
+
+    pager.innerHTML =
+      '<button id="prev"' + (state.page === 0 ? " disabled" : "") + ">上一页</button>" +
+      '<span class="info">第 ' + (state.page + 1) + " / " + pages + " 页</span>" +
+      '<button id="next"' + (state.page >= pages - 1 ? " disabled" : "") + ">下一页</button>" +
+      pageCtrl +
+      '<select id="pageSizeSel" title="每页行数">' +
+      PAGE_SIZES.map(function (n) {
+        return '<option value="' + n + '"' + (n === size ? " selected" : "") + ">" + n + " 条/页</option>";
+      }).join("") + "</select>";
+    var prev = document.getElementById("prev"), next = document.getElementById("next");
+    if (prev) prev.onclick = function () { state.page--; renderDetailPage(); };
+    if (next) next.onclick = function () { state.page++; renderDetailPage(); };
+    bindPageNav();
+    var pageInput = document.getElementById("pageInput");
+    if (pageInput) {
+      var gotoPage = function () {
+        var n = Number(pageInput.value);
+        if (!isFinite(n) || n < 1) n = 1;
+        if (n > pages) n = pages;
+        state.page = n - 1;
+        renderDetailPage();
+      };
+      pageInput.onchange = gotoPage;
+      pageInput.onkeydown = function (e) {
+        if (e.key === "Enter") gotoPage();
+      };
+    }
+    var sizeSel = document.getElementById("pageSizeSel");
+    if (sizeSel) {
+      sizeSel.onchange = function () {
+        state.pageSize = Number(sizeSel.value) || 20;
+        state.page = 0;
+        renderDetailPage();
+      };
+    }
+  }
+
+  /**
+   * 构建明细行：拉取区间内各天分片 → 过滤模型 → 按时间倒序 → 计算累计命中率。
+   * 抽成独立函数，让「刷新」只重算明细而不动上方统计。
+   */
+  function buildRows(selDates) {
+    var rows = [];
+    for (var i = 0; i < selDates.length; i++) {
+      var date = selDates[i];
+      var list = turnsOf(date);
+      for (var j = 0; j < list.length; j++) {
+        var t = list[j];
+        if (state.model !== null && t.model !== state.model) continue;
+        rows.push({ date: date, sec: t.sec, model: t.model, input: t.input, output: t.output,
+          cacheRead: t.cacheRead, cacheWrite: t.cacheWrite, speed: t.speed, session: t.session });
+      }
+    }
+    // 跨天排序：先日期再秒数，倒序
+    rows.sort(function (a, b) {
+      if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+      return b.sec - a.sec;
+    });
+
+    // 累计命中率：按时间正序累加后写回每一行。
+    // 必须在排序之后算，且与表格的排序/分页无关——累计是「到这一轮为止」的客观值，
+    // 不随视图顺序变化，否则按 token 排序后同一行会算出不同数字。
+    //
+    // 关键：按模型分别累加。KV Cache 是按 provider + model 隔离的，
+    // 混在一起累加会让某模型的首轮继承别的模型几百轮的高命中率
+    // （曾出现 mimo 首轮真实 2.8% 被显示成 95%）。
+    var accByModel = new Map();
+    for (var k = rows.length - 1; k >= 0; k--) {
+      var row = rows[k];
+      var acc = accByModel.get(row.model);
+      if (!acc) { acc = { input: 0, cacheRead: 0, cacheWrite: 0 }; accByModel.set(row.model, acc); }
+      acc.input += row.input;
+      acc.cacheRead += row.cacheRead;
+      acc.cacheWrite += row.cacheWrite;
+      var accDenom = acc.input + acc.cacheRead + acc.cacheWrite;
+      row.cumHit = accDenom > 0 ? (acc.cacheRead / accDenom) * 100 : null;
+    }
+    return rows;
+  }
+
+  // ── 主流程 ──────────────────────────────────────────────
+  /** 渲染代次：异步加载分片后用它丢弃过期回调（快速切区间时防止旧结果覆盖新结果） */
+  var renderToken = 0;
+
+  function render() {
+    renderToken++;
+    var token = renderToken;
+
+    current.selDates = datesBetween(state.from, state.to);
+    syncDateInputs();
+
+    if (!current.selDates.length) {
+      rangeLabel.textContent = state.from + " ~ " + state.to + "（无记录）";
+      app.innerHTML = '<div class="card"><div class="empty-state">该区间暂无统计数据。换个日期，或先用 AI 对话几轮再来查看。</div></div>';
+      return;
+    }
+
+    // 分片按需加载：先只加载当前区间缺的，加载期间显示占位
+    var missing = missingShards(current.selDates);
+    if (missing.length) {
+      rangeLabel.textContent = state.from + " ~ " + state.to + "（加载中…）";
+      app.innerHTML = '<div class="card"><div class="empty-state">正在加载 ' +
+        missing.length + " 天数据…</div></div>";
+      ensureShards(missing).then(function () {
+        if (token !== renderToken) return;   // 已被更新的渲染取代
+        render();
+      });
+      return;
+    }
+
+    current.agg = aggregate(current.selDates, state.model);
+    // 选中模型在当前区间没数据时自动回到全部，避免卡在空视图
+    if (state.model !== null && current.agg.total.turns === 0) {
+      state.model = null;
+      current.agg = aggregate(current.selDates, null);
+    }
+
+    var days = current.selDates.length;
+    rangeLabel.textContent = state.from + " ~ " + state.to +
+      "（" + days + " 天有记录，会话 " + fmtNum(turnsCount(current.selDates)) + " 轮）" +
+      (state.model !== null ? "　·　仅 " + modelName[state.model] : "");
+
+    current.rows = buildRows(current.selDates);
+    state.page = 0;
+
+    app.innerHTML =
+      renderTiles(current.agg) +
+      renderModels(current.agg) +
+      '<div class="row2">' +
+      '<div class="col-trend">' + renderTrend(current.agg) + "</div>" +
+      '<div class="col-cal">' + renderCalendar(current.agg) + "</div>" +
+      "</div>" +
+      renderDetail(current.agg);
+
+    bindDetailEvents();
+    bindModelRows();
+    bindCalendarEvents();
+    relayoutCharts();
+  }
+
+  /**
+   * 让「逐日趋势」与「用量热力图」两张卡片等高。
+   * 不用固定像素：热力图周数随区间变（1 个月 ≈ 5 列，3 个月 ≈ 13 列），
+   * 内容高度虽不变但边缘会因换行浮动，实测后互相取最大值最稳。
+   */
+  /**
+   * 两张卡片已由 CSS 固定为同一高度（250px），不再需要测量对齐。
+   * 这里只负责在布局稳定后重绘 canvas——它的尺寸取自容器，插入 DOM 时还没算好。
+   */
+  function relayoutCharts() {
+    if (current.agg && current.selDates.length > 0) {
+      drawTrend(current.selDates.slice().sort(), current.agg);
+    }
+  }
+
+  function turnsCount(ds) {
+    var n = 0;
+    for (var i = 0; i < ds.length; i++) {
+      var raw = shards[ds[i]];
+      n += raw ? raw.length : 0;
+    }
+    return n;
+  }
+
+  // 模型行点击 → 只统计该模型；再点一次取消
+  function bindModelRows() {
+    var rows = document.querySelectorAll(".mrow.clickable");
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].onclick = function (e) {
+        var idx = Number(e.currentTarget.getAttribute("data-model"));
+        state.model = state.model === idx ? null : idx;
+        state.query = "";
+        render();
+      };
+    }
+    var clear = document.getElementById("clearModel");
+    if (clear) clear.onclick = function () { state.model = null; render(); };
+  }
+
+  // 热力图：翻月 + 格子悬停即时提示
+  function bindCalendarEvents() {
+    var navs = document.querySelectorAll("#calCard [data-cal-nav]");
+    for (var i = 0; i < navs.length; i++) {
+      navs[i].onclick = function (e) {
+        var delta = Number(e.currentTarget.getAttribute("data-cal-nav"));
+        state.calMonth = shiftMonth(state.calMonth, delta);
+        render();
+      };
+    }
+    var grid = document.querySelector("#calCard .cal-grid");
+    if (!grid) return;
+    var lastTip = "";
+    grid.onmouseover = function (e) {
+      var cell = e.target;
+      if (!cell || !cell.tagName || cell.tagName !== "I") { hideTip(); lastTip = ""; return; }
+      lastTip = cell.getAttribute("data-tip") || "";
+      if (lastTip) showTip(lastTip, e.clientX, e.clientY);
+    };
+    grid.onmousemove = function (e) {
+      // 只挪位置，不重设内容，避免闪烁
+      if (lastTip) moveTip(e.clientX, e.clientY);
+    };
+    grid.onmouseleave = function () { hideTip(); lastTip = ""; };
+  }
+
+  function syncDateInputs() {
+    var f = document.getElementById("dateFrom");
+    var t = document.getElementById("dateTo");
+    if (f) f.value = state.from;
+    if (t) t.value = state.to;
+    markQuick();
+  }
+
+  /**
+   * 明细表内的联动：点时间只看那一天，点模型只看该模型。
+   *
+   * 用事件委托挂在 tbody 上——每次翻页都会重建 tbody 内容，
+   * 逐行绑定会随行数增长不断叠加监听器。
+   */
+  function bindDetailRowClicks(body) {
+    if (!body) return;
+    body.onclick = function (e) {
+      var cell = e.target;
+      while (cell && cell !== body && !cell.getAttribute) cell = cell.parentNode;
+      if (!cell || cell === body) return;
+
+      // 点时间列：把统计区间收敛到当天
+      var date = cell.getAttribute("data-date");
+      if (date) {
+        if (state.from === date && state.to === date) return;  // 已是当天，避免无谓重绘
+        state.from = date;
+        state.to = date;
+        state.page = 0;
+        syncDateInputs();
+        render();
+        return;
+      }
+
+      // 点模型列：按该模型筛选（再点一次取消）
+      var m = cell.getAttribute("data-model");
+      if (m !== null && m !== undefined && m !== "") {
+        var idx = Number(m);
+        if (!isFinite(idx)) return;
+        state.model = state.model === idx ? null : idx;
+        state.query = "";
+        state.page = 0;
+        render();
+      }
+    };
+  }
+
+  function bindDetailEvents() {
+    var q = document.getElementById("q");
+    var sortSel = document.getElementById("sortSel");
+    if (q) {
+      q.oninput = function () { state.query = q.value; state.page = 0; renderDetailPage(); };
+    }
+    if (sortSel) {
+      sortSel.value = state.sortKey;
+      sortSel.onchange = function () {
+        state.sortKey = sortSel.value;
+        state.sortDesc = true;
+        state.page = 0;
+        renderDetailPage();
+      };
+    }
+    var reloadBtn = document.getElementById("reloadData");
+    if (reloadBtn) reloadBtn.onclick = reloadDetail;
+  }
+
+  // ── 服务状态面板 ────────────────────────────────────────
+  // 页面是 file:// 静态文件，没有后台能力；所有控制都转发给 pi 进程内的
+  // 本地服务（127.0.0.1:7788）。服务不在时降级为「未连接」，只读不写。
+
+  var svcTimer = null;
+  var svcBusy = false;
+  var svcLastOk = 0;
+
+  function svcEl(id) { return document.getElementById(id); }
+
+  var svcErrTimer = null;
+
+  /**
+   * 在服务面板内显示错误并闪烁，替代 alert 弹窗。
+   * 弹窗会打断阅读、且 file:// 下样式不可控；这里就地提示更轻。
+   */
+  function showSvcError(msg) {
+    var box = svcEl("svcErr"), panel = svcEl("svc");
+    if (!box) return;
+    box.textContent = msg || "操作失败";
+    box.classList.remove("show");
+    void box.offsetWidth;              // 强制重排，让动画能重复触发
+    box.classList.add("show");
+
+    if (panel) {
+      panel.classList.remove("failed");
+      void panel.offsetWidth;
+      panel.classList.add("failed");
+    }
+
+    if (svcErrTimer) clearTimeout(svcErrTimer);
+    svcErrTimer = setTimeout(function () {
+      box.classList.remove("show");
+      if (panel) panel.classList.remove("failed");
+    }, 4200);
+  }
+
+  function clearSvcError() {
+    var box = svcEl("svcErr"), panel = svcEl("svc");
+    if (box) { box.classList.remove("show"); box.textContent = ""; }
+    if (panel) panel.classList.remove("failed");
+    if (svcErrTimer) { clearTimeout(svcErrTimer); svcErrTimer = null; }
+  }
+
+  /** 统一请求封装：超时短、失败不抛，交由调用方决定降级表现 */
+  function svcCall(path, body, timeoutMs) {
+    var ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, timeoutMs || 4000);
+    var opt = { method: body === undefined ? "GET" : "POST", cache: "no-store" };
+    if (body !== undefined) {
+      opt.headers = { "Content-Type": "application/json" };
+      opt.body = JSON.stringify(body);
+    }
+    if (ctrl) opt.signal = ctrl.signal;
+    return fetch(SERVICE_URL + path, opt)
+      .then(function (r) { return r.json(); })
+      .finally(function () { clearTimeout(timer); });
+  }
+
+  function fmtClock(ms) {
+    if (!ms) return "—";
+    var d = new Date(ms);
+    var p = function (n) { return n < 10 ? "0" + n : String(n); };
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  function fmtAgo(ms) {
+    if (!ms) return "—";
+    var diff = Math.max(0, Date.now() - ms);
+    if (diff < 60000) return Math.round(diff / 1000) + " 秒前";
+    if (diff < 3600000) return Math.round(diff / 60000) + " 分钟前";
+    return Math.round(diff / 3600000) + " 小时前";
+  }
+
+  /** 渲染服务面板。state 为 null 表示连不上服务 */
+  function paintService(state, errText) {
+    var dot = svcEl("svcDot"), val = svcEl("svcState");
+    var meta = svcEl("svcMeta"), toggle = svcEl("svcToggle");
+    var runNow = svcEl("svcRunNow"), sel = svcEl("svcInterval");
+    if (!dot || !val) return;
+
+    var auto = !!(state && state.autoEnabled);
+    var online = !!state;
+
+    // 状态点与文字
+    dot.className = "dot" + (online ? (state.lastError ? " err" : auto ? " on" : "") : " wait");
+    if (!online) {
+      val.className = "svc-val err";
+      val.textContent = "未连接";
+    } else if (state.lastError) {
+      val.className = "svc-val err";
+      val.textContent = "统计出错";
+    } else if (auto) {
+      val.className = "svc-val on";
+      val.textContent = "运行中";
+    } else {
+      val.className = "svc-val off";
+      val.textContent = "已停止";
+    }
+
+    // 时间信息：上次 / 下次 / 耗时
+    var lines = [];
+    if (!online) {
+      lines.push("执行 /stats 统计查询可拉起服务");
+    } else {
+      if (state.lastError) {
+        lines.push("错误：" + state.lastError);
+      } else if (state.lastRunAt) {
+        lines.push("上次 " + fmtClock(state.lastRunAt) + "（" + fmtAgo(state.lastRunAt) + "）" +
+          "　" + state.lastTurns + " 轮　" + state.lastCostMs + " ms");
+      } else {
+        lines.push("尚未统计");
+      }
+      lines.push(auto
+        ? "下次 " + fmtClock(state.nextRunAt) + "　每 " + Math.round(state.intervalMs / 60000) + " 分钟"
+        : "自动统计已停，对话不会写入报表");
+    }
+    meta.innerHTML = lines.map(function (t) { return esc(t); }).join("<br>");
+
+    // 控件状态
+    toggle.textContent = auto ? "暂停自动统计" : "开启自动统计";
+    toggle.className = "svc-btn" + (auto ? " stop" : "");
+    toggle.disabled = !online || svcBusy;
+    if (runNow) runNow.disabled = !online || svcBusy;
+    if (sel) {
+      sel.disabled = !online || svcBusy;
+      if (online && !svcBusy) {
+        var mins = String(Math.round(state.intervalMs / 60000));
+        if (sel.value !== mins && sel.querySelector('option[value="' + mins + '"]')) sel.value = mins;
+      }
+    }
+    if (!online && errText) meta.innerHTML = esc(errText);
+  }
+
+  function refreshServiceStatus() {
+    if (svcBusy) return;
+    svcCall("/api/status", undefined, 2500)
+      .then(function (r) {
+        if (r && r.ok) {
+          svcLastOk = Date.now();
+          paintService(r.state);
+        } else {
+          paintService(null);
+        }
+      })
+      .catch(function () {
+        paintService(null, "无法连接本地服务（127.0.0.1:7788）\n执行 /stats 统计查询可拉起");
+      });
+  }
+
+  function svcAction(path, body) {
+    svcBusy = true;
+    return svcCall(path, body === undefined ? {} : body, 20000)
+      .then(function (r) {
+        if (r && r.ok) return r.state;
+        throw new Error((r && r.error) || "操作失败");
+      })
+      .finally(function () {
+        svcBusy = false;
+        refreshServiceStatus();
+      });
+  }
+
+  function bindService() {
+    var toggle = svcEl("svcToggle"), runNow = svcEl("svcRunNow"), sel = svcEl("svcInterval");
+    if (!toggle) return;
+
+    toggle.onclick = function () {
+      // 按当前状态反推目标动作，避免依赖按钮文案判断
+      var auto = svcEl("svcState").textContent === "运行中";
+      toggle.disabled = true;
+      svcAction(auto ? "/api/stop" : "/api/start")
+        .catch(function (e) { showSvcError(e.message); });
+    };
+
+    var shutdown = svcEl("svcShutdown");
+    if (shutdown) {
+      // 停止服务直接执行，不再二次确认
+      shutdown.onclick = function () {
+        shutdown.disabled = true;
+        clearSvcError();
+        svcCall("/api/shutdown", {}, 4000)
+          .then(function () { paintService(null, "服务已停止，执行 /stats 统计查询可重新拉起"); })
+          .catch(function () { paintService(null, "服务已停止，执行 /stats 统计查询可重新拉起"); })
+          .finally(function () {
+            if (svcTimer) { clearInterval(svcTimer); svcTimer = null; }
+          });
+      };
+    }
+
+    if (runNow) {
+      runNow.onclick = function () {
+        runNow.classList.add("busy");
+        runNow.disabled = true;
+        svcAction("/api/run-now")
+          .then(function (st) {
+            // 立刻统计后数据变了：顺带刷新页面数据
+            return reloadAfterStats(st);
+          })
+          .catch(function (e) { showSvcError(e.message); })
+          .finally(function () {
+            runNow.classList.remove("busy");
+            runNow.disabled = false;
+          });
+      };
+    }
+
+    if (sel) {
+      sel.onchange = function () {
+        var mins = Number(sel.value) || 1;
+        svcAction("/api/interval", { intervalMs: mins * 60000 })
+          .catch(function (e) { showSvcError(e.message); });
+      };
+    }
+
+    refreshServiceStatus();
+    if (svcTimer) clearInterval(svcTimer);
+    svcTimer = setInterval(refreshServiceStatus, SERVICE_POLL_MS);
+  }
+
+  /**
+   * 立刻统计后重读索引与当天分片，让页面数据跟上。
+   * 只重注入索引脚本 + 清掉分片缓存，随后走一次完整 render ——
+   * 因为新数据可能带来新的日期/模型，总体统计必须整块重算。
+   */
+  function reloadAfterStats(state) {
+    if (!state || !state.lastRunAt) return null;
+    return new Promise(function (resolve) {
+      var el = document.createElement("script");
+      el.src = "report-index.js?t=" + Date.now();
+      el.onload = function () {
+        var idx = window.__REPORT_INDEX__;
+        if (!idx || idx.version !== EXPECTED_VERSION) return resolve(null);
+        resetFromIndex();
+        state.page = 0;
+        render();
+        resolve(true);
+      };
+      el.onerror = function () { resolve(null); };
+      document.body.appendChild(el);
+    });
+  }
+
+  /**
+   * 页码下拉面板：开合、跳页、点外部关闭。
+   *
+   * 面板默认显示 10 项高度，当前页在列表里会自动滚到可见位置——
+   * 否则翻到第 200 页时打开面板还要手动往下滚很久。
+   */
+  function bindPageNav() {
+    var nav = document.getElementById("pageNav");
+    if (!nav) return;
+    var btn = nav.querySelector(".btn");
+    var panel = nav.querySelector(".panel");
+    if (!btn || !panel) return;
+
+    // 当前页滚到可视区
+    var active = panel.querySelector(".on");
+    if (active) {
+      var top = active.offsetTop;
+      var h = panel.clientHeight;
+      if (top < panel.scrollTop || top + active.offsetHeight > panel.scrollTop + h) {
+        panel.scrollTop = Math.max(0, top - h / 2 + active.offsetHeight / 2);
+      }
+    }
+
+    btn.onclick = function (e) {
+      e.stopPropagation();
+      nav.classList.toggle("open");
+    };
+
+    panel.onclick = function (e) {
+      var item = e.target;
+      while (item && item !== panel && item.tagName !== "I") item = item.parentNode;
+      if (!item || item === panel) return;
+      var target = Number(item.getAttribute("data-page"));
+      if (isFinite(target)) {
+        state.page = target;
+        renderDetailPage();
+      }
+    };
+
+    // 点面板外任意处收起。只绑一次，用标记避免重复叠加监听
+    if (!nav.dataset.bound) {
+      nav.dataset.bound = "1";
+      document.addEventListener("click", function () {
+        var cur = document.getElementById("pageNav");
+        if (cur) cur.classList.remove("open");
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+          var cur = document.getElementById("pageNav");
+          if (cur) cur.classList.remove("open");
+        }
+      });
+    }
+  }
+
+  // ── 刷新明细：只重读当前区间的分片，不动上方统计 ────────
+  // 按钮在「逐轮明细」工具栏里，语义就是刷新下面的请求详情。
+  // 若连索引一起重载，会连带重置模型筛选、日期区间和滚动位置，
+  // 与「刷新列表」的直觉不符，所以这里只做明细这一块。
+  var reloading = false;
+
+  /** 重新注入指定日期的分片，覆盖内存里已缓存的旧数据 */
+  function reloadShards(list) {
+    return new Promise(function (resolve) {
+      var pos = 0;
+      function next() {
+        if (pos >= list.length) return resolve();
+        var date = list[pos++];
+        var el = document.createElement("script");
+        el.src = "report-day-" + date + ".js?t=" + Date.now();
+        el.onload = function () {
+          var day = window.__REPORT_DAY__;
+          if (day && day.date === date && day.version === EXPECTED_VERSION) {
+            shards[date] = day.turns || [];
+            delete unpacked[date];        // 解包缓存必须一起失效
+          }
+          next();
+        };
+        el.onerror = function () {
+          // 分片已不存在（数据被清理）：当作该日无记录，并清掉旧缓存
+          shards[date] = [];
+          delete unpacked[date];
+          next();
+        };
+        document.body.appendChild(el);
+      }
+      next();
+    });
+  }
+
+  function reloadDetail() {
+    if (reloading) return;
+    if (!current.selDates.length) return;
+    reloading = true;
+    setRefreshBusy(true);
+
+    // 记下发起时的区间与渲染代次：刷新期间用户若切了区间，
+    // 结果不能再往新区间上套（否则表格与上方统计会对不上）
+    var want = current.selDates.slice();
+    var token = renderToken;
+
+    reloadShards(want).then(function () {
+      reloading = false;
+      setRefreshBusy(false);
+      if (token !== renderToken) return;   // 区间已变，交由那次 render 决定
+
+      // 只重建明细行与表格，不动总览/趋势/热力图
+      current.rows = buildRows(current.selDates);
+      state.page = 0;
+
+      if (document.getElementById("detailBody")) {
+        renderDetailPage();
+      } else {
+        // 上次渲染时该区间没有记录（走了 empty-state），此时整块重绘明细卡片
+        var card = document.getElementById("detailCard");
+        if (card) {
+          card.outerHTML = renderDetail(current.agg);
+          bindDetailEvents();
+        }
+      }
+    });
+  }
+
+  function setRefreshBusy(busy) {
+    var btn = document.getElementById("reloadData");
+    if (!btn) return;
+    btn.disabled = busy;
+    if (busy) btn.classList.add("busy");
+    else btn.classList.remove("busy");
+  }
+
+  // ── 顶部统计区间：日期框常显 + 右侧快捷按钮 ─────────────
+  var quickBtns = document.querySelectorAll(".dates .quick button");
+
+  /** 把预设 key 解析成实际起止日期 */
+  function resolveRange(key) {
+    if (key === "today") return { from: todayStr, to: todayStr };
+    if (key === "d7") return { from: shiftDay(todayStr, -6), to: todayStr };
+    if (key === "d30") return { from: shiftDay(todayStr, -29), to: todayStr };
+    if (key === "d90") return { from: shiftDay(todayStr, -89), to: todayStr };
+    return null;
+  }
+
+  /** 只有当前区间正好等于某个预设时才高亮对应按钮 */
+  function markQuick() {
+    for (var i = 0; i < quickBtns.length; i++) {
+      var key = quickBtns[i].getAttribute("data-quick");
+      var preset = resolveRange(key);
+      var hit = preset && preset.from === state.from && preset.to === state.to;
+      quickBtns[i].classList.toggle("on", Boolean(hit));
+    }
+  }
+
+  function applyQuick(key) {
+    var preset = resolveRange(key);
+    if (!preset) return;
+    state.from = preset.from;
+    state.to = preset.to;
+    syncDateInputs();
+    state.query = "";
+    render();
+  }
+
+  for (var qi = 0; qi < quickBtns.length; qi++) {
+    quickBtns[qi].onclick = function (e) {
+      applyQuick(e.currentTarget.getAttribute("data-quick"));
+    };
+  }
+
+  // 手改日期：应用按钮 + 日期框直接改都生效（此时不属任何预设，快捷按钮自动取消高亮）
+  function applyCustomDates() {
+    var f = document.getElementById("dateFrom").value;
+    var t = document.getElementById("dateTo").value;
+    if (!f || !t) return;
+    state.from = f <= t ? f : t;
+    state.to = f <= t ? t : f;
+    state.query = "";
+    render();
+  }
+  document.getElementById("applyRange").onclick = applyCustomDates;
+  document.getElementById("dateFrom").onchange = applyCustomDates;
+  document.getElementById("dateTo").onchange = applyCustomDates;
+
+  // 窗口尺寸变化时重绘折线（Canvas 不像 SVG 会自适应）
+  var rt;
+  window.addEventListener("resize", function () {
+    clearTimeout(rt);
+    rt = setTimeout(function () {
+      relayoutCharts();
+      if (current.agg && current.selDates.length > 1) drawTrend(current.selDates.slice().sort(), current.agg);
+    }, 150);
+  });
+
+  foot.textContent = "数据生成于 " + new Date(IDX.generatedAt).toLocaleString("zh-CN") +
+    "　·　共 " + dates.length + " 天 / " + IDX.models.length + " 个模型" +
+    "　·　逐日分片按需加载";
+
+  render();
+  bindService();
+})();
+</script>
+</body>
+</html>

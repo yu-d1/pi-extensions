@@ -25,15 +25,37 @@ import {
   appendFile,
   mkdir,
   readFile,
+  readdir,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { BUILTIN_PLANS, bindMimoFeedback, checkLoginPlanPrereq, mimoLog, resetMimoLoginBackoff } from "./plans";
 import type { PlanFormatContext, QuotaStyle, TokenPlan } from "./plans";
 import type { TokenPrecision } from "./format";
-import { formatAmount, formatDuration, formatLatency, formatPercent, formatSpeed, formatTokens } from "./format";
+import {
+  UNKNOWN_MODEL_KEY,
+  addUsageToBucket,
+  bucketPromptTokens,
+  calcCacheHitRate,
+  detectInputScope,
+  createEmptyBucket,
+  formatAmount,
+  formatDuration,
+  formatLatency,
+  formatPercent,
+  formatSpeed,
+  formatTokens,
+  getModelKey,
+  normalizeBucket,
+} from "./format";
+import type { InputScope, ModelKey, TokenBucket, UsageDelta } from "./format";
+import { REPORT_HTML_PATH, rebuildDay, writeReportData } from "./report";
+import { formatBytes, isEmpty, listAllDates, planPurge, runPurge } from "./purge";
+import { DEFAULT_PORT, MIN_INTERVAL_MS, StatsServer } from "./server";
 export type { QuotaStyle } from "./plans";
 
 // ── 路径 ──────────────────────────────────────────────────
@@ -67,9 +89,32 @@ interface TurnStats {
   liveTokenSpeed: number | null; // 流式 rolling window 速率
 }
 
+/**
+ * 落盘的逐轮记录：按模型归类统计的唯一数据源。
+ * model 形如 `provider/modelId`（首版就有，最完整）；provider/modelId 是后加的显式字段。
+ */
 interface RawRecord extends TurnStats {
   ts: string;
   session: string;
+  provider?: string;
+  modelId?: string;
+  /**
+   * 该轮 input 字段是否已包含缓存。
+   *
+   * 不同 provider 的 Anthropic 兼容端点行为不一致：有的（标准）把 input 当纯新增，
+   * 有的（实测 minimax、commandcodego）把 input 当含缓存的总量。判定后落盘，
+   * 避免每轮重新推断——推断需要「上一轮 input」，而聚合时顺序可能已被打乱。
+   * 缺省视为 exclusive（与 pi-ai 的 OpenAI 通道一致，也是历史数据的实际口径）。
+   */
+  inputScope?: InputScope;
+}
+
+/** 按模型归类的累计量（会话、时间窗口、报表都复用它） */
+interface ModelUsage {
+  modelKey: ModelKey;
+  bucket: TokenBucket;
+  /** 该区间内输出速率之和，配合 turns 求均值 */
+  sumTokensPerSec: number;
 }
 
 interface HourlyRecord {
@@ -81,6 +126,7 @@ interface HourlyRecord {
   sumCacheRead: number;
   sumCacheWrite: number;
   sumTokensPerSec: number;
+  /** 历史遗留字段（算术平均，展示已改用加权口径），仅为兼容旧文件保留 */
   avgCacheHitRate: number;
 }
 
@@ -92,6 +138,7 @@ interface DailyRecord {
   sumCacheRead: number;
   sumCacheWrite: number;
   sumTokensPerSec: number;
+  /** 历史遗留字段（算术平均，展示已改用加权口径），仅为兼容旧文件保留 */
   avgCacheHitRate: number;
 }
 interface TokenConfig {
@@ -150,31 +197,33 @@ interface LiveTokenSample {
   tokens: number;
 }
 
+/** 单轮快照（用于单轮命中率骤降时提示缓存失效） */
+interface TurnSnapshot extends TokenBucket {
+  modelKey: ModelKey;
+  tokensPerSec: number;
+  cacheHitRate: number | null;
+  at: number;
+}
+
+/**
+ * 会话统计状态机：按模型分桶（byModel）+ 当前激活模型指针 + 全会话汇总。
+ * KV Cache 按 provider+model 隔离，累计量不能混在一个桶里，否则切模型后
+ * 旧模型的 cacheRead 会污染新模型的命中率，且不可修复（只能等重启会话）。
+ */
 const stats = {
-  // 累计会话
-  totalInput: 0,
-  totalOutput: 0,
-  totalCacheRead: 0,
-  totalCacheWrite: 0,
-  totalCost: 0,
-  turnCount: 0,
+  /** 当前激活模型（`provider/model`），footer 的 CH% 以它为准 */
+  activeModelKey: null as ModelKey | null,
+  /** 按模型归类的累计量 */
+  byModel: new Map<ModelKey, TokenBucket>(),
+  /** 每个模型最近一轮的快照 */
+  lastTurnByModel: new Map<ModelKey, TurnSnapshot>(),
   // 本轮计时
   turnStartTime: 0,
   firstTokenTime: 0,
   streaming: false,
-  // 缓存命中率累加（用于平均值）
-  totalCacheHitRateSum: 0,
-  // 本轮最终（message_end 时写入）
-  lastInput: 0,
-  lastOutput: 0,
-  lastCacheRead: 0,
-  lastCacheWrite: 0,
-  lastCost: 0,
-  lastCacheHitRate: 0,
   lastTokensPerSec: 0,           // 平均速率（output / elapsed）
   lastLiveTokenSpeed: null as number | null, // rolling window 速率
   lastFirstTokenLatency: 0,      // 首 token 延迟（毫秒）
-  lastWordCount: 0,              // 输出词数
   // ── 流式 rolling window 状态 ─────────────────────────
   liveOutputChars: 0,
   liveEstimatedTokens: 0,
@@ -183,6 +232,43 @@ const stats = {
   // ── 去重（防止 message_end + turn_end 重复累加）───
   accountedUsageKeys: new Set<string>(),
 };
+
+/** 取指定模型（缺省为当前激活模型）的累计桶，不自动建桶 */
+function getModelBucket(modelKey: ModelKey | null = stats.activeModelKey): TokenBucket | null {
+  if (!modelKey) return null;
+  return stats.byModel.get(modelKey) ?? null;
+}
+
+/** 取指定模型的累计桶，不存在则建空桶 */
+function ensureModelBucket(modelKey: ModelKey): TokenBucket {
+  let bucket = stats.byModel.get(modelKey);
+  if (!bucket) {
+    bucket = createEmptyBucket();
+    stats.byModel.set(modelKey, bucket);
+  }
+  return bucket;
+}
+
+/** 会话统计重置（session_start / 历史重放前） */
+function resetSessionStats() {
+  stats.byModel = new Map();
+  stats.lastTurnByModel = new Map();
+  stats.accountedUsageKeys = new Set();
+  stats.lastTokensPerSec = 0;
+}
+
+/** 当前模型键：优先用 ctx 里的模型，缺失时回退到已记住的激活模型 */
+function resolveActiveModelKey(ctx: ExtensionContext): ModelKey | null {
+  const m = ctx.model;
+  if (m?.provider || m?.id) return getModelKey(m.provider, m.id);
+  return stats.activeModelKey;
+}
+
+/** 当前模型是否已存在历史累计（切换后用于区分「新模型冷启动」与「切回旧模型」） */
+function hasHistory(modelKey: ModelKey | null): boolean {
+  const bucket = getModelBucket(modelKey);
+  return !!bucket && bucket.turns > 0;
+}
 // ── 套餐用量状态 ─────────────────────────────────────────
 
 interface QuotaDisplayState {
@@ -355,22 +441,33 @@ function buildMetricSegments(theme: ExtensionContext["ui"]["theme"], ctx: Extens
 
   // ── 产出段：↓ $ ↑ Σ CH TTFT T+ ─────────────────────
   {
+    // 一律只统计当前模型：不同模型缓存机制与单价不同，混算出来的数没有参考价值
+    const modelBucket = getModelBucket();
+    // 切到还没用过的模型时桶为空，用量按 0 显示（保持 footer 布局稳定，不闪段）
+    const bucket = modelBucket ?? createEmptyBucket();
+
     const segParts: string[] = [];
-    if (cfg.output) segParts.push(`↓${formatTokens(stats.totalOutput, P.token)}`);
+    if (cfg.output) segParts.push(`↓${formatTokens(bucket.output, P.token)}`);
     // 没有花费数据（provider 不返回 usage.cost）时不显示 $0.00 误导用户
-    if (cfg.cost && stats.totalCost > 0) segParts.push(formatAmount(stats.totalCost, P.costAmount));
-    if (cfg.input) segParts.push(`↑${formatTokens(stats.totalInput, P.token)}`);
+    if (cfg.cost && bucket.cost > 0) segParts.push(formatAmount(bucket.cost, P.costAmount));
+    if (cfg.input) segParts.push(`↑${formatTokens(bucket.input, P.token)}`);
     if (cfg.totalTokens) {
-      const total = stats.totalInput + stats.totalOutput;
+      const total = bucket.input + bucket.output;
       segParts.push(`Σ${formatTokens(total, P.token)}`);
     }
     if (cfg.cacheHit) {
-      const totalPrompt = stats.totalInput + stats.totalCacheRead + stats.totalCacheWrite;
-      // 无任何 prompt 数据时不显示 CH 0%（那是“无数据”而不是命中率为零）
-      if (totalPrompt > 0) {
-        const cumCH = (stats.totalCacheRead / totalPrompt) * 100;
-        const chColor = cumCH >= 80 ? ok : cumCH >= 50 ? (s: string) => s : warn;
-        segParts.push(`${dim("CH")} ${chColor(formatPercent(cumCH, P.cacheHitPercent))}`);
+      // CH% 只算当前模型（跨模型算平均命中率没有工程意义）
+      // 切到还没用过的模型时没有分母，命中率按 0% 显示并保持该段不消失
+      const cumCH = calcCacheHitRate(modelBucket) ?? 0;
+      const chColor = cumCH >= 80 ? ok : cumCH >= 50 ? (s: string) => s : warn;
+      const lastTurn = stats.activeModelKey ? stats.lastTurnByModel.get(stats.activeModelKey) : undefined;
+      const lastCH = lastTurn?.cacheHitRate ?? null;
+      // 累计命中率尚可但最新一轮跌得很惨 → 前缀缓存断了（Prefix Break）
+      const brokenPrefix = cumCH >= 60 && lastCH !== null && lastCH < 20;
+      const label = brokenPrefix ? warn("CH!") : dim("CH");
+      segParts.push(`${label} ${chColor(formatPercent(cumCH, P.cacheHitPercent))}`);
+      if (brokenPrefix && lastCH !== null) {
+        segParts.push(warn(`↓${formatPercent(lastCH, P.cacheHitPercent)}`));
       }
     }
     if (cfg.latency) segParts.push(`${dim("TTFT")} ${formatLatency(stats.lastFirstTokenLatency)}`);
@@ -497,6 +594,54 @@ async function appendRaw(record: RawRecord) {
   await appendFile(file, JSON.stringify(record) + "\n", "utf-8");
 }
 
+/**
+ * 从逐轮记录解析模型键。
+ * 优先用显式 provider/modelId；缺失时回退解析 model 字段（首版就有，覆盖最全）。
+ * modelId 自己可能含 "/"（如 deepseek/deepseek-v4.1-flash），所以只按第一个 "/" 切。
+ */
+function recordModelKey(record: Partial<RawRecord>): ModelKey {
+  if (record.provider || record.modelId) return getModelKey(record.provider, record.modelId);
+  const raw = (record.model ?? "").trim();
+  return raw.includes("/") ? raw : UNKNOWN_MODEL_KEY;
+}
+
+/** 把一轮消耗并入时间窗口聚合（hourly / daily 共用） */
+function mergePeriodRecord(
+  target: HourlyRecord | DailyRecord,
+  record: RawRecord,
+): void {
+  const prevCount = Number(target.count) || 0;
+  const newCount = prevCount + 1;
+  const prevAvg = Number(target.avgCacheHitRate) || 0;
+
+  // 与 groupByModel 同口径归一，否则 daily/hourly 的总量会比 raw 明细偏大
+  const usage = recordUsage(record);
+  target.count = newCount;
+  target.sumInput += usage.input;
+  target.sumOutput += usage.output;
+  target.sumCacheRead += usage.cacheRead;
+  target.sumCacheWrite += usage.cacheWrite;
+  target.sumTokensPerSec += record.tokensPerSec;
+  // 历史遗留字段（展示已改用加权口径），继续维护仅为兼容旧版本读取
+  target.avgCacheHitRate = (prevAvg * prevCount + record.cacheHitRate) / newCount;
+}
+
+/** 新建一个时间窗口记录 */
+function createPeriodRecord(date: string, record: RawRecord): HourlyRecord | DailyRecord {
+  const empty: HourlyRecord | DailyRecord = {
+    date,
+    count: 0,
+    sumInput: 0,
+    sumOutput: 0,
+    sumCacheRead: 0,
+    sumCacheWrite: 0,
+    sumTokensPerSec: 0,
+    avgCacheHitRate: 0,
+  };
+  mergePeriodRecord(empty, record);
+  return empty;
+}
+
 async function updateHourly(record: RawRecord) {
   await ensureDir(HOURLY_DIR);
   const date = record.ts.slice(0, 10);
@@ -516,32 +661,9 @@ async function updateHourly(record: RawRecord) {
   );
 
   if (idx >= 0) {
-    const r = records[idx];
-    const newCount = r.count + 1;
-    records[idx] = {
-      date,
-      hour,
-      count: newCount,
-      sumInput: r.sumInput + record.input,
-      sumOutput: r.sumOutput + record.output,
-      sumCacheRead: r.sumCacheRead + record.cacheRead,
-      sumCacheWrite: r.sumCacheWrite + record.cacheWrite,
-      sumTokensPerSec: r.sumTokensPerSec + record.tokensPerSec,
-      avgCacheHitRate:
-        ((r.avgCacheHitRate * r.count + record.cacheHitRate) / newCount),
-    };
+    mergePeriodRecord(records[idx], record);
   } else {
-    records.push({
-      date,
-      hour,
-      count: 1,
-      sumInput: record.input,
-      sumOutput: record.output,
-      sumCacheRead: record.cacheRead,
-      sumCacheWrite: record.cacheWrite,
-      sumTokensPerSec: record.tokensPerSec,
-      avgCacheHitRate: record.cacheHitRate,
-    });
+    records.push({ ...(createPeriodRecord(date, record) as HourlyRecord), hour });
   }
 
   await writeFile(
@@ -567,30 +689,9 @@ async function updateDaily(record: RawRecord) {
   const idx = records.findIndex((r) => r.date === date);
 
   if (idx >= 0) {
-    const r = records[idx];
-    const newCount = r.count + 1;
-    records[idx] = {
-      date,
-      count: newCount,
-      sumInput: r.sumInput + record.input,
-      sumOutput: r.sumOutput + record.output,
-      sumCacheRead: r.sumCacheRead + record.cacheRead,
-      sumCacheWrite: r.sumCacheWrite + record.cacheWrite,
-      sumTokensPerSec: r.sumTokensPerSec + record.tokensPerSec,
-      avgCacheHitRate:
-        ((r.avgCacheHitRate * r.count + record.cacheHitRate) / newCount),
-    };
+    mergePeriodRecord(records[idx], record);
   } else {
-    records.push({
-      date,
-      count: 1,
-      sumInput: record.input,
-      sumOutput: record.output,
-      sumCacheRead: record.cacheRead,
-      sumCacheWrite: record.cacheWrite,
-      sumTokensPerSec: record.tokensPerSec,
-      avgCacheHitRate: record.cacheHitRate,
-    });
+    records.push(createPeriodRecord(date, record) as DailyRecord);
   }
 
   await writeFile(
@@ -600,15 +701,322 @@ async function updateDaily(record: RawRecord) {
   );
 }
 
-async function persistTurn(record: TurnStats, sessionId: string) {
+// ── 当天分片自动重建 ────────────────────────────────────
+// 分片化之后「重建今天」只需读当天一个 raw 文件，通常几毫秒，
+// 所以可以挂在 agent_end 上自动跑，日常对话产生的数据无需再手动执行 /stats html。
+// 仍做节流：连续多轮对话时没必要每轮都写文件，攒一会儿一次性重建即可。
+
+const SHARD_REBUILD_INTERVAL_MS = 30_000;
+let shardRebuildTimer: ReturnType<typeof setTimeout> | null = null;
+let shardRebuildAt = 0;
+
+/**
+ * 自动统计总开关。
+ * 关掉后 agent_end 不再重建分片——否则用户点了「停止服务」，
+ * 却因为继续对话而看到数据仍在更新，语义矛盾。
+ * 手动「立刻统计」不受此开关限制。
+ */
+let autoStatsEnabled = true;
+
+/** 供服务端调用：跟随自动统计开关启停 agent_end 重建 */
+function setAutoStatsEnabled(enabled: boolean): void {
+  autoStatsEnabled = enabled;
+  if (!enabled && shardRebuildTimer) {
+    clearTimeout(shardRebuildTimer);
+    shardRebuildTimer = null;
+  }
+}
+
+function scheduleShardRebuild(): void {
+  if (!autoStatsEnabled) return;   // 自动统计已停：不排重建
+  const now = Date.now();
+  const wait = Math.max(0, shardRebuildAt + SHARD_REBUILD_INTERVAL_MS - now);
+  if (shardRebuildTimer) return; // 已排队，等它跑
+  shardRebuildTimer = setTimeout(() => {
+    shardRebuildTimer = null;
+    shardRebuildAt = Date.now();
+    // 失败不影响对话：报表数据是旁路功能，不能因为写文件出错就报错给用户
+    void rebuildDay().catch(() => {});
+  }, wait);
+  // 不阻止进程退出
+  (shardRebuildTimer as { unref?: () => void }).unref?.();
+}
+
+// ── 本地统计服务 ────────────────────────────────────────
+// 报表页面是 file:// 静态页，无法创建进程，所以「启动/停止定时统计」
+// 必须由 pi 进程内的 HTTP 服务承接。服务随 /stats 统计查询拉起，
+// 页面只负责查询状态和下发停止指令。
+// 跨 /reload 复用：新实例若发现端口已在监听，说明旧实例还在跑，直接沿用状态。
+
+let statsServer: StatsServer | null = null;
+let statsServerStarting: Promise<StatsServer | null> | null = null;
+let statsServerUrl = "";
+
+const STATS_INTERVAL_MS = 60_000;   // 默认 1 分钟
+
+async function ensureStatsServer(
+  pi: ExtensionAPI,
+  notify?: (text: string) => void,
+): Promise<StatsServer | null> {
+  if (statsServer) return statsServer;
+  if (statsServerStarting) return statsServerStarting;
+
+  statsServerStarting = (async () => {
+    const srv = new StatsServer({
+      port: DEFAULT_PORT,
+      intervalMs: STATS_INTERVAL_MS,
+      runOnce: async () => {
+        const r = await rebuildDay();
+        return r?.turns ?? 0;
+      },
+      // 停止时同步关掉 agent_end 那条路径，避免「已停止仍在统计」
+      onAutoToggle: (enabled) => setAutoStatsEnabled(enabled),
+    });
+    try {
+      await srv.listen();
+      statsServer = srv;
+      statsServerUrl = `http://127.0.0.1:${srv.port}/`;
+      // 服务不阻止进程退出：pi 关掉后页面自然显示「服务未运行」
+      return srv;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EADDRINUSE") {
+        notify?.(`端口 ${DEFAULT_PORT} 已被其它程序占用，服务未启动`);
+      } else {
+        notify?.(`本地服务启动失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return null;
+    } finally {
+      statsServerStarting = null;
+    }
+  })();
+  return statsServerStarting;
+}
+
+/**
+ * 查该模型最近一条已落盘记录的口径，作为首轮/无法判定时的兜底。
+ * 口径是 provider 的固有属性，同一模型不会每轮变来变去。
+ */
+async function modelInputScope(provider: string, modelId: string): Promise<InputScope> {
+  const key = getModelKey(provider, modelId);
+  const today = getDateStr();
+  const yesterday = getDateStr(Date.now() - 86400000);
+  for (const date of [today, yesterday]) {
+    let text: string;
+    try {
+      text = await readFile(join(RAW_DIR, `${date}.jsonl`), "utf-8");
+    } catch {
+      continue;
+    }
+    const lines = text.trim().split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      try {
+        const prev = JSON.parse(line) as RawRecord;
+        if (recordModelKey(prev) === key && prev.inputScope) return prev.inputScope;
+      } catch {
+        continue;
+      }
+    }
+  }
+  return "exclusive";
+}
+
+/**
+ * 读同一会话最近一条记录的 input，用于判定本轮 input 的口径。
+ * 只回看今天与昨天的文件：一次会话极少跨更多天，全量扫描得不偿失。
+ */
+async function lastSessionInput(sessionId: string): Promise<number> {
+  const today = getDateStr();
+  const yesterday = getDateStr(Date.now() - 86400000);
+  for (const date of [today, yesterday]) {
+    let text: string;
+    try {
+      text = await readFile(join(RAW_DIR, `${date}.jsonl`), "utf-8");
+    } catch {
+      continue;
+    }
+    const lines = text.trim().split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      try {
+        const prev = JSON.parse(line) as RawRecord;
+        if (prev.session === sessionId && prev.input > 0) return prev.input;
+      } catch {
+        continue;
+      }
+    }
+  }
+  return 0;
+}
+
+async function persistTurn(record: TurnStats, sessionId: string, provider: string, modelId: string) {
+  // 判定 input 口径：cacheRead ≈ 上一轮 input 说明 input 已含缓存。
+  // 首轮（无上一条）无从判断，沿用同模型已有记录的口径，默认 exclusive。
+  const prevInput = await lastSessionInput(sessionId);
+  const detected = detectInputScope(prevInput, record.cacheRead);
+  const inputScope: InputScope = detected ?? (await modelInputScope(provider, modelId));
+
   const raw: RawRecord = {
     ...record,
     ts: getISO(),
     session: sessionId,
+    provider,
+    modelId,
+    inputScope,
   };
   await appendRaw(raw);
   await updateHourly(raw);
   await updateDaily(raw);
+}
+
+// ── 逐轮明细读取（按模型归类统计的数据源） ───────────────
+// 模型维度不落在 hourly/daily 聚合里：那需要逐日累积，漏跑一天就永远是空的。
+// raw 是逐轮落盘的事实源，天然带 model，且文件名就是日期，区间查询可预筛。
+
+/** 读取日期区间 [from, to] 内的逐轮记录（用文件名预筛，不解析无关文件） */
+async function loadRawRecords(from: string, to: string): Promise<RawRecord[]> {
+  let names: string[];
+  try {
+    names = await readdir(RAW_DIR);
+  } catch {
+    return [];
+  }
+
+  const files = names
+    .filter((n) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(n))
+    .map((n) => n.slice(0, 10))
+    .filter((d) => d >= from && d <= to)
+    .sort();
+
+  const out: RawRecord[] = [];
+  for (const date of files) {
+    let text: string;
+    try {
+      text = await readFile(join(RAW_DIR, `${date}.jsonl`), "utf-8");
+    } catch {
+      continue; // 单个文件读失败不影响整体
+    }
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        out.push(JSON.parse(trimmed) as RawRecord);
+      } catch {
+        // 坏行跳过，不阻断整份报表
+      }
+    }
+  }
+  backfillScope(out);
+  return out;
+}
+
+/**
+ * 给缺 inputScope 的老记录补上口径。
+ *
+ * 老数据没有这个字段，但口径是 provider 的固有属性，同一模型不会来回变：
+ * 用该模型已判定过的口径回填；从未判定过的，用「cacheRead ≈ 同会话上一轮 input」
+ * 现场推断（这正是 inclusive 的特征）。推断不出来的保持 undefined，
+ * 由 recordUsage 按 exclusive 处理——沿用 pi-ai 官方语义，
+ * 宁可少算缓存，也不凭空放大命中率。
+ */
+function backfillScope(records: RawRecord[]): void {
+  const decided = new Map<ModelKey, InputScope>();
+  for (const record of records) {
+    if (record.inputScope) decided.set(recordModelKey(record), record.inputScope);
+  }
+
+  // 按时间正序推断：同会话上一条的 input 是本轮缓存量的参照上限
+  const ordered = records.slice().sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  const lastInput = new Map<string, number>();
+  for (const record of ordered) {
+    const key = recordModelKey(record);
+    const session = record.session || "";
+    if (!record.inputScope) {
+      const guessed = decided.get(key)
+        ?? detectInputScope(lastInput.get(session) ?? 0, Number(record.cacheRead) || 0);
+      if (guessed) {
+        record.inputScope = guessed;
+        decided.set(key, guessed);
+      }
+    }
+    lastInput.set(session, Number(record.input) || 0);
+  }
+}
+
+/**
+ * 解析一条记录的口径。优先用落盘时判定的 inputScope；
+ * 老记录没有该字段时由 backfillScope 在读取阶段补齐。
+ */
+function resolveScope(record: RawRecord, fallback: InputScope): InputScope {
+  return record.inputScope ?? fallback;
+}
+
+/**
+ * 把一条 raw 记录转成标准 TokenBucket 增量。
+ *
+ * inclusive 口径（provider 返回的 input 已含缓存）必须在这里拆开还原：
+ * 否则下游把 input 当「纯新增」，总 prompt 会把缓存算两遍，命中率被钉在 50%。
+ * 归一化后 TokenBucket 的语义全库统一，聚合/展示层都不必再关心口径。
+ */
+function recordUsage(record: RawRecord, scope?: InputScope): UsageDelta {
+  const cacheRead = Number(record.cacheRead) || 0;
+  const cacheWrite = Number(record.cacheWrite) || 0;
+  const rawInput = Number(record.input) || 0;
+  const effective = resolveScope(record, scope ?? "exclusive");
+  const input = effective === "inclusive"
+    ? Math.max(0, rawInput - cacheRead - cacheWrite)
+    : rawInput;
+  return {
+    input,
+    output: Number(record.output) || 0,
+    cacheRead,
+    cacheWrite,
+    turns: 1,
+    cost: Number(record.cost) || 0,
+  };
+}
+
+/** 把逐轮记录聚合成 per-model 明细，按 prompt 用量降序 */
+function groupByModel(records: RawRecord[]): ModelUsage[] {
+  const map = new Map<ModelKey, ModelUsage>();
+  for (const record of records) {
+    const modelKey = recordModelKey(record);
+    let entry = map.get(modelKey);
+    if (!entry) {
+      entry = { modelKey, bucket: createEmptyBucket(), sumTokensPerSec: 0 };
+      map.set(modelKey, entry);
+    }
+    addUsageToBucket(entry.bucket, recordUsage(record));
+    entry.sumTokensPerSec += Number(record.tokensPerSec) || 0;
+  }
+  return [...map.values()].sort(
+    (a, b) => bucketPromptTokens(b.bucket) - bucketPromptTokens(a.bucket),
+  );
+}
+
+/** 记录所属日期（ts 为 ISO 字符串，取前 10 位即可） */
+function recordDate(record: RawRecord): string {
+  return typeof record.ts === "string" && record.ts.length >= 10
+    ? record.ts.slice(0, 10)
+    : "";
+}
+
+/** 按日期分组（时间报表的模型明细行用） */
+function groupByDate(records: RawRecord[]): Map<string, ModelUsage[]> {
+  const byDate = new Map<string, RawRecord[]>();
+  for (const record of records) {
+    const date = recordDate(record);
+    if (!date) continue;
+    const list = byDate.get(date);
+    if (list) list.push(record);
+    else byDate.set(date, [record]);
+  }
+  const out = new Map<string, ModelUsage[]>();
+  for (const [date, list] of byDate) out.set(date, groupByModel(list));
+  return out;
 }
 
 // ── 会话恢复：从历史消息重建累计统计 ─────────────────────
@@ -634,69 +1042,86 @@ function getEntryTimestampMs(entry: {
 
 function rebuildFromHistory(ctx: ExtensionContext) {
   const branch = ctx.sessionManager.getBranch();
-  stats.totalInput = 0;
-  stats.totalOutput = 0;
-  stats.totalCacheRead = 0;
-  stats.totalCacheWrite = 0;
-  stats.totalCost = 0;
-  stats.totalCacheHitRateSum = 0;
-  stats.turnCount = 0;
-  stats.accountedUsageKeys = new Set();
-  stats.lastTokensPerSec = 0;
+  resetSessionStats();
 
-  // 遍历 entries 重建累计统计，同时推算历史速率
+  // 遍历 entries 按消息自身的 provider/model 归入各自的桶，同时推算历史速率
   let latestAssistantSpeed: number | null = null;
+  let latestModelKey: ModelKey | null = null;
 
   for (const entry of branch) {
     if (entry.type !== "message") continue;
     const msg = (entry as any).message;
     if (msg.role !== "assistant" || !msg.usage) continue;
 
-    stats.totalInput += msg.usage.input ?? 0;
-    stats.totalOutput += msg.usage.output ?? 0;
-    stats.totalCacheRead += msg.usage.cacheRead ?? 0;
-    stats.totalCacheWrite += msg.usage.cacheWrite ?? 0;
-    stats.totalCost += msg.usage.cost?.total ?? 0;
+    // 模型归属以消息自带的为准（历史里可能混了多个模型）
+    const modelKey = getModelKey(msg.provider, msg.model);
+    const bucket = ensureModelBucket(modelKey);
+    addUsageToBucket(bucket, {
+      input: msg.usage.input ?? 0,
+      output: msg.usage.output ?? 0,
+      cacheRead: msg.usage.cacheRead ?? 0,
+      cacheWrite: msg.usage.cacheWrite ?? 0,
+      turns: 1,
+      cost: msg.usage.cost?.total ?? 0,
+    });
+    latestModelKey = modelKey;
 
-    const promptTokens = (msg.usage.input ?? 0) + (msg.usage.cacheRead ?? 0) + (msg.usage.cacheWrite ?? 0);
-    const chRate = promptTokens > 0
-      ? ((msg.usage.cacheRead ?? 0) / promptTokens) * 100
-      : 0;
-    stats.totalCacheHitRateSum += chRate;
-    stats.turnCount++;
+    // 单轮快照无条件记录（命中率与速率无关，无 timestamp 也能算出 CH）
+    const turnBucket = createEmptyBucket();
+    addUsageToBucket(turnBucket, {
+      input: msg.usage.input ?? 0,
+      output: msg.usage.output ?? 0,
+      cacheRead: msg.usage.cacheRead ?? 0,
+      cacheWrite: msg.usage.cacheWrite ?? 0,
+      turns: 1,
+    });
+    let snapshotSpeed = stats.lastTurnByModel.get(modelKey)?.tokensPerSec ?? 0;
 
     // 推算历史速率：从上一个 user 消息到本条 assistant 的耗时
-    if ((msg.usage.output ?? 0) <= 0) continue;
-    const endMs = getEntryTimestampMs(entry);
-    if (endMs === null) continue;
+    if ((msg.usage.output ?? 0) > 0) {
+      const endMs = getEntryTimestampMs(entry);
+      if (endMs !== null) {
+        for (let j = branch.indexOf(entry) - 1; j >= 0; j--) {
+          const prev = branch[j];
+          if (prev.type !== "message") continue;
+          const prevMsg = (prev as any).message;
+          if (prevMsg.role === "assistant") continue; // 跳过 assistant 之间的 delta
 
-    for (let j = branch.indexOf(entry) - 1; j >= 0; j--) {
-      const prev = branch[j];
-      if (prev.type !== "message") continue;
-      const prevMsg = (prev as any).message;
-      if (prevMsg.role === "assistant") continue; // 跳过 assistant 之间的 delta
+          const startMs = getEntryTimestampMs(prev);
+          if (startMs === null || endMs <= startMs) continue;
 
-      const startMs = getEntryTimestampMs(prev);
-      if (startMs === null || endMs <= startMs) continue;
+          const elapsedSeconds = (endMs - startMs) / 1000;
+          if (elapsedSeconds <= 0) continue;
 
-      const elapsedSeconds = (endMs - startMs) / 1000;
-      if (elapsedSeconds <= 0) continue;
+          const speed = (msg.usage.output ?? 0) / elapsedSeconds;
+          if (!isReasonableTokenSpeed(speed)) continue;
+          snapshotSpeed = speed;
 
-      const speed = (msg.usage.output ?? 0) / elapsedSeconds;
-      if (!isReasonableTokenSpeed(speed)) continue;
-
-      if (prevMsg.role === "user") {
-        latestAssistantSpeed = speed;
-        break;
+          if (prevMsg.role === "user") {
+            latestAssistantSpeed = speed;
+            break;
+          }
+          // 非 user 消息的 fallback
+          if (latestAssistantSpeed === null) latestAssistantSpeed = speed;
+        }
       }
-      // 非 user 消息的 fallback
-      if (latestAssistantSpeed === null) latestAssistantSpeed = speed;
     }
+
+    const lastEntryMs = getEntryTimestampMs(entry);
+    stats.lastTurnByModel.set(modelKey, {
+      ...turnBucket,
+      modelKey,
+      tokensPerSec: snapshotSpeed,
+      cacheHitRate: calcCacheHitRate(turnBucket),
+      at: lastEntryMs ?? Date.now(),
+    });
   }
 
   if (latestAssistantSpeed !== null) {
     stats.lastTokensPerSec = latestAssistantSpeed;
   }
+  // 恢复后以最后一条 assistant 的模型为激活模型（ctx.model 会在拿完后另做修正）
+  stats.activeModelKey = resolveActiveModelKey(ctx) ?? latestModelKey ?? stats.activeModelKey;
 }
 // ── 套餐用量工具 ─────────────────────────────────────────
 
@@ -903,7 +1328,6 @@ let displayConfig: DisplayConfig = {
   items: { ...DEFAULT_DISPLAY_CONFIG.items },
   precision: { ...DEFAULT_DISPLAY_CONFIG.precision },
 };
-
 // ── 勾选组件（样式与交互对齐内置 /scoped-models 选择器）─────────────
 
 interface ToggleEntry {
@@ -1649,28 +2073,159 @@ async function invalidateAllQuotaCache() {
 
 // ── /stats 命令 ──────────────────────────────────────────
 
-function weightedCacheHitRate(d: { sumInput: number; sumCacheRead: number; sumCacheWrite: number }): number {
-  const total = d.sumInput + d.sumCacheRead + d.sumCacheWrite;
-  return total > 0 ? (d.sumCacheRead / total) * 100 : 0;
+/** 时间窗口聚合记录 → TokenBucket（hourly / daily 共用） */
+function periodBucket(d: {
+  sumInput: number;
+  sumOutput: number;
+  sumCacheRead: number;
+  sumCacheWrite: number;
+  count: number;
+  cost?: number;
+}): TokenBucket {
+  return normalizeBucket({
+    input: d.sumInput,
+    output: d.sumOutput,
+    cacheRead: d.sumCacheRead,
+    cacheWrite: d.sumCacheWrite,
+    turns: d.count,
+    cost: d.cost ?? 0,
+  });
 }
 
-function renderDaySummary(daily: DailyRecord): string {
+function fmtRate(hit: number | null, digits = 1): string {
+  // 无数据时用同宽占位，保证表格列不错位
+  return hit === null ? "     --" : `${hit.toFixed(digits).padStart(5)}%`.padStart(7);
+}
+
+/** 时间窗口表格的行前缀（日期或时次）；hideHit=true 时命中率列显示 -- */
+function periodRow(
+  label: string,
+  bucket: TokenBucket,
+  sumTokensPerSec: number,
+  hideHit = false,
+): string {
+  const prompt = bucketPromptTokens(bucket);
+  const rate = bucket.turns > 0 ? sumTokensPerSec / bucket.turns : 0;
+  return (
+    `${label}  ` +
+    `${String(bucket.turns).padStart(3)}  ` +
+    `${formatTokens(bucket.input).padStart(7)}  ` +
+    `${formatTokens(bucket.cacheRead).padStart(7)}  ` +
+    `${formatTokens(bucket.output).padStart(7)}  ` +
+    `${formatTokens(prompt).padStart(7)}  ` +
+    `${hideHit ? fmtRate(null) : fmtRate(calcCacheHitRate(bucket))}  ` +
+    `${rate.toFixed(1).padStart(5)}`
+  );
+}
+
+/**
+ * 模型名截断：保留末尾而不是开头。
+ * 同一家的模型差异常在尾段（MiniMax-M3.1-Flash vs MiniMax-M3.1-Flash-Preview），
+ * 截开头会让两个不同模型看起来一模一样。
+ */
+function truncateModelName(name: string, width: number): string {
+  if (name.length <= width) return name;
+  return "…" + name.slice(name.length - width + 1);
+}
+
+/** 时间窗口下的模型明细行（缩进表示归属关系） */
+function modelRow(
+  modelKey: ModelKey,
+  bucket: TokenBucket,
+  sumTokensPerSec: number,
+): string {
+  const rate = bucket.turns > 0 ? sumTokensPerSec / bucket.turns : 0;
+  return (
+    `  ↳ ${truncateModelName(modelKey, 34).padEnd(34)}` +
+    `${String(bucket.turns).padStart(3)}  ` +
+    `${formatTokens(bucket.input).padStart(7)}  ` +
+    `${formatTokens(bucket.cacheRead).padStart(7)}  ` +
+    `${formatTokens(bucket.output).padStart(7)}  ` +
+    `${fmtRate(calcCacheHitRate(bucket))}  ` +
+    `${rate.toFixed(1).padStart(5)}`
+  );
+}
+
+const PERIOD_HEADER = "日期        次数  新增输入  缓存输入  输出      总token   命中率  速率";
+const PERIOD_RULE = "─".repeat(70);
+
+/**
+ * 把一份时间窗口列表展平为「汇总行 + 模型明细行」。
+ * 模型明细来自逐轮记录（modelsByDate），不再依赖聚合文件里的累积字段。
+ */
+function renderPeriodRows(
+  items: { label: string; record: DailyRecord; models?: ModelUsage[] }[],
+  withModelBreakdown: boolean,
+): string[] {
+  const out: string[] = [];
+  for (const item of items) {
+    const total = periodBucket(item.record);
+    const models = item.models ?? [];
+    const multiModel = models.length > 1;
+    // 多模型时汇总行的命中率是混算值，会误导分析（不同缓存机制不可比），直接隐去
+    out.push(periodRow(item.label, total, item.record.sumTokensPerSec, multiModel));
+    if (!withModelBreakdown) continue;
+    // 只一个模型时不必拆解，避免重复两行
+    if (models.length <= 1) continue;
+    for (const m of models) out.push(modelRow(m.modelKey, m.bucket, m.sumTokensPerSec));
+  }
+  return out;
+}
+
+/** 汇总多份时间窗口为单个 bucket（合计行用） */
+function sumPeriods(records: DailyRecord[]): TokenBucket {
+  const total = createEmptyBucket();
+  for (const record of records) addUsageToBucket(total, periodBucket(record));
+  return total;
+}
+
+function renderDaySummary(daily: DailyRecord, models: ModelUsage[]): string {
   const d = daily;
-  const avgInput = d.count > 0 ? d.sumInput / d.count : 0;
-  const avgOutput = d.count > 0 ? d.sumOutput / d.count : 0;
-  const totalPrompt = d.sumInput + d.sumCacheRead + d.sumCacheWrite;
-  const cacheHitRate = weightedCacheHitRate(d);
+  const total = periodBucket(d);
+  const avgInput = total.turns > 0 ? total.input / total.turns : 0;
+  const avgOutput = total.turns > 0 ? total.output / total.turns : 0;
+  const prompt = bucketPromptTokens(total);
+  const hit = calcCacheHitRate(total);
+  const rate = total.turns > 0 ? d.sumTokensPerSec / total.turns : 0;
 
   const lines = [
-    `对话次数:  ${d.count}`,
-    `新增输入:  ${formatTokens(d.sumInput)}  (平均 ${formatTokens(avgInput)}/次，未命中缓存)`,
-    `缓存输入:  ${formatTokens(d.sumCacheRead)}`,
-    `总输出:    ${formatTokens(d.sumOutput)}  (平均 ${formatTokens(avgOutput)}/次)`,
-    `总token:   ${formatTokens(totalPrompt)}  (新增 + 缓存)`,
-    `缓存命中率: ${cacheHitRate.toFixed(1)}%`,
-    `平均速率:  ${(d.sumTokensPerSec / d.count).toFixed(1)} t/s`,
+    `对话次数:  ${total.turns}`,
+    `新增输入:  ${formatTokens(total.input)}  (平均 ${formatTokens(avgInput)}/次，未命中缓存)`,
+    `缓存输入:  ${formatTokens(total.cacheRead)}`,
+    `总输出:    ${formatTokens(total.output)}  (平均 ${formatTokens(avgOutput)}/次)`,
+    `总token:   ${formatTokens(prompt)}  (新增 + 缓存)`,
+    `缓存命中率: ${hit === null ? "--" : hit.toFixed(1) + "%"}`,
+    `平均速率:  ${rate.toFixed(1)} t/s`,
   ];
+  // 多模型时按模型拆开：跨模型混算的命中率没有工程意义
+  if (models.length > 1) {
+    // 上方那个总命中率是混算值，标注清楚避免被当成真实水平
+    lines[5] = `缓存命中率: 跨模型混算值 ${hit === null ? "--" : hit.toFixed(1) + "%"}（请以下面明细为准）`;
+    lines.push("", "按模型拆分：");
+    for (const m of models) lines.push("", ...modelDetailBlock(m));
+  }
   return lines.join("\n");
+}
+
+/**
+ * 单个模型的纵向明细块（每项一行）。
+ * 用汉字标签而不是 ↑↓ 符号：符号在中文报表里既不好读也不好对齐。
+ */
+function modelDetailBlock(m: ModelUsage): string[] {
+  const hit = calcCacheHitRate(m.bucket);
+  const avgInput = m.bucket.turns > 0 ? m.bucket.input / m.bucket.turns : 0;
+  const avgOutput = m.bucket.turns > 0 ? m.bucket.output / m.bucket.turns : 0;
+  const rate = m.bucket.turns > 0 ? m.sumTokensPerSec / m.bucket.turns : 0;
+  return [
+    `模型:      ${m.modelKey}`,
+    `对话次数:  ${m.bucket.turns}`,
+    `新增输入:  ${formatTokens(m.bucket.input)}  (平均 ${formatTokens(avgInput)}/次)`,
+    `缓存输入:  ${formatTokens(m.bucket.cacheRead)}`,
+    `总输出:    ${formatTokens(m.bucket.output)}  (平均 ${formatTokens(avgOutput)}/次)`,
+    `总token:   ${formatTokens(bucketPromptTokens(m.bucket))}  (新增 + 缓存)`,
+    `缓存命中率: ${hit === null ? "--" : hit.toFixed(1) + "%"}`,
+    `平均速率:  ${rate.toFixed(1)} t/s`,
+  ];
 }
 
 async function showStats(
@@ -1682,6 +2237,186 @@ async function showStats(
   const theme = ctx.ui.theme;
   const text = `${theme.fg("accent", theme.bold(title))}\n${theme.fg("dim", "─".repeat(42))}\n` +
     lines.map((l) => theme.fg("dim", l)).join("\n");
+  pi.sendMessage({
+    customType: "token-stats",
+    content: text,
+    display: true,
+    details: {},
+  });
+}
+
+/**
+ * 用系统默认浏览器打开一个本地路径。
+ * 各平台都有现成的“打开”命令，不必像配额登录那样去探测 Chrome 路径。
+ * 失败不抛错（例如无头环境），由调用方决定怎么提示。
+ */
+function openInBrowser(targetPath: string): boolean {
+  const opts = { stdio: "ignore" as const, detached: true };
+  // 用 file:// URL 而不是裸路径：Windows 路径常带空格，
+  // URL 形式已被编码，不需再处理引号，也不会被重新拼成命令行。
+  const url = pathToFileURL(targetPath).href;
+  try {
+    let child: ReturnType<typeof spawn>;
+    if (process.platform === "win32") {
+      // rundll32 比 cmd /c start 少一层 shell 解析，也没有 explorer 那种“成功也返回 1”的歧义
+      child = spawn("rundll32", ["url.dll,FileProtocolHandler", url], {
+        ...opts,
+        windowsHide: true,
+      });
+    } else if (process.platform === "darwin") {
+      child = spawn("open", [targetPath], opts);
+    } else {
+      child = spawn("xdg-open", [targetPath], opts);
+    }
+    child.on("error", () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 清除历史统计数据。
+ *
+ * 为什么不做成网页里的按钮：报表是 file:// 本地页面，浏览器受同源策略限制
+ * 无法删除磁盘文件；要让「点一下就删」生效必须额外起一个本地服务，
+ * 为一个低频操作多养一个端口不划算，因此入口放在 pi 的菜单里。
+ */
+async function purgeData(ctx: ExtensionContext, pi: ExtensionAPI) {
+  const theme = ctx.ui.theme;
+
+  const dates = await listAllDates();
+  if (!dates.length) {
+    ctx.ui.notify("没有可清除的统计数据", "info");
+    return;
+  }
+  const today = getDateStr();
+  const earliest = dates[0]!;
+
+  // 1. 选择范围
+  const mode = await ctx.ui.select("清除历史统计", [
+    `最近 7 天（${getDateStr(Date.now() - 6 * 86400000)} ~ ${today}）`,
+    `最近 30 天（${getDateStr(Date.now() - 29 * 86400000)} ~ ${today}）`,
+    `最近 90 天（${getDateStr(Date.now() - 89 * 86400000)} ~ ${today}）`,
+    `指定日期区间`,
+    `全部历史数据（${earliest} ~ ${today}，共 ${dates.length} 天）`,
+  ]);
+  if (!mode) return;
+
+  let from = earliest;
+  let to = today;
+  if (mode.startsWith("最近 7 天")) from = getDateStr(Date.now() - 6 * 86400000);
+  else if (mode.startsWith("最近 30 天")) from = getDateStr(Date.now() - 29 * 86400000);
+  else if (mode.startsWith("最近 90 天")) from = getDateStr(Date.now() - 89 * 86400000);
+  else if (mode.startsWith("指定")) {
+    const picked = await pickDateRange(ctx, earliest, today);
+    if (!picked) return;
+    from = picked.from;
+    to = picked.to;
+  }
+
+  // 2. 先算清楚要删什么，再让用户确认
+  const plan = await planPurge({ from, to });
+  if (isEmpty(plan)) {
+    ctx.ui.notify(`${from} ~ ${to} 之间没有统计数据`, "info");
+    return;
+  }
+
+  const summary = [
+    theme.fg("accent", theme.bold("即将删除")),
+    "",
+    `  区间      ${from} ~ ${to}`,
+    `  涉及天数  ${plan.dates.length} 天（${plan.dates[0]} ~ ${plan.dates[plan.dates.length - 1]}）`,
+    `  逐轮明细  ${plan.rawFiles.length} 个文件`,
+    `  小时聚合  ${plan.hourlyFiles.length} 个文件`,
+    `  日聚合    ${plan.dailyDates.length} 条${plan.dropDailyFile ? "（整个文件删除）" : ""}`,
+    `  合计体积  ${formatBytes(plan.bytes)}`,
+    "",
+    theme.fg("warning", "  删除后无法恢复。"),
+  ].join("\n");
+
+  const ok = await ctx.ui.confirm("确认清除统计数据", summary);
+  if (!ok) return;
+
+  // 3. 执行
+  const result = await runPurge(plan);
+
+  const lines = [
+    theme.fg(result.failures.length ? "warning" : "accent", theme.bold("清除完成")),
+    "",
+    `  删除文件  ${result.removedFiles} 个`,
+    `  删除天数  ${result.removedDays} 天`,
+    `  释放空间  ${formatBytes(result.bytes)}`,
+  ];
+  if (result.failures.length) {
+    lines.push("", theme.fg("error", `  ${result.failures.length} 项失败：`));
+    for (const f of result.failures.slice(0, 5)) lines.push(theme.fg("dim", `    ${f}`));
+    if (result.failures.length > 5) {
+      lines.push(theme.fg("dim", `    …另有 ${result.failures.length - 5} 项`));
+    }
+  }
+  lines.push("", theme.fg("dim", "  下次查询会按剩余数据重新统计"));
+
+  pi.sendMessage({ customType: "token-stats", content: lines.join("\n"), display: true });
+}
+
+/** 手输日期区间，任一端为空或格式不对就返回 null */
+async function pickDateRange(
+  ctx: ExtensionContext,
+  earliest: string,
+  today: string,
+): Promise<{ from: string; to: string } | null> {
+  const from = (await ctx.ui.input(`起始日期（YYYY-MM-DD，不早于 ${earliest}）`, earliest))?.trim();
+  if (!from || !/^\d{4}-\d{2}-\d{2}$/.test(from)) return null;
+  const to = (await ctx.ui.input(`结束日期（YYYY-MM-DD，不晚于 ${today}）`, today))?.trim();
+  if (!to || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return null;
+  return from <= to ? { from, to } : { from: to, to: from };
+}
+
+/**
+ * 网页视图：重新生成数据文件，然后用系统浏览器打开固定模板。
+ *
+ * 不再依赖终端超链接：实测 Tabby 等终端不支持 OSC 8，ctrl+click 无反应。
+ * 改为直接开浏览器；即使打开失败也会把路径打出来，可手动复制。
+ */
+async function showHtmlReport(ctx: ExtensionContext, pi: ExtensionAPI) {
+  const theme = ctx.ui.theme;
+  let result: Awaited<ReturnType<typeof writeReportData>>;
+  try {
+    result = await writeReportData();
+  } catch (error) {
+    ctx.ui.notify(
+      `生成网页数据失败：${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
+    return;
+  }
+
+  const url = pathToFileURL(REPORT_HTML_PATH).href;
+  const opened = openInBrowser(REPORT_HTML_PATH);
+  const sizeKb = Math.round(result.bytes / 1024);
+
+  // 顺手拉起本地服务并开始定时统计：页面顶部据此显示服务状态
+  const srv = await ensureStatsServer(pi, (msg) => ctx.ui.notify(msg, "warning"));
+  if (srv) srv.start();
+
+  const serviceLine = srv
+    ? theme.fg("dim", `  服务：${statsServerUrl}（每 1 分钟自动统计，页面可停）`)
+    : theme.fg("warning", "  服务未启动，页面只能看历史数据");
+
+  const text = [
+    theme.fg("accent", theme.bold("Token 统计  |  网页视图")),
+    theme.fg("dim", "─".repeat(42)),
+    "",
+    opened ? `  已在浏览器中打开` : theme.fg("warning", "  打开浏览器失败，请手动复制下面的路径"),
+    "",
+    theme.fg("dim", `  ${url}`),
+    serviceLine,
+    theme.fg("dim", `  数据：${result.days} 天 / ${result.turns} 轮 / ${result.files} 个日志 / ${sizeKb} KB`),
+    theme.fg("dim", "  之后每轮对话结束会自动重建「当天」分片，页面点刷新即可看到新数据"),
+  ].join("\n");
+
   pi.sendMessage({
     customType: "token-stats",
     content: text,
@@ -1706,8 +2441,11 @@ async function showDay(date: string, ctx: ExtensionContext, pi: ExtensionAPI) {
     return;
   }
 
+  // 模型明细从逐轮明细现算，不依赖聚合文件里的累积字段
+  const models = groupByModel(await loadRawRecords(date, date));
+
   await showStats(
-    renderDaySummary(daily).split("\n"),
+    renderDaySummary(daily, models).split("\n"),
     `Token 统计  |  ${date}`,
     ctx,
     pi,
@@ -1732,16 +2470,25 @@ async function showHourly(date: string, ctx: ExtensionContext, pi: ExtensionAPI)
 
   records.sort((a, b) => a.hour - b.hour);
 
+  // 按小时拆模型明细：逐轮记录自带 ts，先按小时分组再归类
+  const rawByHour = new Map<number, RawRecord[]>();
+  for (const record of await loadRawRecords(date, date)) {
+    const hour = new Date(record.ts).getHours();
+    const list = rawByHour.get(hour);
+    if (list) list.push(record);
+    else rawByHour.set(hour, [record]);
+  }
+
   const lines = [
-    "时  次数  输入      输出      命中率  速率",
-    "─".repeat(40),
-    ...records.map((r) =>
-      `${String(r.hour).padStart(2, "0")}  ` +
-      `${String(r.count).padStart(3)}  ` +
-      `${formatTokens(r.sumInput).padStart(7)}  ` +
-      `${formatTokens(r.sumOutput).padStart(7)}  ` +
-      `${weightedCacheHitRate(r).toFixed(1).padStart(5)}%  ` +
-      `${(r.sumTokensPerSec / r.count).toFixed(1).padStart(5)}`,
+    PERIOD_HEADER,
+    PERIOD_RULE,
+    ...renderPeriodRows(
+      records.map((r) => ({
+        label: String(r.hour).padStart(2, "0"),
+        record: r as unknown as DailyRecord,
+        models: groupByModel(rawByHour.get(r.hour) ?? []),
+      })),
+      true,
     ),
   ];
 
@@ -1772,22 +2519,15 @@ async function showWeek(ctx: ExtensionContext, pi: ExtensionAPI) {
     return;
   }
 
+  const modelsByDate = groupByDate(await loadRawRecords(sevenDaysAgo, today));
+
   const lines = [
-    "日期        次数  新增输入  缓存输入  输出      总token   命中率  速率",
-    "─".repeat(70),
-    ...weekRecords.map((r) => {
-      const totalPrompt = r.sumInput + r.sumCacheRead + r.sumCacheWrite;
-      return (
-        `${r.date}  ` +
-        `${String(r.count).padStart(3)}  ` +
-        `${formatTokens(r.sumInput).padStart(7)}  ` +
-        `${formatTokens(r.sumCacheRead).padStart(7)}  ` +
-        `${formatTokens(r.sumOutput).padStart(7)}  ` +
-        `${formatTokens(totalPrompt).padStart(7)}  ` +
-        `${weightedCacheHitRate(r).toFixed(1).padStart(5)}%  ` +
-        `${(r.sumTokensPerSec / r.count).toFixed(1).padStart(5)}`
-      );
-    }),
+    PERIOD_HEADER,
+    PERIOD_RULE,
+    ...renderPeriodRows(
+      weekRecords.map((r) => ({ label: r.date, record: r, models: modelsByDate.get(r.date) })),
+      true,
+    ),
   ];
 
   await showStats(lines, "本周每天汇总", ctx, pi);
@@ -1841,45 +2581,34 @@ async function showYear(year: string, ctx: ExtensionContext, pi: ExtensionAPI) {
     return;
   }
 
-  const total = monthlyRecords.reduce(
-    (acc, r) => {
-      acc.count += r.count;
-      acc.sumInput += r.sumInput;
-      acc.sumCacheRead += r.sumCacheRead;
-      acc.sumCacheWrite += r.sumCacheWrite;
-      acc.sumOutput += r.sumOutput;
-      acc.sumTokensPerSec += r.sumTokensPerSec;
-      return acc;
-    },
-    { count: 0, sumInput: 0, sumCacheRead: 0, sumCacheWrite: 0, sumOutput: 0, sumTokensPerSec: 0 },
-  );
-  const totalPrompt = total.sumInput + total.sumCacheRead + total.sumCacheWrite;
-  const cacheHitRate = weightedCacheHitRate(total);
+  const total = sumPeriods(monthlyRecords);
+  const totalPerSec = monthlyRecords.reduce((sum, r) => sum + r.sumTokensPerSec, 0);
+  // 全年模型明细：按月对逐轮记录归类
+  const raw = await loadRawRecords(`${year}-01-01`, `${year}-12-31`);
+  const rawByMonth = new Map<string, RawRecord[]>();
+  for (const record of raw) {
+    const month = recordDate(record).slice(0, 7);
+    if (!month) continue;
+    const list = rawByMonth.get(month);
+    if (list) list.push(record);
+    else rawByMonth.set(month, [record]);
+  }
+  const allModels = groupByModel(raw);
+  // 合计行跨月聚合，模型往往不止一个 → 命中率不混算
 
   const lines = [
-    "月份        次数  新增输入  缓存输入  输出      总token   命中率  速率",
-    "─".repeat(70),
-    ...monthlyRecords.map((r) => {
-      const totalPromptForMonth = r.sumInput + r.sumCacheRead + r.sumCacheWrite;
-      return (
-        `${r.date}      ` +
-        `${String(r.count).padStart(3)}  ` +
-        `${formatTokens(r.sumInput).padStart(7)}  ` +
-        `${formatTokens(r.sumCacheRead).padStart(7)}  ` +
-        `${formatTokens(r.sumOutput).padStart(7)}  ` +
-        `${formatTokens(totalPromptForMonth).padStart(7)}  ` +
-        `${weightedCacheHitRate(r).toFixed(1).padStart(5)}%  ` +
-        `${(r.sumTokensPerSec / r.count).toFixed(1).padStart(5)}`
-      );
-    }),
+    PERIOD_HEADER,
+    PERIOD_RULE,
+    ...renderPeriodRows(
+      monthlyRecords.map((r) => ({
+        label: r.date.padEnd(9),
+        record: r,
+        models: groupByModel(rawByMonth.get(r.date) ?? []),
+      })),
+      true,
+    ),
     "",
-    `合计      ${String(total.count).padStart(3)}  ` +
-    `${formatTokens(total.sumInput).padStart(7)}  ` +
-    `${formatTokens(total.sumCacheRead).padStart(7)}  ` +
-    `${formatTokens(total.sumOutput).padStart(7)}  ` +
-    `${formatTokens(totalPrompt).padStart(7)}  ` +
-    `${cacheHitRate.toFixed(1).padStart(5)}%  ` +
-    `${(total.sumTokensPerSec / total.count).toFixed(1).padStart(5)}`,
+    periodRow("合计     ", total, totalPerSec, allModels.length > 1),
   ];
 
   await showStats(lines, `${year} 年度汇总（按月）`, ctx, pi);
@@ -1905,48 +2634,87 @@ async function showMonth(month: string, ctx: ExtensionContext, pi: ExtensionAPI)
   }
 
   // 累计
-  const total = monthRecords.reduce(
-    (acc, r) => {
-      acc.count += r.count;
-      acc.sumInput += r.sumInput;
-      acc.sumCacheRead += r.sumCacheRead;
-      acc.sumCacheWrite += r.sumCacheWrite;
-      acc.sumOutput += r.sumOutput;
-      acc.sumTokensPerSec += r.sumTokensPerSec;
-      return acc;
-    },
-    { count: 0, sumInput: 0, sumCacheRead: 0, sumCacheWrite: 0, sumOutput: 0, sumTokensPerSec: 0 },
-  );
-  const totalPrompt = total.sumInput + total.sumCacheRead + total.sumCacheWrite;
-  const cacheHitRate = weightedCacheHitRate(total);
+  const total = sumPeriods(monthRecords);
+  const totalPerSec = monthRecords.reduce((sum, r) => sum + r.sumTokensPerSec, 0);
+  // 该月模型明细：逐轮记录按日期归类
+  const raw = await loadRawRecords(`${month}-01`, `${month}-31`);
+  const modelsByDate = groupByDate(raw);
+  const allModels = groupByModel(raw);
 
   const lines = [
-    "日期        次数  新增输入  缓存输入  输出      总token   命中率  速率",
-    "─".repeat(70),
-    ...monthRecords.map((r) => {
-      const tp = r.sumInput + r.sumCacheRead + r.sumCacheWrite;
-      return (
-        `${r.date}  ` +
-        `${String(r.count).padStart(3)}  ` +
-        `${formatTokens(r.sumInput).padStart(7)}  ` +
-        `${formatTokens(r.sumCacheRead).padStart(7)}  ` +
-        `${formatTokens(r.sumOutput).padStart(7)}  ` +
-        `${formatTokens(tp).padStart(7)}  ` +
-        `${weightedCacheHitRate(r).toFixed(1).padStart(5)}%  ` +
-        `${(r.sumTokensPerSec / r.count).toFixed(1).padStart(5)}`
-      );
-    }),
+    PERIOD_HEADER,
+    PERIOD_RULE,
+    ...renderPeriodRows(
+      monthRecords.map((r) => ({ label: r.date, record: r, models: modelsByDate.get(r.date) })),
+      true,
+    ),
     "",
-    `合计      ${String(total.count).padStart(3)}  ` +
-    `${formatTokens(total.sumInput).padStart(7)}  ` +
-    `${formatTokens(total.sumCacheRead).padStart(7)}  ` +
-    `${formatTokens(total.sumOutput).padStart(7)}  ` +
-    `${formatTokens(totalPrompt).padStart(7)}  ` +
-    `${cacheHitRate.toFixed(1).padStart(5)}%  ` +
-    `${(total.sumTokensPerSec / total.count).toFixed(1).padStart(5)}`,
+    // 合计行跨天聚合，模型往往不止一个 → 命中率不混算
+    periodRow("合计     ", total, totalPerSec, allModels.length > 1),
   ];
 
   await showStats(lines, `${month} 月度汇总`, ctx, pi);
+}
+
+/**
+ * 按模型归类汇总：区间内各模型的轮数 / 输入 / 缓存 / 输出 / 真实命中率 / token 占比。
+ * 数据源是逐轮明细（raw），所以任何时候查都不用等聚合累积。
+ * 跨模型汇总行不显示命中率（不同缓存机制混算没有意义）。
+ */
+async function showByModel(
+  from: string,
+  to: string,
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+) {
+  const records = await loadRawRecords(from, to);
+  if (records.length === 0) {
+    ctx.ui.notify(`${from} ~ ${to} 暂无逐轮明细（该区间没有新日志）`, "info");
+    return;
+  }
+
+  const rows = groupByModel(records);
+  // 逐轮明细里没有可用模型信息时，单独提示，避免被当成统计坏掉
+  const onlyLegacy = rows.length === 1 && rows[0].modelKey === UNKNOWN_MODEL_KEY;
+
+  const grand = createEmptyBucket();
+  for (const row of rows) addUsageToBucket(grand, row.bucket);
+  const grandPrompt = bucketPromptTokens(grand);
+
+  const pad = (s: string, w: number) => s.length >= w ? s.slice(0, w) : s + " ".repeat(w - s.length);
+  const lines = [
+    "模型                          次数  新增输入  缓存输入  输出      占比    命中率",
+    "─".repeat(78),
+    ...rows.map((row) => {
+      const prompt = bucketPromptTokens(row.bucket);
+      const share = grandPrompt > 0 ? (prompt / grandPrompt) * 100 : 0;
+      return (
+        truncateModelName(row.modelKey, 28).padEnd(28) + "  " +
+        `${String(row.bucket.turns).padStart(3)}  ` +
+        `${formatTokens(row.bucket.input).padStart(7)}  ` +
+        `${formatTokens(row.bucket.cacheRead).padStart(7)}  ` +
+        `${formatTokens(row.bucket.output).padStart(7)}  ` +
+        `${share.toFixed(1).padStart(5)}%  ` +
+        `${fmtRate(calcCacheHitRate(row.bucket))}`
+      );
+    }),
+    "─".repeat(78),
+    pad("合计（命中率不跨模型统计）", 28) + "  " +
+    `${String(grand.turns).padStart(3)}  ` +
+    `${formatTokens(grand.input).padStart(7)}  ` +
+    `${formatTokens(grand.cacheRead).padStart(7)}  ` +
+    `${formatTokens(grand.output).padStart(7)}  ` +
+    `${(grandPrompt > 0 ? 100 : 0).toFixed(1).padStart(5)}%  ${fmtRate(null)}`,
+  ];
+
+  await showStats(
+    onlyLegacy
+      ? [...lines, "", `注：该区间 ${records.length} 条记录未带模型信息，无法按模型归类`]
+      : lines,
+    `按模型归类  |  ${from} ~ ${to}`,
+    ctx,
+    pi,
+  );
 }
 
 // ── 扩展入口 ─────────────────────────────────────────────
@@ -1971,10 +2739,34 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     requestFooterRender?.();
   });
 
+  // ── model_select: 切换模型后立即切到目标模型的统计 ──
+  // KV Cache 按 provider+model 隔离：不切换口径的话，新模型首轮会沿用旧模型的
+  // cacheRead 算出「虚假高命中率」。切回用过的模型则自动恢复它自己的历史值。
+  pi.on("model_select", async (event) => {
+    const m = event?.model;
+    const nextKey = m ? getModelKey(m.provider, m.id) : stats.activeModelKey;
+    if (!nextKey || nextKey === stats.activeModelKey) {
+      requestFooterRender?.();
+      return;
+    }
+    stats.activeModelKey = nextKey;
+    // 新模型先建空桶：CH% 显示为无数据（--）而不是 0%
+    if (!hasHistory(nextKey)) ensureModelBucket(nextKey);
+    // 速率/延迟也属于上一个模型的观测值，切模型后不应用来误导当前模型
+    stats.lastTokensPerSec = stats.lastTurnByModel.get(nextKey)?.tokensPerSec ?? 0;
+    stats.lastFirstTokenLatency = 0;
+    requestFooterRender?.();
+  });
+
   pi.on("turn_start", async (_event, ctx) => {
     stats.turnStartTime = Date.now();
     stats.firstTokenTime = 0;
     stats.streaming = false;
+
+    // 兜底同步激活模型（model_select 可能因恢复历史/子会话而未触发）
+    if (ctx.model?.provider || ctx.model?.id) {
+      stats.activeModelKey = getModelKey(ctx.model.provider, ctx.model.id);
+    }
 
     // P1 修复：turn_start 也能触发 provider 变化检测；切换时 force refresh
     if (ctx.model?.provider !== lastQuotaProvider) {
@@ -2070,57 +2862,64 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     const wordCount = countWords(
       extractTextContent(event.message.content),
     );
-    // 缓存命中率（pi 内置公式）
-    const promptTokens =
-      usage.input + usage.cacheRead + usage.cacheWrite;
-    const cacheHitRate =
-      promptTokens > 0
-        ? (usage.cacheRead / promptTokens) * 100
-        : 0;
+    // 模型归属：以响应消息自身的 provider/model 为准（异步任务/子会话可能用别的模型），
+    // 兜底才用当前激活模型，避免串账
+    const provider = assistantMsg.provider || ctx.model?.provider || "unknown";
+    const modelId = assistantMsg.model || ctx.model?.id || "unknown";
+    const modelKey = getModelKey(provider, modelId);
+    // 单轮增量先落成一个桶，命中率统一走 calcCacheHitRate（分母为 0 时为 null）
+    const turnBucket = createEmptyBucket();
+    addUsageToBucket(turnBucket, {
+      input: usage.input,
+      output: usage.output,
+      cacheRead: usage.cacheRead,
+      cacheWrite: usage.cacheWrite,
+      turns: 1,
+      cost: usage.cost?.total ?? 0,
+    });
+    const cacheHitRate = calcCacheHitRate(turnBucket);
     // 花费
     const cost = usage.cost?.total ?? 0;
 
-    // 更新本轮精确值
-    stats.lastInput = usage.input;
-    stats.lastOutput = usage.output;
-    stats.lastCacheRead = usage.cacheRead;
-    stats.lastCacheWrite = usage.cacheWrite;
-    stats.lastCost = cost;
-    stats.lastCacheHitRate = cacheHitRate;
+    // 更新本轮精确值（仅保留展示用的速率/延迟类字段）
     stats.lastTokensPerSec = tokensPerSec;
     stats.lastLiveTokenSpeed = liveSpeed;
     stats.lastFirstTokenLatency = firstTokenLatency;
-    stats.lastWordCount = wordCount;
     stats.streaming = false;
 
-    // 累加到会话
-    stats.totalInput += usage.input;
-    stats.totalOutput += usage.output;
-    stats.totalCacheRead += usage.cacheRead;
-    stats.totalCacheWrite += usage.cacheWrite;
-    stats.totalCost += cost;
-    stats.totalCacheHitRateSum += cacheHitRate;
-    stats.turnCount++;
+    // 按模型入账 + 全会话汇总
+    const bucket = ensureModelBucket(modelKey);
+    addUsageToBucket(bucket, turnBucket);
+    stats.lastTurnByModel.set(modelKey, {
+      ...turnBucket,
+      modelKey,
+      tokensPerSec,
+      cacheHitRate,
+      at: Date.now(),
+    });
+    // 单轮消耗归入它自己的模型桶（异步任务/队列可能用别的模型，不能串账）；
+    // 但 footer 的激活模型以 ctx.model 为准 —— 它才是右侧显示的那个模型，
+    // 否则异步响应会让 CH% 悄悄跳到别的模型上。
+    stats.activeModelKey = resolveActiveModelKey(ctx) ?? modelKey;
 
     requestFooterRender?.();
 
     // 持久化
     const sessionId =
       ctx.sessionManager.getSessionId?.() ?? "unknown";
-    const model = `${event.message.provider}/${event.message.model}`;
     await persistTurn({
       input: usage.input,
       output: usage.output,
       cacheRead: usage.cacheRead,
       cacheWrite: usage.cacheWrite,
       tokensPerSec,
-      cacheHitRate,
-      model,
+      cacheHitRate: cacheHitRate ?? 0,
+      model: `${provider}/${modelId}`,
       firstTokenLatency,
       wordCount,
       cost,
       liveTokenSpeed: liveSpeed,
-    }, sessionId);
+    }, sessionId, provider, modelId);
 
     // 重置 live 状态
     resetLiveState();
@@ -2132,6 +2931,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     stats.streaming = false;
     resetLiveState();
     requestFooterRender?.();
+    scheduleShardRebuild();
   });
 
   // ── session_shutdown: 清理跨 session 资源（定时器 / footer 引用）───────
@@ -2143,10 +2943,20 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     // 注意：reload 会重新执行本文件（全新实例、quotaTimerId 为 null），
     // 所以只有这里能清掉旧实例的定时器，不能依赖 session_start 里的清理。
     sessionActive = false;
+    resetSessionStats();
+    // 不保留上一个会话的模型指针：新 session 由重放/ctx 重新确定
+    stats.activeModelKey = null;
     sessionStartedAt = 0;
     if (quotaTimerId) {
       clearInterval(quotaTimerId);
       quotaTimerId = null;
+    }
+    // 本地服务随 session 一起停：/reload 时旧实例必须让出端口，
+    // 否则新实例 listen 会 EADDRINUSE，页面右上角一直显示「服务未运行」
+    if (statsServer) {
+      void statsServer.close().catch(() => {});
+      statsServer = null;
+      statsServerUrl = "";
     }
     requestFooterRender = null;
     lastQuotaProvider = null;
@@ -2251,7 +3061,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   // ── /stats 命令 ─────────────────────────────────────
 
   pi.registerCommand("stats", {
-    description: "Token 统计：/stats 打开主菜单；/stats day|hour|week|month|year 查询；/stats config 状态栏配置",
+    description: "Token 统计与网页报表",
     handler: async (args, ctx) => {
       let arg = args.trim();
       const fromMainMenu = !arg;
@@ -2260,32 +3070,21 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         // 无参 → 主菜单：统计查询不再需要记参数，套餐/配置入口也在这里
         if (!arg) {
           const main = await ctx.ui.select("Token 统计", [
+            "统计查询",
             "状态栏配置",
             "套餐配额配置",
-            "统计查询",
+            "清除历史统计",
           ]);
           if (!main) return;
+          if (main === "清除历史统计") {
+            await purgeData(ctx, pi);
+            return;
+          }
           if (main === "统计查询") {
-            const report = await ctx.ui.select("统计查询", [
-              "今日统计",
-              "按小时分布（今日）",
-              "本周汇总",
-              "月度汇总",
-              "年度汇总（按月）",
-            ]);
-            if (!report) continue mainMenu;
-            if (report === "今日统计") {
-              await showDay(getDateStr(), ctx, pi);
-            } else if (report === "按小时分布（今日）") {
-              await showHourly(getDateStr(), ctx, pi);
-            } else if (report === "本周汇总") {
-              await showWeek(ctx, pi);
-            } else if (report === "月度汇总") {
-              await showMonth(getMonthStr(), ctx, pi);
-            } else if (report === "年度汇总（按月）") {
-              await showYear(String(new Date().getFullYear()), ctx, pi);
-            }
-            continue mainMenu;
+            // 统计查询直接出网页报表并开浏览器，选中即结束，不回主菜单
+            // （网页已覆盖日/周/月/年所有查询维度，终端不再另列表格入口）
+            await showHtmlReport(ctx, pi);
+            return;
           }
           if (main === "套餐配额配置") arg = "plan";
           else if (main === "状态栏配置") arg = "config";
@@ -2532,6 +3331,28 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         }
       } else if (arg === "week") {
         await showWeek(ctx, pi);
+      } else if (arg === "models" || arg === "model") {
+        // 按模型归类：默认最近 7 天
+        await showByModel(
+          getDateStr(Date.now() - 7 * 24 * 60 * 60 * 1000),
+          getDateStr(),
+          ctx,
+          pi,
+        );
+      } else if (arg.startsWith("models ")) {
+        const range = arg.slice(7).trim().split(/\s+/);
+        const from = range[0] ?? getDateStr();
+        const to = range[1] ?? getDateStr();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(from) && /^\d{4}-\d{2}-\d{2}$/.test(to)) {
+          await showByModel(from, to, ctx, pi);
+        } else {
+          ctx.ui.notify("用法: /stats models [from] [to]（YYYY-MM-DD）", "warning");
+        }
+      } else if (arg === "html" || arg === "web" || arg === "report") {
+        await showHtmlReport(ctx, pi);
+      } else if (arg === "clear" || arg === "purge") {
+        await purgeData(ctx, pi);
+        return;
       } else if (arg === "month") {
         await showMonth(getMonthStr(), ctx, pi);
       } else if (arg.startsWith("month ")) {
@@ -2552,7 +3373,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         }
       } else {
         ctx.ui.notify(
-          "用法: /stats [day [date] | hour [date] | week | month [YYYY-MM] | year [YYYY] | config]",
+          "用法: /stats [day [date] | hour [date] | week | month [YYYY-MM] | year [YYYY] | models [from] [to] | html | config]",
           "warning",
         );
       }

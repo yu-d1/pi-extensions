@@ -6,3 +6,8 @@ dist/
 .env.local
 .vscode/
 .idea/
+
+# token-stats 网页报表生成物（每次生成重写，不入库）
+packages/token-stats/report-index.js
+packages/token-stats/report-day-*.js
+packages/token-stats/report-data.js
