@@ -3190,7 +3190,15 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         // 前置检查不通过（如缺 Chrome）时留在界面重选；选中后保存并关闭弹窗。
         while (true) {
           const choice = await pickQuotaPlan(ctx, provider);
-          if (!choice) return; // esc：直接关闭
+          if (!choice) {
+            // esc：与「状态栏配置」保持一致 —— 回主菜单；直接用 /stats plan 进入则关闭命令
+            if (fromMainMenu) {
+              ctx.ui.notify("已返回主菜单", "info");
+              arg = "";
+              continue mainMenu;
+            }
+            return;
+          }
           const plan = choice === "关闭" ? null : (BUILTIN_PLANS.find((p) => p.name === choice) ?? null);
           if (choice !== "关闭" && !plan) continue;
           if (plan) {
@@ -3218,7 +3226,11 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           "查询超时    " + Math.round((tokenConfig?.quotaTimeoutMs ?? DEFAULT_QUOTA_TIMEOUT_MS) / 1000) + "s",
           "恢复默认",
         ]);
-        if (!subChoice) break configMenu;
+        if (!subChoice) {
+          // esc：退回上一层（主菜单）；直接用 /stats config 进入则关闭命令
+          if (fromMainMenu) ctx.ui.notify("已返回主菜单", "info");
+          break configMenu;
+        }
 
         if (subChoice.startsWith("显示内容")) {
           // 分组勾选面板：右侧示例值随精度联动，ctrl+s 保存并实时刷新 footer
