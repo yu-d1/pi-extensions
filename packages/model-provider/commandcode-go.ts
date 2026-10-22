@@ -710,7 +710,19 @@ export function streamCommandCodeGo(
 			usage: { ...output.usage, cost: { ...output.usage.cost } },
 		});
 
+		// 定时器与 abort 监听提升到 try 外：出错时也要能清理，
+		// 否则 600s 的超时定时器会让进程多挂 10 分钟。
+		const ac = new AbortController();
+		const onAbort = () => ac.abort();
+		options?.signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
+
 		try {
+			// pi 的事件协议要求先发 start：agent-loop 收到 start 后才会把后续
+			// text_delta / thinking_delta / toolcall_* 转成 message_update。
+			// 缺失 start 会导致所有增量事件被静默丢弃，TUI 退化为一次性贴出全文。
+			stream.push({ type: "start", partial: snapshot() } as any);
+
 			const apiKey = options?.apiKey ?? "";
 			const allowImages = (model.input ?? ["text"]).includes("image");
 			const { systemPrompt, tools, messages } = resolveTranscript(context);
@@ -746,10 +758,6 @@ export function streamCommandCodeGo(
 				threadId: resolveThreadId(options),
 			};
 
-			const ac = new AbortController();
-			const onAbort = () => ac.abort();
-			options?.signal?.addEventListener("abort", onAbort, { once: true });
-			const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
 			const res = await fetch(`${base}/alpha/generate`, {
 				method: "POST",
 				headers: {
@@ -797,6 +805,12 @@ export function streamCommandCodeGo(
 			 * 否则同一个调用会在 content 里出现两次，pi 执行时报 [object Object]。
 			 */
 			const closedToolIds = new Set<string>();
+			/**
+			 * 增量 JSON 解析失败、参数待补全的 toolCallId。
+			 * 这类调用不能写入 closedToolIds，否则随后的 tool-call 汇总事件
+			 * 会被去重逻辑拦掉，完整参数就丢了（工具会以 {} 执行）。
+			 */
+			const unresolvedToolIds = new Set<string>();
 
 			const endText = () => {
 				if (textIndex < 0) return;
@@ -900,18 +914,34 @@ export function streamCommandCodeGo(
 						break;
 					}
 					case "tool-call": {
-						// 汇总事件；已由 tool-input-* 处理过则忽略，避免同一个调用入账两次
-						if (!ev.toolCallId || closedToolIds.has(ev.toolCallId)) break;
+						// 汇总事件；已由 tool-input-* 完整处理过则忽略，避免同一个调用入账两次
+						const id = ev.toolCallId;
+						if (!id || closedToolIds.has(id)) break;
+						const blk = toolBlocks.get(id);
 						endText();
 						endThinking();
+						if (blk) {
+							// 已有 block（tool-input-start 建立）：复用它，用汇总事件的完整参数定稿。
+							// 覆盖两种情况：增量 JSON 解析失败挂起的调用，以及上游只发了
+							// tool-input-start 却没发 tool-input-end 的调用。
+							toolBlocks.delete(id);
+							unresolvedToolIds.delete(id);
+							closedToolIds.add(id);
+							const call = output.content[blk.index] as ToolCall;
+							if (!call.name) call.name = ev.toolName ?? "";
+							(call as any).arguments = (ev.input ?? {}) as never;
+							stream.push({ type: "toolcall_end", contentIndex: blk.index, toolCall: call, partial: snapshot() } as any);
+							break;
+						}
+						// 完全没有 tool-input-*：直接新建
 						output.content.push({
 							type: "toolCall",
-							id: ev.toolCallId,
+							id,
 							name: ev.toolName ?? "",
 							arguments: (ev.input ?? {}) as never,
 						} as ToolCall);
 						const index = output.content.length - 1;
-						closedToolIds.add(ev.toolCallId);
+						closedToolIds.add(id);
 						stream.push({ type: "toolcall_start", contentIndex: index, partial: snapshot() } as any);
 						stream.push({ type: "toolcall_end", contentIndex: index, toolCall: output.content[index] as ToolCall, partial: snapshot() } as any);
 						break;
@@ -919,11 +949,12 @@ export function streamCommandCodeGo(
 					case "finish": {
 						endText();
 						endThinking();
+						// usage 与 stopReason 分别处理：上游可能只给 finishReason 不给 usage，
+						// 耦合会导致长度截断 / 工具调用被误判成正常结束。
 						const u = ev.totalUsage ?? ev.usage;
-						if (u) {
-							output.usage = mapUsage(u, model);
-							output.stopReason = mapStopReason((ev.finishReason ?? ev.rawFinishReason) as string | undefined);
-						}
+						if (u) output.usage = mapUsage(u, model);
+						const reason = (ev.finishReason ?? (ev as any).rawFinishReason) as string | undefined;
+						if (typeof reason === "string" && reason) output.stopReason = mapStopReason(reason);
 						break;
 					}
 					case "error": {
@@ -936,8 +967,6 @@ export function streamCommandCodeGo(
 				if (closedToolIds.has(id)) return;
 				const blk = toolBlocks.get(id);
 				if (!blk) return;
-				toolBlocks.delete(id);
-				closedToolIds.add(id);
 				const call = output.content[blk.index] as ToolCall | undefined;
 				if (!call) return;
 				let args: unknown = fallbackInput;
@@ -945,9 +974,16 @@ export function streamCommandCodeGo(
 					try {
 						args = blk.json ? JSON.parse(blk.json) : {};
 					} catch {
-						args = {};
+						// 增量 JSON 不完整：参数交由随后的 tool-call 汇总事件补全。
+						// 此处不关闭、不写入 closedToolIds，否则汇总事件会被去重拦掉，
+						// 工具就会以空参数 {} 执行。
+						unresolvedToolIds.add(id);
+						return;
 					}
 				}
+				toolBlocks.delete(id);
+				closedToolIds.add(id);
+				unresolvedToolIds.delete(id);
 				(call as any).arguments = args;
 				stream.push({ type: "toolcall_end", contentIndex: blk.index, toolCall: call, partial: snapshot() } as any);
 			}
@@ -964,8 +1000,22 @@ export function streamCommandCodeGo(
 			}
 			handle(buf);
 
-			clearTimeout(timer);
-			options?.signal?.removeEventListener("abort", onAbort);
+			// 兜底关闭上游未正常收尾的工具调用，避免 pi 侧悬挂等待参数
+			for (const [id, blk] of [...toolBlocks]) {
+				toolBlocks.delete(id);
+				unresolvedToolIds.delete(id);
+				closedToolIds.add(id);
+				const call = output.content[blk.index] as ToolCall | undefined;
+				if (!call) continue;
+				let args: unknown = {};
+				try {
+					args = blk.json ? JSON.parse(blk.json) : {};
+				} catch {
+					args = {};
+				}
+				(call as any).arguments = args;
+				stream.push({ type: "toolcall_end", contentIndex: blk.index, toolCall: call, partial: snapshot() } as any);
+			}
 
 			// 流未给出 usage 时兜底
 			if (output.usage.totalTokens === 0) {
@@ -977,13 +1027,20 @@ export function streamCommandCodeGo(
 			stream.push({ type: "done", reason: doneReason, message: output } as any);
 			stream.end();
 		} catch (e) {
-			clearTimeout(REQUEST_TIMEOUT_MS);
 			const message = e instanceof Error ? e.message : String(e);
-			output.stopReason = "error";
-			output.errorMessage = message;
+			const aborted = options?.signal?.aborted === true;
+			const timedOut = !aborted && ac.signal.aborted;
+			// 用户主动中断应报 aborted（pi 按此显示「Operation aborted」而非红色报错），
+			// 超时则单独提示，避免与真实故障混淆。
+			output.stopReason = aborted ? "aborted" : "error";
+			output.errorMessage = aborted ? "Request was aborted" : timedOut ? `Command Code 请求超时（${Math.round(REQUEST_TIMEOUT_MS / 1000)}s）` : message;
 			output.usage = mapUsage({}, model);
-			stream.push({ type: "error", reason: "error", error: output } as any);
-			stream.end();		}
+			stream.push({ type: "error", reason: output.stopReason, error: output } as any);
+			stream.end();
+		} finally {
+			clearTimeout(timer);
+			options?.signal?.removeEventListener("abort", onAbort);
+		}
 	})();
 
 	return stream;

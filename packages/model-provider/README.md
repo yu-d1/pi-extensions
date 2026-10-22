@@ -58,6 +58,7 @@ Command Code 的官方授权页 `/studio/auth/cli` 在中文环境下会因 loca
 
 ## 版本历史
 
+- **0.2.11** — 修复 Command Code (GO) 回复不流式渲染：补发 `start` 事件，避免增量事件被丢弃；修复工具调用参数可能丢失、用户中断被报成错误、停止原因丢失
 - **0.2.10** — 修复内置 Command Code (GO) “刷新模型”误连 MiniMax 地址导致认证失败：改走 `/provider/v1/models`；“配置管理”入口仅对 MiniMax 展示
 - **0.2.9** — 修复 Command Code (GO) 正文流式输出异常：事件携带的消息快照改为逐帧拷贝，避免上游密集 delta 被后续内容覆盖
 - **0.2.8** — 新增内置供应商 Command Code（GO 套餐）；新增模型自动勾选启用，内置供应商排到最后
