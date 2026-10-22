@@ -51,6 +51,7 @@ import {
   formatTokens,
   getModelKey,
   normalizeBucket,
+  normalizeInputTokens,
 } from "./format";
 import type { InputScope, ModelKey, TokenBucket, UsageDelta } from "./format";
 import { REPORT_HTML_PATH, rebuildDay, writeReportData } from "./report";
@@ -255,6 +256,7 @@ function resetSessionStats() {
   stats.lastTurnByModel = new Map();
   stats.accountedUsageKeys = new Set();
   stats.lastTokensPerSec = 0;
+  scopeCache.clear();
 }
 
 /** 当前模型键：优先用 ctx 里的模型，缺失时回退到已记住的激活模型 */
@@ -796,8 +798,13 @@ async function ensureStatsServer(
 /**
  * 查该模型最近一条已落盘记录的口径，作为首轮/无法判定时的兜底。
  * 口径是 provider 的固有属性，同一模型不会每轮变来变去。
+ *
+ * 返回 null 表示「查不到已判定的口径」：宁可让调用方保持未知，
+ * 也不能把默认的 exclusive 当成既定事实写回缓存——
+ * 那会让 inclusive 的模型（minimax / commandcodego）第一轮冷启动后
+ * 永远按错误口径统计。
  */
-async function modelInputScope(provider: string, modelId: string): Promise<InputScope> {
+async function modelInputScope(provider: string, modelId: string): Promise<InputScope | null> {
   const key = getModelKey(provider, modelId);
   const today = getDateStr();
   const yesterday = getDateStr(Date.now() - 86400000);
@@ -820,7 +827,7 @@ async function modelInputScope(provider: string, modelId: string): Promise<Input
       }
     }
   }
-  return "exclusive";
+  return null;
 }
 
 /**
@@ -852,12 +859,59 @@ async function lastSessionInput(sessionId: string): Promise<number> {
   return 0;
 }
 
-async function persistTurn(record: TurnStats, sessionId: string, provider: string, modelId: string) {
+/**
+ * 会话内的口径缓存。
+ * 口径是 provider+model 的固有属性（同一模型不会这轮 inclusive、下一轮 exclusive），
+ * 判定一次就记住，后续轮次零 IO。
+ */
+const scopeCache = new Map<ModelKey, InputScope>();
+
+/**
+ * 判定某模型本轮的 input 口径。
+ *
+ * 优先用「cacheRead ≈ 同会话上一轮 input」现场判定（最准）；
+ * 判不出时沿用该模型最近一次落盘记录的口径；
+ * 都没有则返回 null（未知）——未知就保持未知，等下一轮拿到参照物再判，
+ * 避免把猜测固化成事实。
+ */
+async function resolveUsageScope(
+  provider: string,
+  modelId: string,
+  sessionId: string,
+  cacheRead: number,
+): Promise<InputScope | null> {
+  const key = getModelKey(provider, modelId);
+  const cached = scopeCache.get(key);
+  if (cached) return cached;
+  const prevInput = await lastSessionInput(sessionId);
+  const detected = detectInputScope(prevInput, cacheRead);
+  if (detected) {
+    scopeCache.set(key, detected);
+    return detected;
+  }
+  const known = await modelInputScope(provider, modelId);
+  if (known) {
+    scopeCache.set(key, known);
+    return known;
+  }
+  return null;
+}
+
+async function persistTurn(
+  record: TurnStats,
+  sessionId: string,
+  provider: string,
+  modelId: string,
+  knownScope?: InputScope,
+) {
   // 判定 input 口径：cacheRead ≈ 上一轮 input 说明 input 已含缓存。
-  // 首轮（无上一条）无从判断，沿用同模型已有记录的口径，默认 exclusive。
+  // 首轮（无上一条）无从判断，沿用同模型已有记录的口径；
+  // 都判不出时留空（不写 inputScope），留给读取阶段现场推断，
+  // 避免把 exclusive 当成事实落盘、反过来污染 modelInputScope 的判断。
   const prevInput = await lastSessionInput(sessionId);
   const detected = detectInputScope(prevInput, record.cacheRead);
-  const inputScope: InputScope = detected ?? (await modelInputScope(provider, modelId));
+  const resolved = knownScope ?? detected ?? (await modelInputScope(provider, modelId));
+  if (resolved) scopeCache.set(getModelKey(provider, modelId), resolved);
 
   const raw: RawRecord = {
     ...record,
@@ -865,7 +919,7 @@ async function persistTurn(record: TurnStats, sessionId: string, provider: strin
     session: sessionId,
     provider,
     modelId,
-    inputScope,
+    inputScope: resolved ?? undefined,
   };
   await appendRaw(raw);
   await updateHourly(raw);
@@ -966,9 +1020,7 @@ function recordUsage(record: RawRecord, scope?: InputScope): UsageDelta {
   const cacheWrite = Number(record.cacheWrite) || 0;
   const rawInput = Number(record.input) || 0;
   const effective = resolveScope(record, scope ?? "exclusive");
-  const input = effective === "inclusive"
-    ? Math.max(0, rawInput - cacheRead - cacheWrite)
-    : rawInput;
+  const input = normalizeInputTokens(rawInput, cacheRead, cacheWrite, effective);
   return {
     input,
     output: Number(record.output) || 0,
@@ -1040,13 +1092,18 @@ function getEntryTimestampMs(entry: {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function rebuildFromHistory(ctx: ExtensionContext) {
+async function rebuildFromHistory(ctx: ExtensionContext) {
   const branch = ctx.sessionManager.getBranch();
   resetSessionStats();
 
   // 遍历 entries 按消息自身的 provider/model 归入各自的桶，同时推算历史速率
   let latestAssistantSpeed: number | null = null;
   let latestModelKey: ModelKey | null = null;
+  /**
+   * 同会话上一轮的原始 prompt 大小（inclusive 口径的参照物）。
+   * 增量会话里 cacheRead ≈ 上一轮 prompt，说明 provider 返回的 input 已含缓存。
+   */
+  let lastPromptInput = 0;
 
   for (const entry of branch) {
     if (entry.type !== "message") continue;
@@ -1055,12 +1112,26 @@ function rebuildFromHistory(ctx: ExtensionContext) {
 
     // 模型归属以消息自带的为准（历史里可能混了多个模型）
     const modelKey = getModelKey(msg.provider, msg.model);
+    const rawInput = msg.usage.input ?? 0;
+    const cacheRead = msg.usage.cacheRead ?? 0;
+    const cacheWrite = msg.usage.cacheWrite ?? 0;
+
+    // 口径判定：命中缓存后 input 已含缓存 → 扣掉缓存才是纯新增
+    const knownScope =
+      detectInputScope(lastPromptInput, cacheRead)
+      ?? scopeCache.get(modelKey)
+      ?? (await modelInputScope(msg.provider ?? "", msg.model ?? ""));
+    const scope = knownScope ?? "exclusive";
+    if (knownScope) scopeCache.set(modelKey, knownScope);
+    const input = normalizeInputTokens(rawInput, cacheRead, cacheWrite, scope);
+    lastPromptInput = rawInput;
+
     const bucket = ensureModelBucket(modelKey);
     addUsageToBucket(bucket, {
-      input: msg.usage.input ?? 0,
+      input,
       output: msg.usage.output ?? 0,
-      cacheRead: msg.usage.cacheRead ?? 0,
-      cacheWrite: msg.usage.cacheWrite ?? 0,
+      cacheRead,
+      cacheWrite,
       turns: 1,
       cost: msg.usage.cost?.total ?? 0,
     });
@@ -1069,10 +1140,10 @@ function rebuildFromHistory(ctx: ExtensionContext) {
     // 单轮快照无条件记录（命中率与速率无关，无 timestamp 也能算出 CH）
     const turnBucket = createEmptyBucket();
     addUsageToBucket(turnBucket, {
-      input: msg.usage.input ?? 0,
+      input,
       output: msg.usage.output ?? 0,
-      cacheRead: msg.usage.cacheRead ?? 0,
-      cacheWrite: msg.usage.cacheWrite ?? 0,
+      cacheRead,
+      cacheWrite,
       turns: 1,
     });
     let snapshotSpeed = stats.lastTurnByModel.get(modelKey)?.tokensPerSec ?? 0;
@@ -2867,10 +2938,24 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     const provider = assistantMsg.provider || ctx.model?.provider || "unknown";
     const modelId = assistantMsg.model || ctx.model?.id || "unknown";
     const modelKey = getModelKey(provider, modelId);
+    const sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+
+    // 口径判定：provider 返回的 input 可能已含缓存（inclusive）。
+    // 必须先归一成「纯新增」再入桶，否则命中率分母会把缓存算两遍，
+    // CH% 被永久钉在 50% 附近（真实值可能 99%）。
+    const knownScope = await resolveUsageScope(provider, modelId, sessionId, usage.cacheRead ?? 0);
+    const scope = knownScope ?? "exclusive";
+    const input = normalizeInputTokens(
+      usage.input ?? 0,
+      usage.cacheRead ?? 0,
+      usage.cacheWrite ?? 0,
+      scope,
+    );
+
     // 单轮增量先落成一个桶，命中率统一走 calcCacheHitRate（分母为 0 时为 null）
     const turnBucket = createEmptyBucket();
     addUsageToBucket(turnBucket, {
-      input: usage.input,
+      input,
       output: usage.output,
       cacheRead: usage.cacheRead,
       cacheWrite: usage.cacheWrite,
@@ -2904,9 +2989,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
     requestFooterRender?.();
 
-    // 持久化
-    const sessionId =
-      ctx.sessionManager.getSessionId?.() ?? "unknown";
+    // 持久化（raw 保留 provider 原始口径 + inputScope，由读取阶段负责归一）
     await persistTurn({
       input: usage.input,
       output: usage.output,
@@ -2919,7 +3002,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       wordCount,
       cost,
       liveTokenSpeed: liveSpeed,
-    }, sessionId, provider, modelId);
+    }, sessionId, provider, modelId, knownScope ?? undefined);
 
     // 重置 live 状态
     resetLiveState();
@@ -2970,7 +3053,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     sessionActive = true;
     sessionStartedAt = Date.now();
-    rebuildFromHistory(ctx);
+    await rebuildFromHistory(ctx);
     bindMimoFeedback(
       typeof ctx.ui?.setWorkingMessage === "function"
         ? (message: string) => ctx.ui.setWorkingMessage!(message)

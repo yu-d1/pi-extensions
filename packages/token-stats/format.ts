@@ -130,6 +130,24 @@ export function bucketPromptTokens(
 }
 
 /**
+ * 把 provider 返回的原始 input 归一化为「纯新增」（不含缓存）口径。
+ *
+ * inclusive 口径下 input 已含缓存，必须扣掉命中的与新写入的缓存，
+ * 否则下游按 exclusive 口径把缓存又加一遍，总 prompt 翻倍、
+ * 命中率被钉在 50% 附近（真实值可能是 99%）。
+ */
+export function normalizeInputTokens(
+  rawInput: number,
+  cacheRead: number,
+  cacheWrite: number,
+  scope: InputScope = "exclusive",
+): number {
+  const raw = toCount(rawInput);
+  if (scope !== "inclusive") return raw;
+  return Math.max(0, raw - toCount(cacheRead) - toCount(cacheWrite));
+}
+
+/**
  * 缓存命中率（百分比）：cacheRead / 总输入。分母为 0 返回 null，
  * 由调用方显示 "--" 或隐藏该段。
  */
