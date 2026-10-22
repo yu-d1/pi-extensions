@@ -7,8 +7,8 @@
  * 因此无需像 kimi 那样自行刷新 token，resolveApiKey 的 2a 分支直接可用。
  */
 
-import type { TokenPlan } from "./shared";
-import { formatTokenPlanDisplay, quotaColor } from "./shared";
+import type { QuotaFetchOptions, TokenPlan } from "./shared";
+import { formatTokenPlanDisplay, quotaColor, quotaTimeout } from "./shared";
 
 /** credits 响应里的一扇用量窗口 */
 interface WindowEntry {
@@ -53,11 +53,11 @@ export const commandCodeGoPlan: TokenPlan = {
   baseUrl: "https://api.commandcode.ai",
   quotaPath: "/alpha/billing/credits",
   authHeader: (key) => ({ Authorization: "Bearer " + key, Accept: "application/json" }),
-  fetchQuota: async (plan: TokenPlan, key: string) => {
+  fetchQuota: async (plan: TokenPlan, key: string, opts?: QuotaFetchOptions) => {
     const r = await fetch(plan.baseUrl + plan.quotaPath, {
       method: "GET",
       headers: plan.authHeader(key),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(quotaTimeout(opts)),
     });
     if (!r.ok) throw new Error("Command Code 配额查询 HTTP " + r.status);
     return await r.json();

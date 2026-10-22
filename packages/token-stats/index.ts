@@ -33,7 +33,7 @@ import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { BUILTIN_PLANS, bindMimoFeedback, checkLoginPlanPrereq, mimoLog, resetMimoLoginBackoff } from "./plans";
+import { BUILTIN_PLANS, bindMimoFeedback, checkLoginPlanPrereq, DEFAULT_QUOTA_TIMEOUT_MS, mimoLog, resetMimoLoginBackoff } from "./plans";
 import type { PlanFormatContext, QuotaStyle, TokenPlan } from "./plans";
 import type { TokenPrecision } from "./format";
 import {
@@ -145,6 +145,8 @@ interface DailyRecord {
 interface TokenConfig {
   providerPlans: Record<string, string | null>;
   ttl: number;
+  /** 套餐配额查询的单次请求超时（毫秒） */
+  quotaTimeoutMs: number;
 }
 
 interface QuotaCache {
@@ -1322,7 +1324,7 @@ async function pickQuotaPlan(ctx: ExtensionContext, provider: string): Promise<s
 
 /** 保存套餐选择（plan=null 表示关闭），刷新 footer 并提示结果。 */
 async function applyQuotaPlan(ctx: ExtensionContext, provider: string, plan: TokenPlan | null): Promise<void> {
-  const defaults: TokenConfig = { providerPlans: {}, ttl: 60 };
+  const defaults: TokenConfig = { ...DEFAULT_TOKEN_CONFIG };
   const planId = plan ? plan.id : null;
   tokenConfig = tokenConfig
     ? { ...tokenConfig, providerPlans: { ...tokenConfig.providerPlans, [provider]: planId } }
@@ -1362,6 +1364,7 @@ const QUOTA_CACHE_FILE = join(LOGS_DIR, "quota-cache.json");
 const DEFAULT_TOKEN_CONFIG: TokenConfig = {
   providerPlans: {},
   ttl: 60,
+  quotaTimeoutMs: DEFAULT_QUOTA_TIMEOUT_MS,
 };
 
 const DISPLAY_CONFIG_FILE = join(TOKEN_CONFIG_DIR, "display-config.json");
@@ -1709,10 +1712,12 @@ async function loadTokenConfig(): Promise<TokenConfig> {
     if (existsSync(TOKEN_CONFIG_FILE)) {
       const raw = await readFile(TOKEN_CONFIG_FILE, "utf-8");
       const parsed = JSON.parse(raw) as Partial<TokenConfig>;
-      return {
-        ...DEFAULT_TOKEN_CONFIG,
-        ...parsed,
-      };
+      const merged: TokenConfig = { ...DEFAULT_TOKEN_CONFIG, ...parsed };
+      // 超时容错：老配置没有该字段时合并已补上默认值；写成非法值则回落默认
+      if (!Number.isFinite(merged.quotaTimeoutMs) || merged.quotaTimeoutMs <= 0) {
+        merged.quotaTimeoutMs = DEFAULT_TOKEN_CONFIG.quotaTimeoutMs;
+      }
+      return merged;
     }
   } catch {}
   return { ...DEFAULT_TOKEN_CONFIG };
@@ -2059,7 +2064,7 @@ async function refreshQuota(ctx: ExtensionContext, force = false): Promise<void>
 
   // 5. 调接口
   try {
-    const data = await plan.fetchQuota(plan, key ?? "");
+    const data = await plan.fetchQuota(plan, key ?? "", { timeoutMs: tokenConfig?.quotaTimeoutMs });
     cache[plan.id] = { fetchedAt: Date.now(), ttl: ttlMs, data };
     await writeQuotaCache(cache);
     const fmt = plan.format(data, planFormatCtx());
@@ -3210,6 +3215,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
           "速率样式    " + (SPEED_STYLE_ITEMS.find((i) => i.value === displayConfig.speedStyle)?.label ?? displayConfig.speedStyle),
           "套餐样式    " + (QUOTA_STYLE_ITEMS.find((i) => i.value === displayConfig.quotaStyle)?.label ?? displayConfig.quotaStyle),
           "查询间隔    " + (tokenConfig?.ttl || 60) + "s",
+          "查询超时    " + Math.round((tokenConfig?.quotaTimeoutMs ?? DEFAULT_QUOTA_TIMEOUT_MS) / 1000) + "s",
           "恢复默认",
         ]);
         if (!subChoice) break configMenu;
@@ -3363,7 +3369,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
             } else {
               tokenConfig = tokenConfig
                 ? { ...tokenConfig, ttl: sec }
-                : { providerPlans: {}, ttl: sec };
+                : { ...DEFAULT_TOKEN_CONFIG, ttl: sec };
               await saveTokenConfig(tokenConfig);
               if (quotaTimerId) clearInterval(quotaTimerId);
               quotaTimerId = setInterval(async () => {
@@ -3374,6 +3380,26 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
                 requestFooterRender?.();
               }, sec * 1000);
               ctx.ui.notify("查询间隔已设为 " + sec + " 秒", "info");
+            }
+          }
+        } else if (subChoice.startsWith("查询超时")) {
+          const curSec = Math.round((tokenConfig?.quotaTimeoutMs ?? DEFAULT_QUOTA_TIMEOUT_MS) / 1000);
+          const input = await ctx.ui.input("输入配额查询超时（秒）", String(curSec));
+          if (input) {
+            const sec = parseInt(input, 10);
+            if (Number.isNaN(sec) || sec < 1 || sec > 120) {
+              ctx.ui.notify("查询超时必须在 1-120 秒之间", "warning");
+            } else {
+              tokenConfig = {
+                providerPlans: tokenConfig?.providerPlans ?? {},
+                ttl: tokenConfig?.ttl ?? 60,
+                quotaTimeoutMs: sec * 1000,
+              };
+              await saveTokenConfig(tokenConfig);
+              ctx.ui.notify("查询超时已设为 " + sec + " 秒", "info");
+              // 立即用新超时跑一次，便于当场确认是否生效
+              await refreshQuotaOnce(ctx, true);
+              requestFooterRender?.();
             }
           }
         } else if (subChoice === "恢复默认") {

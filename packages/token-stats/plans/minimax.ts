@@ -3,8 +3,8 @@
  * 开放平台 coding_plan 余量：5h 窗口 + 周配额，general 优先。
  */
 
-import type { TokenPlan } from "./shared";
-import { formatTokenPlanDisplay, quotaColor } from "./shared";
+import type { QuotaFetchOptions, TokenPlan } from "./shared";
+import { formatTokenPlanDisplay, quotaColor, quotaTimeout } from "./shared";
 
 export const minimaxPlan: TokenPlan = {
   id: "minimax",
@@ -14,12 +14,12 @@ export const minimaxPlan: TokenPlan = {
   baseUrl: "https://api.minimaxi.com",
   quotaPath: "/v1/api/openplatform/coding_plan/remains",
   authHeader: (key) => ({ Authorization: "Bearer " + key }),
-  fetchQuota: async (plan: TokenPlan, key: string) => {
+  fetchQuota: async (plan: TokenPlan, key: string, opts?: QuotaFetchOptions) => {
     const url = "https://api.minimaxi.com" + plan.quotaPath;
     const r = await fetch(url, {
       method: "GET",
       headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(quotaTimeout(opts)),
     });
     const data = await r.json();
     if (data.base_resp?.status_code === 0) return data;

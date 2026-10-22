@@ -10,6 +10,20 @@ import { formatAmount, formatDuration, formatDurationLargest, formatPercent } fr
 
 export type QuotaColor = "ok" | "warn" | "err";
 
+/** 套餐配额查询的默认 HTTP 超时（毫秒），可由用户在配置面板覆盖 */
+export const DEFAULT_QUOTA_TIMEOUT_MS = 15_000;
+
+/** fetchQuota 的可选参数：timeoutMs 为本次查询的超时（毫秒） */
+export interface QuotaFetchOptions {
+  timeoutMs?: number;
+}
+
+/** 取本次查询应使用的超时（毫秒）：非法值回落到默认 */
+export function quotaTimeout(opts?: QuotaFetchOptions): number {
+  const t = opts?.timeoutMs;
+  return typeof t === "number" && Number.isFinite(t) && t > 0 ? t : DEFAULT_QUOTA_TIMEOUT_MS;
+}
+
 /** 套餐段格式化上下文：样式与各项精度由用户当前配置注入 */
 export interface PlanFormatContext {
   /** 套餐展示样式（紧凑 / 倒计时） */
@@ -43,7 +57,7 @@ export interface TokenPlan {
   baseUrl: string;
   quotaPath: string;
   authHeader: (key: string) => Record<string, string>;
-  fetchQuota: (plan: TokenPlan, key: string) => Promise<any>;
+  fetchQuota: (plan: TokenPlan, key: string, opts?: QuotaFetchOptions) => Promise<any>;
   /** 样式与精度来自用户当前的展示配置，由调用方（index）注入 */
   format: (data: any, ctx: PlanFormatContext) => { modelPrefix: string; display: string; color: QuotaColor };
 }

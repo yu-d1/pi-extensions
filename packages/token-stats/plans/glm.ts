@@ -3,8 +3,8 @@
  * /api/monitor/usage/quota/limit：tokens_limit 两档（5h / 周），unit=6 为周。
  */
 
-import type { TokenPlan } from "./shared";
-import { formatTokenPlanDisplay, quotaColor } from "./shared";
+import type { QuotaFetchOptions, TokenPlan } from "./shared";
+import { formatTokenPlanDisplay, quotaColor, quotaTimeout } from "./shared";
 
 export const glmPlan: TokenPlan = {
   id: "glm",
@@ -14,11 +14,11 @@ export const glmPlan: TokenPlan = {
   baseUrl: "https://open.bigmodel.cn",
   quotaPath: "/api/monitor/usage/quota/limit",
   authHeader: (key) => ({ Authorization: key }),
-  fetchQuota: async (plan: TokenPlan, key: string) => {
+  fetchQuota: async (plan: TokenPlan, key: string, opts?: QuotaFetchOptions) => {
     const r = await fetch(plan.baseUrl + plan.quotaPath, {
       method: "GET",
       headers: { ...plan.authHeader(key), "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(quotaTimeout(opts)),
     });
     if (!r.ok) throw new Error("GLM 配额查询 HTTP " + r.status);
     return await r.json();
