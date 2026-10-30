@@ -16,23 +16,24 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { detectPlanMode, streamViaProviderApi, type CcgoPlanMode } from "./commandcode-api";
 
 /**
- * Command Code（GO 套餐）内置供应商。
+ * Command Code 内置供应商。
  *
- * GO 套餐与 Provider 套餐的能力边界（实测）：
- *   GET  /provider/v1/models   → 200，模型目录可拉
- *   POST /provider/v1/*        → 403 upgrade_required（GO 套餐无 API 对话权限）
- *   POST /alpha/generate       → 200，唯一的对话通道
+ * 账号套餐决定走哪条通道（planMode，登录时判定一次后持久化）：
+ *   planMode = "go"   → 仅 /alpha/generate 可用（GO 套餐无 Provider API 权限）
+ *   planMode = "api"  → 走 Provider API（/provider/v1/*，GOAT / Pro / Max / Provider 套餐）
  *
- * 因此本模块自带传输层：把 pi 的 TranscriptContext 转成 Command Code CLI 的
- * 私有请求体，并解析它返回的 NDJSON 流（AI SDK 风格事件，非标准 SSE）。
+ * 两条通道的请求体与响应格式完全不同，因此分成两个独立实现：
+ *   本文件          —— /alpha/generate 的私有 NDJSON 协议（GO 套餐）
+ *   commandcode-api.ts —— 官方 OpenAI / Anthropic 协议（有 API 权限的套餐）
  */
 
 // ── 常量 ──────────────────────────────────────────────────────────────
 
 export const CCGO_PROVIDER_ID = "commandcodego";
-export const CCGO_LABEL = "Command Code (GO)";
+export const CCGO_LABEL = "Command Code";
 export const CCGO_BASE_URL = "https://api.commandcode.ai";
 /** 请求头里声明的 CLI 版本，服务端据此决定能力集。 */
 const CLI_VERSION = "1.72.4";
@@ -44,6 +45,12 @@ const REQUEST_TIMEOUT_MS = 600_000;
 export interface CommandCodeGoConfig {
 	/** API 根地址，默认 https://api.commandcode.ai */
 	baseUrl: string;
+	/**
+	 * 套餐类型，决定走哪条请求通道。
+	 *   登录成功后自动判定一次并写入；用户可在「模型管理 → 套餐类型」手动修改。
+	 *   缺失时默认 "go"（还没有判定结果时按 GO 通道处理）。
+	 */
+	planMode: CcgoPlanMode;
 	/** 覆盖 max_tokens；不设则用模型自身的 maxTokens。 */
 	maxCompletionTokens?: number;
 	/** 传给 params.reasoning_effort；不设则不下发该字段。 */
@@ -51,7 +58,7 @@ export interface CommandCodeGoConfig {
 	temperature?: number;
 }
 
-export const DEFAULT_CCGO: CommandCodeGoConfig = { baseUrl: CCGO_BASE_URL };
+export const DEFAULT_CCGO: CommandCodeGoConfig = { baseUrl: CCGO_BASE_URL, planMode: "go" };
 
 export function asCommandCodeGoConfig(raw: unknown): CommandCodeGoConfig {
 	const o = (raw ?? {}) as Record<string, unknown>;
@@ -61,6 +68,8 @@ export function asCommandCodeGoConfig(raw: unknown): CommandCodeGoConfig {
 		typeof v === "string" && v.trim() ? v.trim() : undefined;
 	return {
 		baseUrl: str(o.baseUrl) ?? CCGO_BASE_URL,
+		// 老配置没有该字段：默认 GO 通道
+		planMode: o.planMode === "api" ? "api" : "go",
 		maxCompletionTokens: num(o.maxCompletionTokens),
 		reasoningEffort: str(o.reasoningEffort),
 		temperature: typeof o.temperature === "number" ? (o.temperature as number) : undefined,
@@ -157,7 +166,7 @@ function imagesOf(content: unknown): Record<string, string>[] {
 			const src = b?.source ?? {};
 			const url = typeof src.url === "string" ? src.url : typeof b?.image === "string" ? b.image : "";
 			const mediaType = typeof src.mediaType === "string" ? src.mediaType : "image/png";
-			return { type: "image", mediaType, data: url.startsWith("data:") ? url : url };
+			return { type: "image", mediaType, data: url };
 		})
 		.filter((x) => x.data);
 }
@@ -400,6 +409,50 @@ export function refreshToken(credentials: CcGoCredentials): CcGoCredentials {
 	return credentialsFromApiKey(credentials.refresh);
 }
 
+// ── 宿主回调（由 index.ts 注册，用于把判定结果写回配置） ──────────────
+
+interface CcgoHost {
+	/** 把套餐类型写入持久化配置（并同步到本模块的 injectedConfig）。 */
+	savePlanMode(mode: CcgoPlanMode): Promise<void>;
+}
+
+let host: CcgoHost | null = null;
+
+export function setCommandCodeGoHost(next: CcgoHost): void {
+	host = next;
+}
+
+/**
+ * 登录成功后判定套餐类型并持久化。
+ *
+ * 只在登录这一处判定：用户手动改过套餐类型后，任何刷新 / 重注册都不会覆盖他的选择。
+ * 判定失败（网络异常或响应不明确）时保留原值，仅提示用户可手动改。
+ */
+async function applyDetectedPlanMode(apiKey: string, apiBase: string, callbacks: CcGoCallbacks): Promise<void> {
+	let mode: CcgoPlanMode | undefined;
+	try {
+		mode = await detectPlanMode(apiKey, apiBase);
+	} catch (e) {
+		// 密钥无效之类的硬错误不应阻断登录流程（validateApiKey 已把过关）
+		callbacks.onProgress?.(`套餐类型判定失败：${e instanceof Error ? e.message : String(e)}`);
+		return;
+	}
+	if (!mode) {
+		callbacks.onProgress?.("未能识别套餐类型，暂按 GO 通道；可在「模型管理 → 套餐类型」手动修改");
+		return;
+	}
+	try {
+		await host?.savePlanMode(mode);
+		callbacks.onProgress?.(
+			mode === "api"
+				? "已识别套餐：支持 Provider API，将走 /provider/v1 通道"
+				: "已识别套餐：GO 套餐，将走 /alpha/generate 通道",
+		);
+	} catch (e) {
+		callbacks.onProgress?.(`套餐类型保存失败：${e instanceof Error ? e.message : String(e)}`);
+	}
+}
+
 export async function validateApiKey(apiKey: string, apiBase: string): Promise<void> {
 	let res: Response;
 	try {
@@ -612,6 +665,7 @@ async function loginViaBrowser(callbacks: CcGoCallbacks, apiBase: string): Promi
 		clearTimeout(timer);
 		auth.server.close();
 		await validateApiKey(cb.apiKey, apiBase);
+		await applyDetectedPlanMode(cb.apiKey, apiBase, callbacks);
 		return credentialsFromApiKey(cb.apiKey);
 	} catch (e) {
 		clearTimeout(timer);
@@ -630,12 +684,13 @@ async function loginViaPrompt(callbacks: CcGoCallbacks, apiBase: string): Promis
 	);
 	if (!answer) throw new Error("Login cancelled");
 	await validateApiKey(answer, apiBase);
+	await applyDetectedPlanMode(answer, apiBase, callbacks);
 	return credentialsFromApiKey(answer);
 }
 
 export async function login(callbacks: CcGoCallbacks, apiBase: string): Promise<CcGoCredentials> {
 	const choice = await callbacks.onSelect({
-		message: "Command Code (GO) 登录方式：",
+		message: `${CCGO_LABEL} 登录方式：`,
 		options: [
 			{ id: "browser", label: "浏览器登录（自动回传密钥）" },
 			{ id: "paste", label: "粘贴 API 密钥（推荐）" },
@@ -668,7 +723,30 @@ function mapStopReason(raw: string | undefined): StopReason {
 	}
 }
 
+/**
+ * 供应商入口：按持久化的套餐类型分流。
+ *
+ * planMode 只能由两处写入：登录时的自动判定、用户在「套餐类型」菜单里的手动选择。
+ * 其它任何路径（刷新模型、重注册、启动加载）都只读不写。
+ */
 export function streamCommandCodeGo(
+	model: Model<Api>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	const cfg = getConfig();
+	if (cfg.planMode === "api") {
+		return streamViaProviderApi(model, context, options, cfg.baseUrl || CCGO_BASE_URL);
+	}
+	return streamViaAlphaGenerate(model, context, options);
+}
+
+/**
+ * GO 套餐通道：POST /alpha/generate，解析私有 NDJSON 流。
+ * 把 pi 的 TranscriptContext 转成 Command Code CLI 的请求体，
+ * 响应是 AI SDK 风格事件（非标准 SSE），需要逐行解析。
+ */
+function streamViaAlphaGenerate(
 	model: Model<Api>,
 	context: Context,
 	options?: SimpleStreamOptions,
@@ -1085,15 +1163,8 @@ export interface CcGoModelConfig {
 	maxTokens?: number;
 	reasoning?: boolean;
 	thinkingLevelMap?: Record<string, string | null>;
-}
-
-export interface CcGoCallbacks2 {
-	/** 登录期间打开浏览器 / 读取输入，由 pi 的 /login 界面提供。 */
-	onSelect(prompt: { message: string; options: { id: string; label: string }[] }): Promise<string | undefined>;
-	onPrompt(prompt: { message: string; placeholder?: string; allowEmpty?: boolean }): Promise<string>;
-	onAuth(info: { url: string; instructions?: string }): void;
-	onProgress?(message: string): void;
-	signal?: AbortSignal;
+	/** 模型目录声明该模型应答的端点，用于 API 通道选路（例：[\"/messages\"]）。 */
+	supportedEndpoints?: string[];
 }
 
 /**
@@ -1140,7 +1211,7 @@ export function buildCommandCodeGoConfig(params: {
 		oauth: {
 			name: "Command Code",
 			isSubscription: true,
-			login: (callbacks: CcGoCallbacks2) => login(callbacks as CcGoCallbacks, base),
+			login: (callbacks: CcGoCallbacks) => login(callbacks, base),
 			refreshToken: async (credentials: CcGoCredentials) => refreshToken(credentials),
 			getApiKey: (credentials: CcGoCredentials) => getApiKey(credentials),
 		},

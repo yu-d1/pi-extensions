@@ -1,6 +1,6 @@
 # @liziy/model-provider
 
-统一管理 pi 模型供应商的扩展。内置 MiniMax Local 与 Command Code（GO 套餐），并支持添加 OpenAI Chat Completions、OpenAI Responses、Claude Messages 兼容供应商。
+统一管理 pi 模型供应商的扩展。内置 MiniMax Local 与 Command Code，并支持添加 OpenAI Chat Completions、OpenAI Responses、Claude Messages 兼容供应商。
 
 ## 安装
 
@@ -32,9 +32,22 @@ pi install npm:@liziy/model-provider
 | 供应商 | 方式 |
 |--------|------|
 | MiniMax Local | `/login minimax_local`，参数经 `管理模型` → `配置管理` 调整 |
-| Command Code (GO) | `/login` →「Sign in with an account」→ Command Code |
+| Command Code | `/login` →「Sign in with an account」→ Command Code |
 
 Command Code 的官方授权页 `/studio/auth/cli` 在中文环境下会因 locale 重定向丢参数而报 `Missing callback or state`，此时改用登录界面里的**粘贴 API 密钥**。
+
+### Command Code 套餐类型
+
+账号套餐决定请求通道，登录成功后自动判定并保存，之后**不再重新判定**：
+
+| 套餐 | 通道 | 请求接口 |
+|---|---|---|
+| GO | `/alpha/generate`（私有 NDJSON 协议） | 仅此一条 |
+| GOAT / Pro / Max / Provider | Provider API（标准协议） | `/provider/v1/chat/completions`，Claude 走 `/provider/v1/messages` |
+
+未判定前默认为 GO。切换套餐（例如从 GO 升级到 GOAT）或判定失败时，到 `管理模型` → 选择 Command Code → **套餐类型** 手动修改；手动选择的值不会被任何刷新或重注册覆盖。
+
+模型走哪个接口由服务端 `/provider/v1/models` 的 `supported_endpoints` 决定，`刷新模型` 时一并保存，无需手工配置。
 
 ### 思考等级
 
@@ -58,6 +71,7 @@ Command Code 的官方授权页 `/studio/auth/cli` 在中文环境下会因 loca
 
 ## 版本历史
 
+- **0.3.0** — 内置供应商更名为 Command Code 并支持 Provider API 通道：登录时自动识别账号套餐（GO 走 `/alpha/generate`，GOAT/Pro/Max/Provider 走 `/provider/v1`），新增「套餐类型」手动切换；模型按服务端 `supported_endpoints` 自动选择 Chat Completions 或 Messages 接口
 - **0.2.11** — 修复 Command Code (GO) 回复不流式渲染：补发 `start` 事件，避免增量事件被丢弃；修复工具调用参数可能丢失、用户中断被报成错误、停止原因丢失
 - **0.2.10** — 修复内置 Command Code (GO) “刷新模型”误连 MiniMax 地址导致认证失败：改走 `/provider/v1/models`；“配置管理”入口仅对 MiniMax 展示
 - **0.2.9** — 修复 Command Code (GO) 正文流式输出异常：事件携带的消息快照改为逐帧拷贝，避免上游密集 delta 被后续内容覆盖

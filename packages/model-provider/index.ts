@@ -36,9 +36,11 @@ import {
 	asCommandCodeGoConfig,
 	buildCommandCodeGoConfig,
 	setCommandCodeGoConfig,
+	setCommandCodeGoHost,
 	type CcGoModelConfig,
 	type CommandCodeGoConfig,
 } from "./commandcode-go";
+import type { CcgoPlanMode } from "./commandcode-api";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -104,6 +106,8 @@ export interface StoredModel {
 	maxTokens?: number;
 	cost?: StoredCost;
 	thinkingLevelMap?: Record<string, string | null>;
+	/** Command Code 模型目录声明的应答端点，用于 API 通道选路。 */
+	supportedEndpoints?: string[];
 	/** 勾选启用：true/undefined = 启用并显示在 /model；false = 不显示（配置保留）。 */
 	enabled?: boolean;
 }
@@ -184,6 +188,19 @@ setMiniMaxHost({
 	save: () => saveStore(),
 });
 
+// commandcode-go.ts 登录时判定完套餐类型，通过该回调写回持久化配置。
+// 套餐类型只有两个写入口：登录自动判定、用户在「套餐类型」菜单手动选择。
+setCommandCodeGoHost({
+	savePlanMode: async (mode: CcgoPlanMode) => {
+		const entry = getBuiltinEntry("commandcodego");
+		if (!entry || entry.name !== "commandcodego") return;
+		entry.commandcodeGo.planMode = mode;
+		// 必须同步注入值，否则 streamSimple 读到的还是旧 planMode
+		setCommandCodeGoConfig(entry.commandcodeGo);
+		await saveStore();
+	},
+});
+
 // =============================================================================
 // Store 读写与迁移
 // =============================================================================
@@ -202,6 +219,7 @@ function normalizeStoredModels(raw: unknown): StoredModel[] {
 			...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}),
 			...(m.cost ? { cost: m.cost } : {}),
 			...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
+			...(Array.isArray(m.supportedEndpoints) ? { supportedEndpoints: m.supportedEndpoints.map(String) } : {}),
 			...(typeof m.enabled === "boolean" ? { enabled: m.enabled } : {}),
 		}));
 }
@@ -610,6 +628,8 @@ function normalizeModel(m: StoredModel): any {
 		},
 	};
 	if (m.thinkingLevelMap) base.thinkingLevelMap = m.thinkingLevelMap;
+	// API 通道按此字段选 /messages 还是 /chat/completions；联络式模型自带，其它忽略
+	if (m.supportedEndpoints) base.supportedEndpoints = m.supportedEndpoints;
 	return base;
 }
 
@@ -705,12 +725,13 @@ function registerBuiltin(pi: ExtensionAPI): void {
 }
 
 /**
- * 注册内置 Command Code（GO 套餐）供应商。
+ * 注册内置 Command Code 供应商。
  *
- * GO 套餐与 Provider 套餐的边界（实测）：/provider/v1/models 可读，
- * 但 /provider/v1/* 对话端点一律 403 upgrade_required，唯一可用通道是
- * /alpha/generate，因此必须自带 streamSimple。带 oauth 后该 provider 会
- * 出现在 /login 的「Sign in with an account」中。
+ * 模型目录固定走 /provider/v1/models（所有套餐都可读），而对话通道由
+ * 持久化的套餐类型（planMode）决定：GO 套餐只能用 /alpha/generate，
+ * GOAT / Pro / Max / Provider 套餐走官方 Provider API。因此必须自带
+ * streamSimple 做分流。带 oauth 后该 provider 会出现在 /login 的
+ * 「Sign in with an account」中。
  */
 function registerCommandCodeGo(pi: ExtensionAPI): void {
 	const entry = getBuiltinEntry("commandcodego");
@@ -723,13 +744,21 @@ function registerCommandCodeGo(pi: ExtensionAPI): void {
 		config: cfg,
 		models,
 		persist: async (fetched) => {
-			// 远端目录写回本地配置，供「启用模型」勾选
-			const remote = fetched as { id: string; name: string; contextWindow: number; input: ("text" | "image")[] }[];
+			// 远端目录写回本地配置，供「启用模型」勾选；
+			// supportedEndpoints 必须一并落盘：API 通道靠它判断该模型走 /messages 还是 /chat/completions。
+			const remote = fetched as {
+				id: string;
+				name: string;
+				contextWindow: number;
+				input: ("text" | "image")[];
+				supportedEndpoints: string[];
+			}[];
 			const merged = mergeModels(entry.models, remote.map((r) => ({
 				id: r.id,
 				name: r.name,
 				input: r.input,
 				contextWindow: r.contextWindow,
+				...(r.supportedEndpoints?.length ? { supportedEndpoints: r.supportedEndpoints } : {}),
 			})));
 			entry.models = sortModels(merged);
 			await saveStore();
@@ -755,11 +784,22 @@ function listProvidersText(): string {
 		if (p.kind === "builtin") {
 			const enabledCount = p.models.filter(isModelEnabled).length;
 			if (p.name === "commandcodego") {
-				lines.push(`● ${p.name}（内置 Command Code GO，固定供应商）`);
+				const mode = p.commandcodeGo.planMode;
+				lines.push(`● ${p.name}（内置 ${CCGO_LABEL}，固定供应商）`);
 				lines.push(`   地址：${p.commandcodeGo.baseUrl}`);
-				lines.push(`   对话通道：/alpha/generate（GO 套餐无 /provider/v1 权限）`);
+				lines.push(
+					mode === "api"
+						? `   套餐类型：GOAT / Pro / Max / Provider（Provider API）`
+						: `   套餐类型：GO（仅 /alpha/generate）`,
+				);
+				lines.push(
+					mode === "api"
+						? `   对话通道：/provider/v1/chat/completions（Claude 走 /provider/v1/messages）`
+						: `   对话通道：/alpha/generate（GO 套餐无 Provider API 权限）`,
+				);
 				lines.push(`   模型：启用 ${enabledCount} / 共 ${p.models.length} 个（登录后可在“刷新模型”拉取目录）`);
-				lines.push(`   登录：/login → Sign in with an account → Command Code`);
+				lines.push(`   登录：/login → Sign in with an account → ${CCGO_LABEL}`);
+				lines.push(`   套餐类型可在「管理模型 → ${p.name} → 套餐类型」手动修改`);
 			} else {
 				const cfg = p.minimax;
 				lines.push(`● ${p.name}（内置 MiniMax，固定供应商）`);
@@ -849,7 +889,7 @@ async function selectProvider(ctx: any, title: string, includeBuiltin = false): 
 	const options = entries.map((p) => {
 		const enabledCount = p.models.filter(isModelEnabled).length;
 		if (p.kind === "builtin") {
-			const tag = p.name === "commandcodego" ? "内置 Command Code GO" : "内置 MiniMax";
+			const tag = p.name === "commandcodego" ? `内置 ${CCGO_LABEL}` : "内置 MiniMax";
 			const url = p.name === "commandcodego" ? p.commandcodeGo.baseUrl : MINIMAX_BASE_URL;
 			return `${p.name}  [${tag}]  ${url}  （启用 ${enabledCount}/${p.models.length} 个模型）`;
 		}
@@ -930,18 +970,22 @@ async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void
 		}
 		let list: StoredModel[];
 		if (entry.kind === "builtin" && entry.name === "commandcodego") {
-			// Command Code GO 的模型目录在 {baseUrl}/provider/v1/models，与内置 MiniMax 既不同站也不同路径，
-			// 必须走它自己的拉取函数；套用 MiniMax 的 /v1/models 会拿 GO 的 key 打 MiniMax，必然认证失败。
+			// Command Code 的模型目录在 {baseUrl}/provider/v1/models，与内置 MiniMax 既不同站也不同路径，
+			// 必须走它自己的拉取函数；套用 MiniMax 的 /v1/models 会拿 Command Code 的 key 打 MiniMax，必然认证失败。
 			const remote = await fetchCommandCodeGoModels(key, entry.commandcodeGo.baseUrl);
 			if (remote.length === 0) {
-				throw new Error(`${entry.commandcodeGo.baseUrl}/provider/v1/models 返回为空，请先 /login 登录 Command Code GO 账号`);
+				throw new Error(`${entry.commandcodeGo.baseUrl}/provider/v1/models 返回为空，请先 /login 登录 ${CCGO_LABEL} 账号`);
 			}
 			// 不写 reasoning/thinkingLevelMap：注册时 buildCommandCodeGoConfig 会补 CCGO 专属档位映射。
+			// supportedEndpoints 必须写入：API 通道靠它判断模型走 /messages 还是 /chat/completions。
 			list = remote.map((m) => ({
 				id: m.id,
 				name: m.name || m.id,
 				input: normalizeInput(m.input),
 				...(m.contextWindow > 0 ? { contextWindow: m.contextWindow } : {}),
+				...(Array.isArray(m.supportedEndpoints) && m.supportedEndpoints.length > 0
+					? { supportedEndpoints: m.supportedEndpoints }
+					: {}),
 				enabled: false,
 			}));
 		} else {
@@ -1048,6 +1092,43 @@ function formatContextWindow(value: number | undefined): string {
 	if (value % 1_000_000 === 0) return `${value / 1_000_000}M`;
 	if (value % 1_000 === 0) return `${value / 1_000}K`;
 	return value.toLocaleString();
+}
+
+/**
+ * 套餐类型：决定走 Provider API 还是 /alpha/generate。
+ *
+ * 登录成功后会自动判定一次并写入；用户可以在这里手动改。
+ * 手动改过的值不会被后续任何操作（包括刷新模型、重新注册）覆盖。
+ */
+async function editPlanModeFlow(ctx: any, entry: ProviderEntry): Promise<void> {
+	if (entry.kind !== "builtin" || entry.name !== "commandcodego") return;
+	const cur = entry.commandcodeGo.planMode;
+	const apiLabel = "GOAT / Pro / Max / Provider：可用 Provider API";
+	const goLabel = "GO：仅 /alpha/generate";
+	const choice = await ctx.ui.select(
+		`套餐类型：${CCGO_LABEL}（决定请求通道）`,
+		[
+			`${apiLabel}${cur === "api" ? "  ← 当前" : ""}`,
+			`${goLabel}${cur === "go" ? "  ← 当前" : ""}`,
+		],
+	);
+	if (!choice) return;
+	const mode: CcgoPlanMode = choice.startsWith("GOAT") ? "api" : "go";
+	if (mode === cur) {
+		ctx.ui.notify(`套餐类型未变更（${mode === "api" ? "Provider API" : "GO 通道"}）。`, "info");
+		return;
+	}
+	entry.commandcodeGo.planMode = mode;
+	// 先同步注入配置再重注册，否则重注册时拿到的还是旧值
+	setCommandCodeGoConfig(entry.commandcodeGo);
+	reRegisterEntry(entry);
+	await saveStore();
+	ctx.ui.notify(
+		mode === "api"
+			? "已切换为 Provider API 通道：请求走 /provider/v1/chat/completions（Claude 走 /provider/v1/messages）。"
+			: "已切换为 GO 通道：请求走 /alpha/generate。",
+		"info",
+	);
 }
 
 async function editModelContextFlow(ctx: any, entry: ProviderEntry): Promise<void> {
@@ -1486,6 +1567,8 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 			"刷新模型",
 			"新增模型",
 			"删除模型",
+			// 套餐类型决定请求通道：GO 走 /alpha/generate，其它套餐走 Provider API
+			...(entry.kind === "builtin" && entry.name === "commandcodego" ? ["套餐类型"] : []),
 			"修改上下文窗口",
 			"是否支持图片读取",
 			"返回供应商列表",
@@ -1497,6 +1580,7 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 		else if (action === "刷新模型") await refreshCommonModels(ctx, entry);
 		else if (action === "新增模型") await addModelsFlow(ctx, entry);
 		else if (action === "删除模型") await removeModelFlow(ctx, entry);
+		else if (action === "套餐类型") await editPlanModeFlow(ctx, entry);
 		else if (action === "修改上下文窗口") await editModelContextFlow(ctx, entry);
 		else if (action === "是否支持图片读取") await editModelInputFlow(ctx, entry);
 	}
