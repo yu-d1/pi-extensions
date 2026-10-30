@@ -104,15 +104,34 @@ export function addUsageToBucket(target: TokenBucket, delta: UsageDelta | null |
 export type InputScope = "exclusive" | "inclusive";
 
 /**
- * 判定口径。依据是「cacheRead ≈ 上一轮的 input」：
- *   - input 含缓存时，本轮能命中的正是上一轮整个 prompt，比值≈1
- *   - input 是纯新增时，缓存命中量远大于本轮新增，比值远大于 1 或毫无规律
- * 无法判定（轮数不足 / 从没命中过）时返回 undefined，由调用方决定默认值。
+ * 判定 exclusive 的阈值：cacheRead / input 超过它即认为 input 不含缓存。
+ *
+ * inclusive 的口径下 input 已含缓存，比值恒 < 1（实测 0.93~1.00）；
+ * exclusive 的口径下缓存命中量与本轮新增无关，长会话中比值可达数倍到数千倍
+ * （实测最小 1.99）。1.25 在两者之间且两侧都有充分余量。
  */
-export function detectInputScope(prevInput: number, cacheRead: number): InputScope | undefined {
-  if (prevInput <= 0 || cacheRead <= 0) return undefined;
-  const ratio = cacheRead / prevInput;
-  return ratio > 0.8 && ratio < 1.25 ? "inclusive" : "exclusive";
+export const INPUT_SCOPE_EXCLUSIVE_RATIO = 1.25;
+
+/**
+ * 判定口径。依据是「一个模型整体的 cacheRead 与 input 谁更大」。
+ *
+ * 为什么不再用「cacheRead ≈ 上一轮 input」逐轮判定：
+ *   那个判据要求参照物是**同一模型**上一轮的 input，参照物一旦取错
+ *   （同会话切模型时极易取到别的模型），本轮就会被误判；而被误判的结论
+ *   又会落盘并被后续轮次与后续日期当作事实沿用，误差层层传播。
+ *   实测它在 commandcodego 上把整天数据打成了 exclusive，总量直接翻倍。
+ *
+ * 现在的依据是口径的数学定义，与参照物无关：
+ *   - exclusive：input 是纯新增，长会话里命中量远大于新增 → cacheRead/input >> 1
+ *   - inclusive：input 是含缓存的总量 → cacheRead 必然 ≤ input，比值 < 1
+ * 实测分布：inclusive 侧 ≈0.93~1.00，exclusive 侧最小 1.99，阈值 1.25 分得很开。
+ *
+ * 参数是该模型累计的 input 与 cacheRead 总量（至少要有一轮同时命中缓存才成立），
+ * 样本不足或从没命中过缓存时返回 undefined，由调用方保持未知。
+ */
+export function detectInputScope(totalInput: number, totalCacheRead: number): InputScope | undefined {
+  if (totalInput <= 0 || totalCacheRead <= 0) return undefined;
+  return totalCacheRead / totalInput > INPUT_SCOPE_EXCLUSIVE_RATIO ? "exclusive" : "inclusive";
 }
 
 /**

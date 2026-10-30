@@ -117,31 +117,43 @@ function int(value: unknown): number {
 }
 
 /**
- * 判定某条记录的 input 是否含缓存。
- * 已落盘的值优先；否则现场推断，并把结论按模型固化（口径是 provider 固有属性）。
+ * 口径判定状态：按模型累计 input 与 cacheRead，跨日期共享。
+ *
+ * 为什么不再按「同会话上一轮 input」逐轮判：参照物在跨模型时会取错，
+ * 一次误判会沿用到后续轮次与后续日期，误差层层传播（详见 format.ts）。
+ * 改成模型级聚合后，证据越累越多、结论越来越稳，不会随参照物飘。
+ */
+interface ScopeState {
+  evidence: Map<string, { input: number; cacheRead: number }>;
+}
+
+/** 单个模型的口径证据（累计值） */
+function evidenceOf(state: ScopeState, modelKey: string) {
+  let item = state.evidence.get(modelKey);
+  if (!item) {
+    item = { input: 0, cacheRead: 0 };
+    state.evidence.set(modelKey, item);
+  }
+  return item;
+}
+
+/**
+ * 解析某条记录的口径。
+ *
+ * 优先用模型级聚合重算（最可靠，不受单轮噪声影响）；
+ * 证据不足（该模型当日未命中过缓存）时退回落盘的 inputScope——
+ * 那个值由写入端判定、并由历史回填修正过，比凭空猜测可信；
+ * 两者都没有时按 pi-ai 官方语义当 exclusive，宁可少算缓存也不放大命中率。
  */
 function resolveInclusive(
   declared: "exclusive" | "inclusive" | undefined,
-  decided: Map<string, boolean>,
+  state: ScopeState,
   modelKey: string,
-  prevInput: number,
-  cacheRead: number,
 ): boolean {
-  if (declared) {
-    const v = declared === "inclusive";
-    decided.set(modelKey, v);
-    return v;
-  }
-  const known = decided.get(modelKey);
-  if (known !== undefined) return known;
-  const guessed = detectInputScope(prevInput, cacheRead);
-  if (guessed !== undefined) {
-    const v = guessed === "inclusive";
-    decided.set(modelKey, v);
-    return v;
-  }
-  // 判定不出来时按 pi-ai 官方语义处理，宁可少算缓存也不放大命中率
-  return false;
+  const item = state.evidence.get(modelKey);
+  const aggregated = item ? detectInputScope(item.input, item.cacheRead) : undefined;
+  if (aggregated) return aggregated === "inclusive";
+  return declared === "inclusive";
 }
 
 /** 列出 raw 目录下所有日期（升序） */
@@ -234,10 +246,20 @@ class Dictionary {
 /**
  * 把一天的 raw 行打包成 PackedTurn[]。
  *
- * scopeState 跨日期共享：口径判定需要「同会话上一轮 input」，
- * 而会话可能跨天，所以状态必须由调用方持有并贯穿整个遍历。
+ * scopeState 跨日期共享：口径证据越累越多，结论越来越稳。
+ * 函数内部先扫一遍当天记录累计证据，再逐条打包——
+ * 否则当天的早期记录只能拿到前几天的证据，判定会滞后。
  */
 function packDay(lines: RawLine[], dict: Dictionary, scopeState: ScopeState): PackedTurn[] {
+  // 预扫：把当天所有记录的口径证据先累加完
+  for (const record of lines) {
+    const item = evidenceOf(scopeState, modelKeyOf(record));
+    const input = int(record.input);
+    const cacheRead = int(record.cacheRead);
+    if (input > 0) item.input += input;
+    if (cacheRead > 0) item.cacheRead += cacheRead;
+  }
+
   const packed: PackedTurn[] = [];
   for (const record of lines) {
     const ts = typeof record.ts === "string" ? record.ts : "";
@@ -249,14 +271,7 @@ function packDay(lines: RawLine[], dict: Dictionary, scopeState: ScopeState): Pa
     const modelKey = modelKeyOf(record);
     const sessionId = record.session ?? "";
 
-    const inclusive = resolveInclusive(
-      record.inputScope,
-      scopeState.decided,
-      modelKey,
-      scopeState.lastInput.get(sessionId) ?? 0,
-      cacheRead,
-    );
-    scopeState.lastInput.set(sessionId, rawInput);
+    const inclusive = resolveInclusive(record.inputScope, scopeState, modelKey);
 
     const input = inclusive ? Math.max(0, rawInput - cacheRead - cacheWrite) : rawInput;
     packed.push([
@@ -274,13 +289,9 @@ function packDay(lines: RawLine[], dict: Dictionary, scopeState: ScopeState): Pa
 }
 
 /** 跨日期保留的口径判定状态 */
-interface ScopeState {
-  decided: Map<string, boolean>;
-  lastInput: Map<string, number>;
-}
 
 function newScopeState(): ScopeState {
-  return { decided: new Map(), lastInput: new Map() };
+  return { evidence: new Map() };
 }
 
 async function readIndex(): Promise<ReportIndex | null> {

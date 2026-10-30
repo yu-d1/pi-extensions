@@ -258,7 +258,7 @@ function resetSessionStats() {
   stats.lastTurnByModel = new Map();
   stats.accountedUsageKeys = new Set();
   stats.lastTokensPerSec = 0;
-  scopeCache.clear();
+  scopeEvidenceCache.clear();
 }
 
 /** 当前模型键：优先用 ctx 里的模型，缺失时回退到已记住的激活模型 */
@@ -798,105 +798,89 @@ async function ensureStatsServer(
 }
 
 /**
- * 查该模型最近一条已落盘记录的口径，作为首轮/无法判定时的兜底。
- * 口径是 provider 的固有属性，同一模型不会每轮变来变去。
+ * 某模型的口径证据：累计 input 与累计 cacheRead。
  *
- * 返回 null 表示「查不到已判定的口径」：宁可让调用方保持未知，
- * 也不能把默认的 exclusive 当成既定事实写回缓存——
- * 那会让 inclusive 的模型（minimax / commandcodego）第一轮冷启动后
- * 永远按错误口径统计。
+ * 口径（input 含不含缓存）是 provider+model 的固有属性，用**整体比值**判定最稳：
+ *   - inclusive：input 已含缓存 → cacheRead 恒 ≤ input，比值恒 < 1
+ *   - exclusive：input 是纯新增 → 缓存命中量随会话变长迅速超过新增，比值可达数十倍
+ * 而「cacheRead ≈ 上一轮 input」的逐轮判据依赖参照物，同会话切模型时参照物
+ * 极易取成别的模型，一次误判又会落盘沿用到后续轮次与后续日期，误差层层传播。
  */
-async function modelInputScope(provider: string, modelId: string): Promise<InputScope | null> {
-  const key = getModelKey(provider, modelId);
-  const today = getDateStr();
-  const yesterday = getDateStr(Date.now() - 86400000);
-  for (const date of [today, yesterday]) {
+interface ScopeEvidence {
+  input: number;
+  cacheRead: number;
+}
+
+function newScopeEvidence(): ScopeEvidence {
+  return { input: 0, cacheRead: 0 };
+}
+
+/** 把一轮的量并入口径证据（非正数忽略） */
+function addScopeEvidence(evidence: ScopeEvidence, input: number, cacheRead: number): void {
+  if (Number.isFinite(input) && input > 0) evidence.input += input;
+  if (Number.isFinite(cacheRead) && cacheRead > 0) evidence.cacheRead += cacheRead;
+}
+
+/** 从落盘记录累积某模型的口径证据（只看今天与昨天：一次会话极少跨更多天） */
+async function modelScopeEvidence(modelKey: ModelKey): Promise<ScopeEvidence> {
+  const evidence = newScopeEvidence();
+  for (const date of [getDateStr(), getDateStr(Date.now() - 86400000)]) {
     let text: string;
     try {
       text = await readFile(join(RAW_DIR, `${date}.jsonl`), "utf-8");
     } catch {
       continue;
     }
-    const lines = text.trim().split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]?.trim();
-      if (!line) continue;
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
       try {
-        const prev = JSON.parse(line) as RawRecord;
-        if (recordModelKey(prev) === key && prev.inputScope) return prev.inputScope;
+        const prev = JSON.parse(trimmed) as RawRecord;
+        // 老记录可能只有 model 字段，recordModelKey 会回退解析
+        if (recordModelKey(prev) !== modelKey) continue;
+        addScopeEvidence(evidence, Number(prev.input) || 0, Number(prev.cacheRead) || 0);
       } catch {
         continue;
       }
     }
   }
-  return null;
+  return evidence;
 }
 
 /**
- * 读同一会话最近一条记录的 input，用于判定本轮 input 的口径。
- * 只回看今天与昨天的文件：一次会话极少跨更多天，全量扫描得不偿失。
+ * 会话内的口径证据缓存（≠ 判定结论缓存）。
+ *
+ * 只缓存“已有的量”，每轮重新按累计比值判定，**不锁定结论**：
+ * exclusive 模型在会话前几轮缓存量还小时比值接近 1，过早锁定会把它粘死成
+ * inclusive。重新判定则随证据增长自动纠正，代价只是每轮一次除法。
  */
-async function lastSessionInput(sessionId: string): Promise<number> {
-  const today = getDateStr();
-  const yesterday = getDateStr(Date.now() - 86400000);
-  for (const date of [today, yesterday]) {
-    let text: string;
-    try {
-      text = await readFile(join(RAW_DIR, `${date}.jsonl`), "utf-8");
-    } catch {
-      continue;
-    }
-    const lines = text.trim().split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]?.trim();
-      if (!line) continue;
-      try {
-        const prev = JSON.parse(line) as RawRecord;
-        if (prev.session === sessionId && prev.input > 0) return prev.input;
-      } catch {
-        continue;
-      }
-    }
-  }
-  return 0;
-}
-
-/**
- * 会话内的口径缓存。
- * 口径是 provider+model 的固有属性（同一模型不会这轮 inclusive、下一轮 exclusive），
- * 判定一次就记住，后续轮次零 IO。
- */
-const scopeCache = new Map<ModelKey, InputScope>();
+const scopeEvidenceCache = new Map<ModelKey, ScopeEvidence>();
 
 /**
  * 判定某模型本轮的 input 口径。
  *
- * 优先用「cacheRead ≈ 同会话上一轮 input」现场判定（最准）；
- * 判不出时沿用该模型最近一次落盘记录的口径；
- * 都没有则返回 null（未知）——未知就保持未知，等下一轮拿到参照物再判，
- * 避免把猜测固化成事实。
+ * 证据 = 落盘的今天/昨天同模型记录 + 本轮（本条尚未落盘）。
+ * 判不出时返回 null（未知），由调用方保持未知，而不是硬断言成 exclusive。
  */
 async function resolveUsageScope(
   provider: string,
   modelId: string,
-  sessionId: string,
-  cacheRead: number,
+  turnInput: number,
+  turnCacheRead: number,
 ): Promise<InputScope | null> {
   const key = getModelKey(provider, modelId);
-  const cached = scopeCache.get(key);
-  if (cached) return cached;
-  const prevInput = await lastSessionInput(sessionId);
-  const detected = detectInputScope(prevInput, cacheRead);
-  if (detected) {
-    scopeCache.set(key, detected);
-    return detected;
+  let evidence = scopeEvidenceCache.get(key);
+  if (!evidence) {
+    evidence = await modelScopeEvidence(key);
+    scopeEvidenceCache.set(key, evidence);
   }
-  const known = await modelInputScope(provider, modelId);
-  if (known) {
-    scopeCache.set(key, known);
-    return known;
-  }
-  return null;
+  const scope = detectInputScope(
+    evidence.input + turnInput,
+    evidence.cacheRead + turnCacheRead,
+  );
+  // 无论判没判出，本轮都要计入证据，供后续轮次与明天的新会话使用
+  addScopeEvidence(evidence, turnInput, turnCacheRead);
+  return scope ?? null;
 }
 
 async function persistTurn(
@@ -906,22 +890,17 @@ async function persistTurn(
   modelId: string,
   knownScope?: InputScope,
 ) {
-  // 判定 input 口径：cacheRead ≈ 上一轮 input 说明 input 已含缓存。
-  // 首轮（无上一条）无从判断，沿用同模型已有记录的口径；
-  // 都判不出时留空（不写 inputScope），留给读取阶段现场推断，
-  // 避免把 exclusive 当成事实落盘、反过来污染 modelInputScope 的判断。
-  const prevInput = await lastSessionInput(sessionId);
-  const detected = detectInputScope(prevInput, record.cacheRead);
-  const resolved = knownScope ?? detected ?? (await modelInputScope(provider, modelId));
-  if (resolved) scopeCache.set(getModelKey(provider, modelId), resolved);
-
+  // 口径由调用方（message_end）统一判定后传入，这里不再重复推断：
+  // 同一轮判两次不但白花 IO，两次结论不一致时还会互相矛盾。
+  // raw 存的是 provider 原始口径（未归一），归一化只发生在读取阶段，
+  // 所以即使这里的标记存疑，历史数据也不会被写坏。
   const raw: RawRecord = {
     ...record,
     ts: getISO(),
     session: sessionId,
     provider,
     modelId,
-    inputScope: resolved ?? undefined,
+    inputScope: knownScope,
   };
   await appendRaw(raw);
   await updateHourly(raw);
@@ -970,35 +949,41 @@ async function loadRawRecords(from: string, to: string): Promise<RawRecord[]> {
 }
 
 /**
- * 给缺 inputScope 的老记录补上口径。
+ * 按模型聚合算出各自的口径，并**覆盖**写回每条记录。
  *
- * 老数据没有这个字段，但口径是 provider 的固有属性，同一模型不会来回变：
- * 用该模型已判定过的口径回填；从未判定过的，用「cacheRead ≈ 同会话上一轮 input」
- * 现场推断（这正是 inclusive 的特征）。推断不出来的保持 undefined，
- * 由 recordUsage 按 exclusive 处理——沿用 pi-ai 官方语义，
- * 宁可少算缓存，也不凭空放大命中率。
+ * 为什么不再相信已落盘的 inputScope：
+ *   旧版本的逐轮判据在参照物取错时会写入错误结论（实测把 commandcodego
+ *   整天打成 exclusive，总量直接翻倍），而后续代码又拿这个值当事实递归使用，
+ *   于是错误越传越远。口径是 model 级属性，用全量累计比值重算必然比
+ *   任何单轮猜测都可靠，所以这里一律以重算结果为准。
+ *
+ * 重算不出（该模型从未命中过缓存）的记录保持原值：旧版可能写对了，
+ * 也可能写错了，但没有证据时凭空改反而更糟。
  */
 function backfillScope(records: RawRecord[]): void {
-  const decided = new Map<ModelKey, InputScope>();
+  // 1. 按模型累计证据（只统计 input>0 且 cacheRead>0 的轮次）
+  const evidence = new Map<ModelKey, ScopeEvidence>();
   for (const record of records) {
-    if (record.inputScope) decided.set(recordModelKey(record), record.inputScope);
+    const key = recordModelKey(record);
+    let item = evidence.get(key);
+    if (!item) {
+      item = newScopeEvidence();
+      evidence.set(key, item);
+    }
+    addScopeEvidence(item, Number(record.input) || 0, Number(record.cacheRead) || 0);
   }
 
-  // 按时间正序推断：同会话上一条的 input 是本轮缓存量的参照上限
-  const ordered = records.slice().sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-  const lastInput = new Map<string, number>();
-  for (const record of ordered) {
-    const key = recordModelKey(record);
-    const session = record.session || "";
-    if (!record.inputScope) {
-      const guessed = decided.get(key)
-        ?? detectInputScope(lastInput.get(session) ?? 0, Number(record.cacheRead) || 0);
-      if (guessed) {
-        record.inputScope = guessed;
-        decided.set(key, guessed);
-      }
-    }
-    lastInput.set(session, Number(record.input) || 0);
+  // 2. 逐模型定口径
+  const decided = new Map<ModelKey, InputScope>();
+  for (const [key, item] of evidence) {
+    const scope = detectInputScope(item.input, item.cacheRead);
+    if (scope) decided.set(key, scope);
+  }
+
+  // 3. 回写（口径是模型级属性，同模型每条记录共享同一结论）
+  for (const record of records) {
+    const scope = decided.get(recordModelKey(record));
+    if (scope) record.inputScope = scope;
   }
 }
 
@@ -1101,32 +1086,46 @@ async function rebuildFromHistory(ctx: ExtensionContext) {
   // 遍历 entries 按消息自身的 provider/model 归入各自的桶，同时推算历史速率
   let latestAssistantSpeed: number | null = null;
   let latestModelKey: ModelKey | null = null;
-  /**
-   * 同会话上一轮的原始 prompt 大小（inclusive 口径的参照物）。
-   * 增量会话里 cacheRead ≈ 上一轮 prompt，说明 provider 返回的 input 已含缓存。
-   */
-  let lastPromptInput = 0;
 
+  // ── 阶段一：收集本会话内的历史 usage，并按模型累计口径证据 ────────
+  // 必须先全量收集再判定：口径是模型级属性，用整个会话的累计比值最稳。
+  // 旧版边遍历边用「上一轮 input」作参照，同一个复用的变量会在切模型时
+  // 把上一个模型的量当成参照（历史里混多个模型很常见），必然误判。
+  const usages: Array<{
+    entry: (typeof branch)[number];
+    msg: any;
+    modelKey: ModelKey;
+    rawInput: number;
+    cacheRead: number;
+    cacheWrite: number;
+  }> = [];
+  const evidence = new Map<ModelKey, ScopeEvidence>();
   for (const entry of branch) {
     if (entry.type !== "message") continue;
     const msg = (entry as any).message;
     if (msg.role !== "assistant" || !msg.usage) continue;
-
-    // 模型归属以消息自带的为准（历史里可能混了多个模型）
     const modelKey = getModelKey(msg.provider, msg.model);
     const rawInput = msg.usage.input ?? 0;
     const cacheRead = msg.usage.cacheRead ?? 0;
-    const cacheWrite = msg.usage.cacheWrite ?? 0;
+    let item = evidence.get(modelKey);
+    if (!item) {
+      item = newScopeEvidence();
+      evidence.set(modelKey, item);
+      // 补上该模型今天/昨天已落盘的证据，让冷启动会话也能一次判对
+      const onDisk = await modelScopeEvidence(modelKey);
+      item.input += onDisk.input;
+      item.cacheRead += onDisk.cacheRead;
+      scopeEvidenceCache.set(modelKey, item);
+    }
+    addScopeEvidence(item, rawInput, cacheRead);
+    usages.push({ entry, msg, modelKey, rawInput, cacheRead, cacheWrite: msg.usage.cacheWrite ?? 0 });
+  }
 
-    // 口径判定：命中缓存后 input 已含缓存 → 扣掉缓存才是纯新增
-    const knownScope =
-      detectInputScope(lastPromptInput, cacheRead)
-      ?? scopeCache.get(modelKey)
-      ?? (await modelInputScope(msg.provider ?? "", msg.model ?? ""));
-    const scope = knownScope ?? "exclusive";
-    if (knownScope) scopeCache.set(modelKey, knownScope);
+  // 阶段二：按模型口径归一后入账
+  for (const { entry, msg, modelKey, rawInput, cacheRead, cacheWrite } of usages) {
+    const item = evidence.get(modelKey);
+    const scope = detectInputScope(item?.input ?? 0, item?.cacheRead ?? 0) ?? "exclusive";
     const input = normalizeInputTokens(rawInput, cacheRead, cacheWrite, scope);
-    lastPromptInput = rawInput;
 
     const bucket = ensureModelBucket(modelKey);
     addUsageToBucket(bucket, {
@@ -2948,7 +2947,13 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     // 口径判定：provider 返回的 input 可能已含缓存（inclusive）。
     // 必须先归一成「纯新增」再入桶，否则命中率分母会把缓存算两遍，
     // CH% 被永久钉在 50% 附近（真实值可能 99%）。
-    const knownScope = await resolveUsageScope(provider, modelId, sessionId, usage.cacheRead ?? 0);
+    // 判据是该模型累计的 cacheRead/input 比值，与哪一轮做参照无关。
+    const knownScope = await resolveUsageScope(
+      provider,
+      modelId,
+      usage.input ?? 0,
+      usage.cacheRead ?? 0,
+    );
     const scope = knownScope ?? "exclusive";
     const input = normalizeInputTokens(
       usage.input ?? 0,
