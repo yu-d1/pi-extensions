@@ -1,7 +1,7 @@
 {
   "name": "@liziy/ssh-manager",
-  "version": "1.1.1",
-  "description": "AI 远程操作服务器扩展 —— 添加/编辑/删除 SSH 连接，AI 通过 ssh_exec 远程执行命令，受权限控制",
+  "version": "2.0.0",
+  "description": "AI 远程操作服务器扩展 —— 管理 SSH 连接并按需启用，AI 通过 ssh_exec 远程执行命令，受只读与确认策略控制",
   "keywords": [
     "pi-extension",
     "pi-package"
@@ -17,7 +17,9 @@
     "ssh2": "^1.16.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "repository": {
     "type": "git",
@@ -31,6 +33,7 @@
   "author": "liziy",
   "files": [
     "index.ts",
+    "src",
     "README.md"
   ]
 }
