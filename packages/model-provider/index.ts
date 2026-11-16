@@ -1,33 +1,17 @@
 /**
  * model-provider — 模型提供扩展（统一管理 pi 模型供应商）
  * =============================================================================
- * 在原 minimax-local 基础上扩展：
- *   1. 内置 MiniMax Local：完整适配 MiniMax 官方参数（service_tier / thinking /
- *      reasoning_split / temperature / top_p / max_completion_tokens），逻辑整体保留。
+ *   1. 内置 Command Code 供应商：自带上游专属协议与套餐分流，见 commandcode-go.ts。
  *   2. 通用（common）供应商：通过 /model-provider 命令添加，仅使用 pi 官方的
  *      OpenAI Completions 格式、OpenAI Responses 格式、Claude 格式；地址只保存 API 前缀，模型列表
  *      通过 {baseUrl}/models 获取，也可手动添加模型 id。
  *      认证统一走 /login <名称> 存入 auth.json。
- *   3. 配置统一持久化到 ~/.pi/agent/extensions/model-provider/config.json（schemaVersion:2），
- *      首次加载时自动迁移旧的 minimax-local/config.json。
- *   4. MiniMax 专属协议实现、流式逻辑与参数配置菜单拆分在 minimax.ts；
- *      内置 MiniMax 作为固定供应商出现在“管理模型”列表中，参数经“配置管理”进入。
+ *   3. 配置统一持久化到 ~/.pi/agent/extensions/model-provider/config.json（schemaVersion:2）。
+ *   4. 思考等级可实测后写入（thinking-probe.ts），只把真正可用的档位暴露到 /settings。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, Input, Key, matchesKey, Spacer, Text, fuzzyFilter } from "@earendil-works/pi-tui";
-import {
-	DEFAULT_MINIMAX,
-	MINIMAX_BASE_URL,
-	MINIMAX_PROVIDER_ID,
-	MINIMAX_PROVIDER_LABEL,
-	asMiniMaxConfig,
-	cloneMiniMaxDefaultModels,
-	minimaxMenu,
-	setMiniMaxHost,
-	streamMiniMaxChat,
-	type MiniMaxConfig,
-} from "./minimax";
 import {
 	CCGO_LABEL,
 	CCGO_PROVIDER_ID,
@@ -41,7 +25,8 @@ import {
 	type CommandCodeGoConfig,
 } from "./commandcode-go";
 import type { CcgoPlanMode } from "./commandcode-api";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { buildThinkingLevelMap, probeThinkingLevels } from "./thinking-probe";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -112,21 +97,13 @@ export interface StoredModel {
 	enabled?: boolean;
 }
 
-type BuiltinEntry =
-	| {
-			kind: "builtin";
-			name: "minimax_local";
-			label: string;
-			minimax: MiniMaxConfig;
-			models: StoredModel[];
-	  }
-	| {
-			kind: "builtin";
-			name: "commandcodego";
-			label: string;
-			commandcodeGo: CommandCodeGoConfig;
-			models: StoredModel[];
-	  };
+interface BuiltinEntry {
+	kind: "builtin";
+	name: "commandcodego";
+	label: string;
+	commandcodeGo: CommandCodeGoConfig;
+	models: StoredModel[];
+}
 
 interface CommonEntry {
 	kind: "common";
@@ -152,19 +129,11 @@ interface Store {
 // =============================================================================
 
 const STORE_FILE = join(homedir(), ".pi", "agent", "extensions", "model-provider", "config.json");
-const LEGACY_MINIMAX_FILE = join(homedir(), ".pi", "agent", "extensions", "minimax-local", "config.json");
 
 function createDefaultStore(): Store {
 	return {
 		schemaVersion: 2,
 		providers: [
-			{
-				kind: "builtin",
-				name: "minimax_local",
-				label: "MiniMax Local",
-				minimax: { ...DEFAULT_MINIMAX },
-				models: cloneMiniMaxDefaultModels(),
-			},
 			{
 				kind: "builtin",
 				name: "commandcodego",
@@ -178,15 +147,6 @@ function createDefaultStore(): Store {
 
 let store: Store = createDefaultStore();
 let api: ExtensionAPI | null = null;
-
-// minimax.ts 通过宿主回调读写 store，保持 index → minimax 的单向依赖。
-setMiniMaxHost({
-	getBuiltin: () => {
-		const b = getBuiltinEntry("minimax_local");
-		return b && b.name === "minimax_local" ? b : undefined;
-	},
-	save: () => saveStore(),
-});
 
 // commandcode-go.ts 登录时判定完套餐类型，通过该回调写回持久化配置。
 // 套餐类型只有两个写入口：登录自动判定、用户在「套餐类型」菜单手动选择。
@@ -226,19 +186,9 @@ function normalizeStoredModels(raw: unknown): StoredModel[] {
 
 function normalizeStore(raw: any): Store {
 	const providers: ProviderEntry[] = [];
-	// 内置 minimax 始终存在
+	// 内置 commandcodego 始终存在
 	const rawProviders: any[] = Array.isArray(raw?.providers) ? raw.providers : [];
 	const findBuiltin = (id: string) => rawProviders.find((p: any) => p?.kind === "builtin" && p?.name === id);
-	const minimaxRaw = findBuiltin("minimax_local") ?? rawProviders.find((p: any) => p?.kind === "builtin");
-	const builtinModels = normalizeStoredModels(minimaxRaw?.models);
-	providers.push({
-		kind: "builtin",
-		name: "minimax_local",
-		label: "MiniMax Local",
-		minimax: asMiniMaxConfig(minimaxRaw?.minimax),
-		// 旧配置没有 models 字段时回落到内置默认模型（M3 / M2.7-HighSpeed）。
-		models: builtinModels.length > 0 ? sortModels(builtinModels) : cloneMiniMaxDefaultModels(),
-	});
 	const ccgoRaw = findBuiltin("commandcodego");
 	const ccgoModels = sortModels(normalizeStoredModels(ccgoRaw?.models));
 	providers.push({
@@ -266,26 +216,12 @@ function normalizeStore(raw: any): Store {
 	return { schemaVersion: 2, providers };
 }
 
-/** 将旧 minimax-local/config.json 迁移进新 store（一次性） */
-async function migrateLegacyMinimax(): Promise<void> {
-	try {
-		const raw = await readFile(LEGACY_MINIMAX_FILE, "utf8");
-		const parsed = JSON.parse(raw);
-		const builtin = getBuiltinEntry("minimax_local");
-		if (builtin && builtin.name === "minimax_local") builtin.minimax = asMiniMaxConfig(parsed);
-		await unlink(LEGACY_MINIMAX_FILE).catch(() => {});
-	} catch {
-		// 无旧文件或读取失败，忽略
-	}
-}
-
 async function loadStore(): Promise<void> {
 	try {
 		const raw = await readFile(STORE_FILE, "utf8");
 		store = normalizeStore(JSON.parse(raw));
 	} catch {
 		store = createDefaultStore();
-		await migrateLegacyMinimax();
 		await saveStore();
 	}
 }
@@ -607,7 +543,7 @@ async function fetchModelsByApi(api: string, baseUrl: string, apiKey?: string): 
 }
 
 // =============================================================================
-// 通用注册：内置 minimax + common 供应商
+// 通用注册：builtin + common 供应商
 // =============================================================================
 
 function normalizeModel(m: StoredModel): any {
@@ -696,32 +632,11 @@ function unregisterAndReRegister(pi: ExtensionAPI, oldName: string | null, entry
 	registerCommon(pi, entry);
 }
 
-/** 模型等本地变更后重新注册：builtin 走 MiniMax 注册，common 走通用注册。 */
+/** 模型等本地变更后重新注册：builtin 走各自专属注册，common 走通用注册。 */
 function reRegisterEntry(entry: ProviderEntry): void {
 	if (!api) return;
-	if (entry.kind === "builtin") {
-		if (entry.name === "commandcodego") registerCommandCodeGo(api);
-		else registerBuiltin(api);
-	}
+	if (entry.kind === "builtin") registerCommandCodeGo(api);
 	else unregisterAndReRegister(api, entry.name, entry);
-}
-
-/** 注册内置 MiniMax 供应商：模型列表来自 store（可在“管理模型”中勾选启用）。 */
-function registerBuiltin(pi: ExtensionAPI): void {
-	const builtin = getBuiltinEntry("minimax_local");
-	const models = (builtin?.models?.length ? builtin.models : cloneMiniMaxDefaultModels())
-		.filter(isModelEnabled)
-		.map(normalizeModel);
-	pi.unregisterProvider(MINIMAX_PROVIDER_ID);
-	pi.registerProvider(MINIMAX_PROVIDER_ID, {
-		name: MINIMAX_PROVIDER_LABEL,
-		baseUrl: MINIMAX_BASE_URL,
-		apiKey: "$MINIMAX_API_KEY",
-		authHeader: true,
-		api: "minimax-chat",
-		models,
-		streamSimple: streamMiniMaxChat,
-	});
 }
 
 /**
@@ -767,7 +682,6 @@ function registerCommandCodeGo(pi: ExtensionAPI): void {
 }
 
 function registerAllProviders(pi: ExtensionAPI): void {
-	registerBuiltin(pi);
 	registerCommandCodeGo(pi);
 	for (const entry of getCommonEntries()) {
 		registerCommon(pi, entry);
@@ -800,13 +714,6 @@ function listProvidersText(): string {
 				lines.push(`   模型：启用 ${enabledCount} / 共 ${p.models.length} 个（登录后可在“刷新模型”拉取目录）`);
 				lines.push(`   登录：/login → Sign in with an account → ${CCGO_LABEL}`);
 				lines.push(`   套餐类型可在「管理模型 → ${p.name} → 套餐类型」手动修改`);
-			} else {
-				const cfg = p.minimax;
-				lines.push(`● ${p.name}（内置 MiniMax，固定供应商）`);
-				lines.push(`   地址：${MINIMAX_BASE_URL}`);
-				lines.push(`   模型：启用 ${enabledCount} / 共 ${p.models.length} 个（未勾选的不显示在 /model 中）`);
-				lines.push(`   服务层级：${cfg.serviceTier}  思考拆分：${cfg.reasoningSplit}`);
-				lines.push(`   参数配置：/model-provider → 管理模型 → ${p.name} → 配置管理`);
 			}
 		} else {
 			const apiOption = getCommonApiOption(p.api);
@@ -831,7 +738,7 @@ async function addCommonFlow(ctx: any): Promise<void> {
 		ctx.ui.notify("供应商名称只能包含字母、数字、下划线、连字符。", "error");
 		return;
 	}
-	if (cleanName === MINIMAX_PROVIDER_ID || cleanName === CCGO_PROVIDER_ID || getCommonEntries().some((p) => p.name === cleanName)) {
+	if (cleanName === CCGO_PROVIDER_ID || getCommonEntries().some((p) => p.name === cleanName)) {
 		ctx.ui.notify(`供应商 "${cleanName}" 已存在或是内置供应商。`, "error");
 		return;
 	}
@@ -875,7 +782,7 @@ async function addCommonFlow(ctx: any): Promise<void> {
 }
 
 /**
- * 选择供应商。includeBuiltin = true 时，内置 MiniMax 固定显示在最后（仅“管理模型”入口使用）。
+ * 选择供应商。includeBuiltin = true 时，内置供应商同时列出（仅“管理模型”入口使用）。
  */
 async function selectProvider(ctx: any, title: string, includeBuiltin = false): Promise<ProviderEntry | undefined> {
 	const entries: ProviderEntry[] = [
@@ -889,9 +796,7 @@ async function selectProvider(ctx: any, title: string, includeBuiltin = false): 
 	const options = entries.map((p) => {
 		const enabledCount = p.models.filter(isModelEnabled).length;
 		if (p.kind === "builtin") {
-			const tag = p.name === "commandcodego" ? `内置 ${CCGO_LABEL}` : "内置 MiniMax";
-			const url = p.name === "commandcodego" ? p.commandcodeGo.baseUrl : MINIMAX_BASE_URL;
-			return `${p.name}  [${tag}]  ${url}  （启用 ${enabledCount}/${p.models.length} 个模型）`;
+			return `${p.name}  [内置 ${CCGO_LABEL}]  ${p.commandcodeGo.baseUrl}  （启用 ${enabledCount}/${p.models.length} 个模型）`;
 		}
 		const apiOption = getCommonApiOption(p.api);
 		return `${p.name}  [${apiOption.label}]  ${p.baseUrl}  （启用 ${enabledCount}/${p.models.length} 个模型）`;
@@ -934,7 +839,7 @@ async function editCommonFlow(ctx: any): Promise<void> {
 		return;
 	}
 	const existingSameName = getCommonEntries().some((p) => p.name === newName && p !== entry);
-	if (existingSameName || newName === MINIMAX_PROVIDER_ID) {
+	if (existingSameName) {
 		ctx.ui.notify(`供应商 "${newName}" 已存在或是内置供应商。`, "error");
 		return;
 	}
@@ -970,8 +875,8 @@ async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void
 		}
 		let list: StoredModel[];
 		if (entry.kind === "builtin" && entry.name === "commandcodego") {
-			// Command Code 的模型目录在 {baseUrl}/provider/v1/models，与内置 MiniMax 既不同站也不同路径，
-			// 必须走它自己的拉取函数；套用 MiniMax 的 /v1/models 会拿 Command Code 的 key 打 MiniMax，必然认证失败。
+			// Command Code 的模型目录在 {baseUrl}/provider/v1/models，与其它供应商既不同站也不同路径，
+			// 必须走它自己的拉取函数；套用通用的 /v1/models 会认证失败。
 			const remote = await fetchCommandCodeGoModels(key, entry.commandcodeGo.baseUrl);
 			if (remote.length === 0) {
 				throw new Error(`${entry.commandcodeGo.baseUrl}/provider/v1/models 返回为空，请先 /login 登录 ${CCGO_LABEL} 账号`);
@@ -989,10 +894,7 @@ async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void
 				enabled: false,
 			}));
 		} else {
-			// 内置 MiniMax 的模型目录固定走官方 /v1（OpenAI 兼容 /models）。
-			const apiType = entry.kind === "builtin" ? "openai-completions" : entry.api;
-			const baseUrl = entry.kind === "builtin" ? MINIMAX_BASE_URL : entry.baseUrl;
-			list = await fetchModelsByApi(apiType, baseUrl, key);
+			list = await fetchModelsByApi(entry.api, entry.baseUrl, key);
 		}
 		const knownIds = new Set(entry.models.map((m) => m.id));
 		const added = list.filter((m) => !knownIds.has(m.id)).length;
@@ -1009,6 +911,87 @@ async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void
 		ctx.ui.notify(`刷新失败：${e instanceof Error ? e.message : String(e)}\n可在“新增模型”中手动添加。`, "error");
 	} finally {
 		ctx.ui.setStatus("model-provider", undefined);
+	}
+}
+
+/**
+ * 实测已启用模型真正支持哪些思考档位，写回 thinkingLevelMap。
+ *
+ * 为什么要测：pi 用 thinkingLevelMap 决定 /settings 里能选哪些档，
+ * 不探测只能一律给全档，用户选到不支持的档会直接 400。
+ */
+async function refreshThinkingLevels(ctx: any, entry: ProviderEntry): Promise<void> {
+	const targets = entry.models.filter(isModelEnabled);
+	if (targets.length === 0) {
+		ctx.ui.notify("当前没有启用的模型。", "warning");
+		return;
+	}
+
+	const abort = new AbortController();
+	let index = 0;
+	let updated = 0;
+	const unchanged: string[] = [];
+	const errors: string[] = [];
+
+	try {
+		for (const model of targets) {
+			if (abort.signal.aborted) break;
+			index += 1;
+			ctx.ui.setStatus("model-provider", `正在探测 ${index}/${targets.length}：${model.id}`);
+
+			// 取已注册的模型对象：让它带上正确的 api / provider / baseUrl，
+			// 请求才能由该供应商自己的 streamSimple 处理
+			const registered = findRegisteredModel(ctx, entry.name, model.id);
+			if (!registered) {
+				unchanged.push(model.id);
+				errors.push(`${model.id}：模型未注册到运行时`);
+				continue;
+			}
+
+			const result = await probeThinkingLevels(ctx.modelRegistry, registered, abort.signal, (note) => {
+				ctx.ui.setStatus("model-provider", `正在探测 ${index}/${targets.length}：${model.id} · ${note}`);
+			});
+
+			if (result.levels.length === 0) {
+				// 一档都探不出来：保持原配置不动，避免把认证/网络问题误当成不支持
+				unchanged.push(model.id);
+				continue;
+			}
+
+			model.reasoning = true;
+			model.thinkingLevelMap = buildThinkingLevelMap(result.levels);
+			updated += 1;
+		}
+
+		if (updated > 0) {
+			reRegisterEntry(entry);
+			await saveStore();
+		}
+	} catch (e) {
+		errors.push(e instanceof Error ? e.message : String(e));
+	} finally {
+		ctx.ui.setStatus("model-provider", undefined);
+	}
+
+	const lines = [`已更新 ${updated} / ${targets.length} 个模型的思考等级。`];
+	if (unchanged.length > 0) lines.push(`\n没探到思考档位（配置保持原样）：${unchanged.join("、")}`);
+	if (errors.length > 0) lines.push(`\n${errors.join("\n")}`);
+	ctx.ui.notify(lines.join("\n"), updated > 0 ? "info" : "warning");
+}
+
+/** 从运行时找已注册的模型对象，探测时要用它才能走到正确的供应商通道 */
+function findRegisteredModel(ctx: any, provider: string, modelId: string): any {
+	try {
+		const found = ctx?.modelRegistry?.find?.(provider, modelId);
+		if (found) return found;
+	} catch {
+		// 运行时未就绪时退回下面的全量扫描
+	}
+	try {
+		const all = ctx?.modelRegistry?.getAll?.() ?? [];
+		return all.find((m: any) => m.provider === provider && m.id === modelId);
+	} catch {
+		return undefined;
 	}
 }
 
@@ -1550,7 +1533,7 @@ async function toggleModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 /** 模型管理：选供应商后进入操作循环；“返回供应商列表”回到选择，便于连续管理多个供应商 */
 async function modelsMenu(ctx: any): Promise<void> {
 	while (true) {
-		// 内置 MiniMax 作为固定供应商始终出现在列表首位，可统一管理模型与参数。
+		// 内置供应商与通用供应商一并列出，可连续管理多个。
 		const entry = await selectProvider(ctx, "管理模型：选择供应商", true);
 		if (!entry) return;
 		await modelOpsMenu(ctx, entry);
@@ -1561,9 +1544,8 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 	while (true) {
 		const enabledCount = entry.models.filter(isModelEnabled).length;
 		const items = [
-			// 配置管理目前只有内置 MiniMax 有参数菜单；commandcodego 不展示，避免误入 MiniMax 配置。
-			...(entry.kind === "builtin" && entry.name === "minimax_local" ? ["配置管理"] : []),
 			"启用模型",
+			"刷新启用模型思考等级",
 			"刷新模型",
 			"新增模型",
 			"删除模型",
@@ -1575,8 +1557,8 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 		];
 		const action = await ctx.ui.select(`模型管理：${entry.name}（启用 ${enabledCount} / 共 ${entry.models.length} 个）`, items);
 		if (!action || action === "返回供应商列表") return;
-		if (action === "配置管理") await minimaxMenu(ctx);
-		else if (action === "启用模型") await toggleModelsFlow(ctx, entry);
+		if (action === "启用模型") await toggleModelsFlow(ctx, entry);
+		else if (action === "刷新启用模型思考等级") await refreshThinkingLevels(ctx, entry);
 		else if (action === "刷新模型") await refreshCommonModels(ctx, entry);
 		else if (action === "新增模型") await addModelsFlow(ctx, entry);
 		else if (action === "删除模型") await removeModelFlow(ctx, entry);
@@ -1616,7 +1598,7 @@ export default async function (pi: ExtensionAPI) {
 	registerAllProviders(pi);
 
 	pi.registerCommand("model-provider", {
-		description: "统一管理模型供应商：内置 MiniMax 与通用供应商、模型管理，MiniMax 参数经“配置管理”进入",
+		description: "统一管理模型供应商：内置供应商与通用供应商、模型管理",
 		handler: modelProviderCommand,
 	});
 }

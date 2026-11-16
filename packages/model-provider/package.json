@@ -1,15 +1,14 @@
 {
   "name": "@liziy/model-provider",
-  "version": "0.3.0",
-  "description": "pi 模型供应商管理扩展：统一管理 MiniMax Local 与 OpenAI、Responses、Claude 兼容供应商",
+  "version": "0.4.0",
+  "description": "pi 模型供应商管理扩展：统一管理 Command Code 与 OpenAI、Responses、Claude 兼容供应商",
   "keywords": [
     "pi-extension",
     "pi-package",
     "model-provider",
     "openai",
     "responses",
-    "anthropic",
-    "minimax"
+    "anthropic"
   ],
   "license": "MIT",
   "author": "liziy",
@@ -35,9 +34,9 @@
   },
   "files": [
     "index.ts",
-    "minimax.ts",
     "commandcode-go.ts",
     "commandcode-api.ts",
+    "thinking-probe.ts",
     "README.md"
   ]
 }

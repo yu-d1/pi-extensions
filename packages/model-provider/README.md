@@ -1,6 +1,6 @@
 # @liziy/model-provider
 
-统一管理 pi 模型供应商的扩展。内置 MiniMax Local 与 Command Code，并支持添加 OpenAI Chat Completions、OpenAI Responses、Claude Messages 兼容供应商。
+统一管理 pi 模型供应商的扩展。内置 Command Code，并支持添加 OpenAI Chat Completions、OpenAI Responses、Claude Messages 兼容供应商。
 
 ## 安装
 
@@ -31,7 +31,6 @@ pi install npm:@liziy/model-provider
 
 | 供应商 | 方式 |
 |--------|------|
-| MiniMax Local | `/login minimax_local`，参数经 `管理模型` → `配置管理` 调整 |
 | Command Code | `/login` →「Sign in with an account」→ Command Code |
 
 Command Code 的官方授权页 `/studio/auth/cli` 在中文环境下会因 locale 重定向丢参数而报 `Missing callback or state`，此时改用登录界面里的**粘贴 API 密钥**。
@@ -51,16 +50,20 @@ Command Code 的官方授权页 `/studio/auth/cli` 在中文环境下会因 loca
 
 ### 思考等级
 
-`/settings` 的思考档位由模型的 `thinkingLevelMap` 过滤：服务端明确返回 `reasoning: false` 时只保留 `off`；其余情况自动补全全部档位。`xhigh`、`max` 必须有显式映射才显示。
+`管理模型` → 选择供应商 → **刷新启用模型思考等级**，实测每个已启用模型真正支持哪些档位，写回配置。运行后 `/settings` 里只显示该模型可用的档位。
 
-需要自定义时编辑 `~/.pi/agent/extensions/model-provider/config.json`：
+探测按 `low` / `medium` / `high` / `xhigh` / `max` 逐档请求，请求被接受即算支持。`minimal` 不在探测范围，会从 `/settings` 隐藏。
+
+某个模型一档都探不出来时，配置保持原样不动（通常是该模型不支持思考，或密钥/网络不可用）。
+
+手动编辑 `~/.pi/agent/extensions/model-provider/config.json` 也可以：
 
 ```json
 { "id": "my-model", "reasoning": true,
-  "thinkingLevelMap": { "off": "none", "xhigh": "high", "max": "high" } }
+  "thinkingLevelMap": { "off": "none", "low": "low", "high": "high", "xhigh": null } }
 ```
 
-值为 `null` 的档位在 `/settings` 中不可见，重启 pi 生效。
+值为 `null` 的档位在 `/settings` 中不可见。改完重启 pi 生效。
 
 ## 说明
 
@@ -71,6 +74,7 @@ Command Code 的官方授权页 `/studio/auth/cli` 在中文环境下会因 loca
 
 ## 版本历史
 
+- **0.4.0** — 移除内置 MiniMax Local 供应商（含旧配置迁移）；新增「刷新启用模型思考等级」，实测每个已启用模型支持的档位并写入配置，`/settings` 只显示可用档位
 - **0.3.0** — 内置供应商更名为 Command Code 并支持 Provider API 通道：登录时自动识别账号套餐（GO 走 `/alpha/generate`，GOAT/Pro/Max/Provider 走 `/provider/v1`），新增「套餐类型」手动切换；模型按服务端 `supported_endpoints` 自动选择 Chat Completions 或 Messages 接口
 - **0.2.11** — 修复 Command Code (GO) 回复不流式渲染：补发 `start` 事件，避免增量事件被丢弃；修复工具调用参数可能丢失、用户中断被报成错误、停止原因丢失
 - **0.2.10** — 修复内置 Command Code (GO) “刷新模型”误连 MiniMax 地址导致认证失败：改走 `/provider/v1/models`；“配置管理”入口仅对 MiniMax 展示

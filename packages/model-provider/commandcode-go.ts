@@ -309,7 +309,7 @@ function resolveReasoningEffort(model: Model<Api>, options?: SimpleStreamOptions
 	return mapped;
 }
 
-// ── Transcript 解析（与 minimax.ts 同法，不依赖 pi-ai 的 reader 导出）──
+// ── Transcript 解析（不依赖 pi-ai 的 reader 导出）──
 
 interface ResolvedTranscript {
 	systemPrompt?: string;
