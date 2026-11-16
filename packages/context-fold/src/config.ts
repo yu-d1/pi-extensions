@@ -2,16 +2,14 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-/** 折叠触发方式 */
-export type TriggerMode = "threshold" | "model";
+/** 多批折叠的执行方式 */
+export type BatchMode = "serial" | "parallel";
 
 /** 折叠设置。字段少是刻意的，暴露太多反而不知道该调哪个。 */
 export interface FoldConfig {
   /** 是否启用自动折叠 */
   enabled: boolean;
-  /** 触发方式：按阈值，或由模型自己判断 */
-  triggerMode: TriggerMode;
-  /** 触发折叠的上下文 token 数（固定值，不按比例；仅 threshold 模式生效） */
+  /** 触发折叠的上下文 token 数（固定值，不按比例） */
   foldAtTokens: number;
   /** 保留最近多少 token 的原文不折叠 */
   keepRecentTokens: number;
@@ -21,16 +19,21 @@ export interface FoldConfig {
   minGrowth: number;
   /** 区间小于这个 token 数不值得折，白白付一次摘要费用（固定值，不暴露） */
   minFoldTokens: number;
+  /** 多批折叠时逐批串行，还是并发 */
+  batchMode: BatchMode;
+  /** 并发时的同时请求数 */
+  batchConcurrency: number;
 }
 
 export const DEFAULT_CONFIG: FoldConfig = {
   enabled: true,
-  triggerMode: "threshold",
   foldAtTokens: 150_000,
   keepRecentTokens: 20_000,
   safetyRatio: 0.9,
   minGrowth: 15_000,
   minFoldTokens: 8_000,
+  batchMode: "serial",
+  batchConcurrency: 3,
 };
 
 /**
@@ -47,10 +50,16 @@ export const MIN_HEADROOM_TOKENS = 8_000;
 /**
  * 保底触发比例。
  *
- * 与触发阈值、模型判断都无关：上下文到这个占比时无条件折叠，
- * 防止模型从不调用 request_fold、或阈值设得过高导致上下文一直涨。
+ * 与触发阈值无关：上下文到这个占比时无条件折叠，
+ * 防止阈值设得过高导致上下文一直涨。
  */
 export const SAFETY_RATIO_OPTIONS = [0, 0.8, 0.9, 0.95] as const;
+
+/** 执行方式选项 */
+export const BATCH_MODE_OPTIONS = ["逐步", "并发"] as const;
+
+/** 并发个数选项 */
+export const CONCURRENCY_OPTIONS = [2, 3, 5] as const;
 
 /**
  * 给 pi 原生压缩留的余量。
@@ -106,8 +115,12 @@ export function normalizeConfig(raw: unknown): FoldConfig {
 
   if (typeof r.enabled === "boolean") base.enabled = r.enabled;
 
-  if (r.triggerMode === "threshold" || r.triggerMode === "model") {
-    base.triggerMode = r.triggerMode;
+  if (r.batchMode === "serial" || r.batchMode === "parallel") {
+    base.batchMode = r.batchMode;
+  }
+
+  if (typeof r.batchConcurrency === "number" && Number.isFinite(r.batchConcurrency)) {
+    base.batchConcurrency = clamp(Math.floor(r.batchConcurrency), 1, 8);
   }
 
   if (typeof r.foldAtTokens === "number" && Number.isFinite(r.foldAtTokens)) {
@@ -170,23 +183,21 @@ export function tokenLabel(value: number): string {
   return `${(value / 1_000_000).toFixed(2)}M`;
 }
 
-/** 两种触发方式的显示文案，菜单、状态、设置摘要共用，避免各处写法漂移 */
-export const TRIGGER_MODE_LABELS: Record<TriggerMode, string> = {
-  threshold: "按阈值",
-  model: "模型判断（未测试）",
-};
-
-/** 设置项摘要，给 /fold 命令和菜单复用 */
-export function triggerModeLabel(mode: TriggerMode): string {
-  return TRIGGER_MODE_LABELS[mode];
+/** 执行方式的显示文案，菜单与设置摘要共用 */
+export function batchModeLabel(mode: BatchMode): string {
+  return mode === "parallel" ? "并发" : "逐步";
 }
 
 export function configSummary(config: FoldConfig): string[] {
-  return [
+  const lines = [
     `启用折叠: ${config.enabled ? "是" : "否"}`,
-    `触发方式: ${triggerModeLabel(config.triggerMode)}`,
-    `触发阈值: ${config.triggerMode === "model" ? "不适用" : tokenLabel(config.foldAtTokens)}`,
+    `触发阈值: ${tokenLabel(config.foldAtTokens)}`,
     `保留最近: ${tokenLabel(config.keepRecentTokens)}`,
     `保底触发: ${config.safetyRatio > 0 ? `${Math.round(config.safetyRatio * 100)}%` : "关闭"}`,
+    `执行方式: ${batchModeLabel(config.batchMode)}`,
   ];
+  if (config.batchMode === "parallel") {
+    lines.push(`并发个数: ${config.batchConcurrency}`);
+  }
+  return lines;
 }

@@ -69,30 +69,23 @@ export function renderEntry(entry: SessionEntry): string | undefined {
   }
 }
 
-/** 整个区间序列化。会二次裁剪总长度，防止输入本身就把预算吃光。 */
-export function serializeRange(
-  entries: SessionEntry[],
-  entryIds: string[],
-  maxChars = 60_000,
-): string {
+/**
+ * 整个区间序列化。
+ *
+ * 不设字符上限：一批折多大由模型的切分决定，插件再做二次裁剪
+ * 会让摘要看不到后半段，静默丢信息。单条消息的长度仍在 renderEntry 里裁。
+ */
+export function serializeRange(entries: SessionEntry[], entryIds: string[]): string {
   const byId = new Map<string, SessionEntry>();
   for (const entry of entries) byId.set(entry.id, entry);
 
   const chunks: string[] = [];
-  let total = 0;
-
   for (const id of entryIds) {
     const entry = byId.get(id);
     if (entry === undefined) continue;
     const text = renderEntry(entry);
     if (text === undefined) continue;
-
-    if (total + text.length > maxChars) {
-      chunks.push(`…[后续 ${entryIds.length - chunks.length} 条已省略]…`);
-      break;
-    }
     chunks.push(text);
-    total += text.length;
   }
 
   return chunks.join("\n\n");
@@ -157,12 +150,109 @@ export function buildFoldPrompt(input: PromptInput): string {
 }
 
 /** 摘要块在上下文里的显示头，模型据此知道这是折叠产物、覆盖多少、怎么取回原文 */
-export function buildSummaryHeader(blockId: string, messageCount: number, summary: string): string {
+export function buildSummaryHeader(
+  blockId: string,
+  messageCount: number,
+  summary: string,
+  topic?: string,
+): string {
+  const title =
+    topic !== undefined && topic.trim().length > 0
+      ? `[历史摘要 ${blockId} · 覆盖 ${messageCount} 条消息 · ${topic.trim()}]`
+      : `[历史摘要 ${blockId} · 覆盖 ${messageCount} 条消息]`;
+  return [title, "", summary, "", `需要原文时调用 recall("${blockId}")。`].join("\n");
+}
+
+export interface SplitPromptInput {
+  /** 每轮的序号与原话，按时间顺序 */
+  turns: Array<{ index: number; userText: string }>;
+  /** 候选区间总 token，用于让模型有个体量参照 */
+  totalTokens: number;
+}
+
+/**
+ * 让模型决定这段历史切成几批。
+ *
+ * 只给 user 原话：切分依据是用户提了哪些需求，助手过程对判断子任务边界帮助不大，
+ * 而全量内容会让这次调用和一次完整摘要一样贵。
+ */
+export function buildSplitPrompt(input: SplitPromptInput): string {
+  const rows = input.turns.map((turn) => {
+    const text = turn.userText.replace(/\s+/g, " ").trim();
+    const clipped = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+    return `[${turn.index}] ${clipped}`;
+  });
+
   return [
-    `[历史摘要 ${blockId} · 覆盖 ${messageCount} 条消息]`,
+    "下面是一段即将被折叠的对话历史，每轮一行，只保留了用户的原话。",
     "",
-    summary,
+    "你的任务：按子任务边界把它切成若干批，每批单独生成摘要。",
+    "分批是为了让每批的摘要都能覆盖到全部原文，所以不要分出过大的批；",
+    "也不要切得比一个子任务还碎，同一件事的过程应该留在同一批里。",
     "",
-    `需要原文时调用 recall("${blockId}")。`,
+    "输出要求：",
+    "- 只输出 JSON，不要任何解释文字",
+    "- 格式：{\"batches\":[{\"from\":1,\"to\":8,\"topic\":\"简短主题\"}]}",
+    "- from / to 是轮次序号，闭区间，必须覆盖全部轮次，不要重叠或留空",
+    "- topic 用一句话概括这批在做什么，会显示在摘要头部",
+    "",
+    `共 ${input.turns.length} 轮，约 ${input.totalTokens} tokens。`,
+    "",
+    "<turns>",
+    rows.join("\n"),
+    "</turns>",
   ].join("\n");
+}
+
+/** 切分结果解析失败时的原因，仅用于日志与兜底判断 */
+export class SplitParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SplitParseError";
+  }
+}
+
+/** 剥掉模型可能加的 markdown 围栏 */
+function stripFence(text: string): string {
+  const trimmed = text.trim();
+  const fence = /^```(?:json)?\s*\n([\s\S]*?)\n?```$/.exec(trimmed);
+  return fence ? fence[1].trim() : trimmed;
+}
+
+/** 从模型输出里取出切分方案；不合法就抛错，由调用方兜底 */
+export function parseSplitResponse(text: string): Array<{ from: number; to: number; topic: string }> {
+  const body = stripFence(text);
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new SplitParseError("输出里没有 JSON 对象");
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.slice(start, end + 1));
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    throw new SplitParseError(`JSON 解析失败: ${msg}`);
+  }
+
+  const batches = (parsed as { batches?: unknown }).batches;
+  if (!Array.isArray(batches) || batches.length === 0) {
+    throw new SplitParseError("缺少 batches 数组");
+  }
+
+  const result: Array<{ from: number; to: number; topic: string }> = [];
+  for (const item of batches) {
+    if (item === null || typeof item !== "object") continue;
+    const b = item as Record<string, unknown>;
+    const from = typeof b.from === "number" ? b.from : Number(b.from);
+    const to = typeof b.to === "number" ? b.to : Number(b.to);
+    if (!Number.isFinite(from) || !Number.isFinite(to)) continue;
+    result.push({
+      from: Math.floor(from),
+      to: Math.floor(to),
+      topic: typeof b.topic === "string" ? b.topic : "",
+    });
+  }
+
+  if (result.length === 0) throw new SplitParseError("batches 里没有合法条目");
+  return result;
 }

@@ -28,16 +28,34 @@ export interface FoldRange {
   tokensBefore: number;
 }
 
+/** 待切分的候选轮次，交给模型决定切成几批 */
+export interface CandidateTurn {
+  /** 轮次序号，从 1 开始，给模型看的编号 */
+  index: number;
+  /** 该轮的条目 id */
+  entryIds: string[];
+  /** 该轮首条 user 消息的正文，切分时只给模型看这个 */
+  userText: string;
+  /** 该轮估算 token */
+  tokens: number;
+}
+
+export interface Candidates {
+  /** 按时间顺序排列的候选轮次 */
+  turns: CandidateTurn[];
+  /** 候选区间总 token */
+  totalTokens: number;
+}
+
 export type SkipReason =
   | "no-turns"
   | "no-completed-turns"
   | "nothing-beyond-protection"
   | "range-too-small"
-  | "all-folded"
-  | "insufficient-headroom";
+  | "all-folded";
 
 export interface PickResult {
-  range?: FoldRange;
+  candidates?: Candidates;
   reason?: SkipReason;
 }
 
@@ -121,19 +139,15 @@ export interface PickOptions {
   config: FoldConfig;
   /** 本次实际生效的触发阈值（可能被窗口限制过） */
   foldAtTokens: number;
-  /** 当前投影的真实 token 数（不含已折叠部分），用于判断折完是否还有意义 */
-  currentTokens: number;
   /** 已被折叠过的条目 id */
   folded: Set<string>;
-  /** 模型明确表示最近几轮已收尾，允许把它们也纳入折叠（保留量降到下限） */
-  includeRecent?: boolean;
 }
 
 /**
- * 选出要折叠的区间。
+ * 选出待折叠的候选轮次。
  *
- * 策略：从尾部往前扣掉保留量，剩下的全折。这样折叠点尽量靠后，
- * 前缀缓存命中最多。
+ * 只负责划出「哪一段可以折」，具体切成几批交给模型决定。
+ * 从尾部往前扣掉保留量，剩下的全部作为候选，顺序保持时间先后。
  */
 export function pickRange(branch: SessionEntry[], options: PickOptions): PickResult {
   const turns = splitTurns(branch);
@@ -143,18 +157,15 @@ export function pickRange(branch: SessionEntry[], options: PickOptions): PickRes
   const usable = turns.slice(0, -1);
   if (usable.length === 0) return { reason: "no-completed-turns" };
 
-  // 第一个 turn 承载任务意图，永久保护
-  const candidates = usable.slice(1);
-  if (candidates.length === 0) return { reason: "nothing-beyond-protection" };
+  // 第一个 turn 不特殊保护。长会话里首轮可能跑了几十条工具调用，
+  // 而且用户的需求早都换过好几轮了，留着它只会白白占上下文。
+  const candidates = usable;
 
-  // 保留量不能占满整个阈值，否则折完也省不下空间。
-  // includeRecent 时降到下限：模型说最近几轮已收尾，不必再圈进保护区。
-  const keepBudget = options.includeRecent
-    ? MIN_KEEP_TOKENS
-    : Math.max(
-        MIN_KEEP_TOKENS,
-        Math.min(options.config.keepRecentTokens, Math.max(MIN_KEEP_TOKENS, options.foldAtTokens - MIN_HEADROOM_TOKENS)),
-      );
+  // 保留量不能占满整个阈值，否则折完也省不下空间
+  const keepBudget = Math.max(
+    MIN_KEEP_TOKENS,
+    Math.min(options.config.keepRecentTokens, Math.max(MIN_KEEP_TOKENS, options.foldAtTokens - MIN_HEADROOM_TOKENS)),
+  );
 
   // 从尾部往前保留 keepBudget
   let kept = 0;
@@ -167,47 +178,62 @@ export function pickRange(branch: SessionEntry[], options: PickOptions): PickRes
 
   if (cut === 0) return { reason: "nothing-beyond-protection" };
 
-  // 从候选里剔除已折叠的条目；一个 turn 只要还有未折叠条目就保留剩下的部分
-  const range = candidates.slice(0, cut);
-  const entryIds: string[] = [];
-  let tokensBefore = 0;
-  let skippedAll = true;
-
   // 防御：再对照一次 branch，确保交给 context_edit 的条目都能被编辑
   const index = new Map(branch.map((entry) => [entry.id, entry]));
+  const picked: CandidateTurn[] = [];
+  let totalTokens = 0;
 
-  for (const turn of range) {
+  for (const turn of candidates.slice(0, cut)) {
+    const entryIds: string[] = [];
     for (const id of turn.entryIds) {
       if (options.folded.has(id)) continue;
       const entry = index.get(id);
       if (entry === undefined || !isFoldable(entry)) continue;
-      skippedAll = false;
       entryIds.push(id);
     }
-    if (turn.entryIds.some((id) => !options.folded.has(id))) {
-      tokensBefore += turn.tokens;
-    }
+    if (entryIds.length === 0) continue;
+
+    const foldedAll = entryIds.length < turn.entryIds.length;
+    picked.push({
+      index: picked.length + 1,
+      entryIds,
+      userText: firstUserText(branch, turn),
+      // 部分条目已被折叠过时，按比例折算这轮的实际 token
+      tokens: foldedAll ? Math.round((turn.tokens * entryIds.length) / turn.entryIds.length) : turn.tokens,
+    });
+    totalTokens += picked[picked.length - 1].tokens;
   }
 
-  if (skippedAll || entryIds.length === 0) return { reason: "all-folded" };
+  if (picked.length === 0) return { reason: "all-folded" };
 
   // 区间太薄，白付一次摘要费用
-  if (tokensBefore < options.config.minFoldTokens) return { reason: "range-too-small" };
+  if (totalTokens < options.config.minFoldTokens) return { reason: "range-too-small" };
 
-  // 折完还是超过阈值，说明保留量占满了预算，这次折叠没意义。
-  // 基准用当前投影的真实 token，而不是所有历史轮次之和——
-  // 已折叠的轮次在投影里只剩摘要，再算一遍会让判断失效。
-  if (options.currentTokens - tokensBefore >= options.foldAtTokens) {
-    return { reason: "insufficient-headroom" };
+  return { candidates: { turns: picked, totalTokens } };
+}
+
+/** 取一轮里的 user 原话，切分时给模型看的就是这段 */
+function firstUserText(branch: SessionEntry[], turn: Turn): string {
+  for (let i = turn.start; i < turn.end; i++) {
+    const entry = branch[i];
+    if (entry?.type !== "message" || entry.message.role !== "user") continue;
+    return messageText(entry.message).trim();
   }
+  return "";
+}
 
-  return {
-    range: {
-      entryIds,
-      headEntryId: entryIds[0],
-      tokensBefore,
-    },
-  };
+/** 消息正文的纯文本，忽略思考块与图片 */
+function messageText(message: unknown): string {
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block === null || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type === "text" && typeof b.text === "string") parts.push(b.text);
+  }
+  return parts.join("\n");
 }
 
 /** 边界草稿：context_edit 列表 + 一条元数据记录 */
@@ -240,12 +266,14 @@ export function buildDrafts(
   summary: string,
   header: string,
   tokensAfter: number,
+  topic?: string,
 ): Drafts {
   const record: FoldRecord = {
     blockId,
     entryIds: range.entryIds,
     headEntryId: range.headEntryId,
     summary,
+    topic,
     tokensBefore: range.tokensBefore,
     tokensAfter,
     createdAt: Date.now(),
@@ -269,4 +297,93 @@ export function buildDrafts(
   entries.push({ type: "custom", customType: "fold-record", data: record });
 
   return { entries, record };
+}
+
+/** 一批折叠的轮次范围（模型给出的序号区间） */
+export interface BatchPlan {
+  /** 起始轮次序号（含） */
+  from: number;
+  /** 结束轮次序号（含） */
+  to: number;
+  /** 这段的主题，用作摘要侧重点与摘要头 */
+  topic: string;
+}
+
+/** 把序号区间映射回具体的折叠区间 */
+export function toFoldRange(candidates: Candidates, plan: BatchPlan): FoldRange | undefined {
+  const entryIds: string[] = [];
+  let tokensBefore = 0;
+
+  for (const turn of candidates.turns) {
+    if (turn.index < plan.from || turn.index > plan.to) continue;
+    entryIds.push(...turn.entryIds);
+    tokensBefore += turn.tokens;
+  }
+
+  if (entryIds.length === 0) return undefined;
+  return { entryIds, headEntryId: entryIds[0], tokensBefore };
+}
+
+/**
+ * 兜底切分：模型返回不可用时用这个。
+ *
+ * 目标是每批差不多大，且都落在轮次边界上，所以平均分即可。
+ */
+export function fallbackBatches(candidates: Candidates, count: number): BatchPlan[] {
+  const turns = candidates.turns;
+  if (turns.length === 0) return [];
+
+  const size = Math.max(1, Math.ceil(turns.length / Math.max(1, count)));
+  const plans: BatchPlan[] = [];
+  for (let i = 0; i < turns.length; i += size) {
+    const slice = turns.slice(i, i + size);
+    plans.push({
+      from: slice[0].index,
+      to: slice[slice.length - 1].index,
+      topic: "",
+    });
+  }
+  return plans;
+}
+
+/**
+ * 校验模型给的切分方案。
+ *
+ * 要求：序号递增、不重叠、不越界。合法部分保留，空洞用后续轮次补齐，
+ * 保证覆盖完整且每轮只被折一次。
+ */
+export function normalizeBatches(candidates: Candidates, plans: BatchPlan[]): BatchPlan[] {
+  const turns = candidates.turns;
+  if (turns.length === 0) return [];
+  const minIndex = turns[0].index;
+  const maxIndex = turns[turns.length - 1].index;
+
+  const valid = plans
+    .map((p) => ({
+      from: Math.max(minIndex, Math.min(maxIndex, Math.floor(p.from))),
+      to: Math.max(minIndex, Math.min(maxIndex, Math.floor(p.to))),
+      topic: typeof p.topic === "string" ? p.topic.trim() : "",
+    }))
+    .filter((p) => p.from <= p.to)
+    .sort((a, b) => a.from - b.from);
+
+  // 去掉重叠：后一批的起点推到前一批结尾之后
+  const cleaned: BatchPlan[] = [];
+  let cursor = minIndex;
+  for (const p of valid) {
+    const from = Math.max(p.from, cursor);
+    if (from > p.to) continue;
+    cleaned.push({ from, to: p.to, topic: p.topic });
+    cursor = p.to + 1;
+    if (cursor > maxIndex) break;
+  }
+
+  // 尾部有空洞就补一批；完全为空时整体均分
+  if (cleaned.length === 0) return fallbackBatches(candidates, 1);
+  const last = cleaned[cleaned.length - 1];
+  if (last.to < maxIndex) {
+    cleaned.push({ from: last.to + 1, to: maxIndex, topic: "" });
+  }
+
+  return cleaned;
 }

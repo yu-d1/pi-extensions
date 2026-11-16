@@ -10,6 +10,8 @@ export interface FoldRecord {
   headEntryId: string;
   /** 摘要正文 */
   summary: string;
+  /** 这批覆盖内容的主题，来自切分方案，显示在摘要头 */
+  topic?: string;
   /** 折叠前的上下文字数（估算） */
   tokensBefore: number;
   /** 折叠后这一块占用的 token（摘要长度） */
@@ -25,10 +27,16 @@ export interface FoldState {
   nextSeq: number;
   /** 最近一次折叠后的上下文 token 数，用作增长门槛基线 */
   lastFoldTokens: number | null;
+  /** 基线待重读：刚折叠完，下次 agent_settled 读到的才是折叠后的值 */
+  baselinePending: boolean;
   /** 正在后台生成摘要 */
   summarizing: boolean;
-  /** 摘要已生成，等待在下一个边界应用 */
-  pending: FoldRecord | undefined;
+  /** 摘要已生成，等待在下一个边界应用（多批时会有多条） */
+  pending: FoldRecord[] | undefined;
+  /** 本轮切出的总批数，用于进度显示 */
+  batchTotal: number;
+  /** 本轮已完成的批数 */
+  batchDone: number;
   /** 连续失败次数，用来避免反复重试同一个坏区间 */
   failures: number;
 }
@@ -38,8 +46,11 @@ export function createState(): FoldState {
     records: new Map(),
     nextSeq: 1,
     lastFoldTokens: null,
+    baselinePending: false,
     summarizing: false,
     pending: undefined,
+    batchTotal: 0,
+    batchDone: 0,
     failures: 0,
   };
 }
@@ -48,15 +59,22 @@ export function resetState(state: FoldState): void {
   state.records.clear();
   state.nextSeq = 1;
   state.lastFoldTokens = null;
+  state.baselinePending = false;
   state.summarizing = false;
   state.pending = undefined;
+  state.batchTotal = 0;
+  state.batchDone = 0;
   state.failures = 0;
 }
 
-export function nextBlockId(state: FoldState): string {
-  const id = `b${state.nextSeq}`;
-  state.nextSeq += 1;
-  return id;
+/** 预留一批块编号，并发执行时也不会撞号 */
+export function reserveBlockIds(state: FoldState, count: number): string[] {
+  const ids: string[] = [];
+  for (let i = 0; i < count; i++) {
+    ids.push(`b${state.nextSeq}`);
+    state.nextSeq += 1;
+  }
+  return ids;
 }
 
 function isFoldRecordEntry(entry: SessionEntry): boolean {
@@ -78,6 +96,7 @@ function readRecord(entry: SessionEntry): FoldRecord | undefined {
     entryIds,
     headEntryId: typeof d.headEntryId === "string" ? d.headEntryId : entryIds[0],
     summary: typeof d.summary === "string" ? d.summary : "",
+    topic: typeof d.topic === "string" ? d.topic : undefined,
     tokensBefore: typeof d.tokensBefore === "number" ? d.tokensBefore : 0,
     tokensAfter: typeof d.tokensAfter === "number" ? d.tokensAfter : 0,
     createdAt: typeof d.createdAt === "number" ? d.createdAt : 0,
@@ -123,4 +142,9 @@ export function foldedEntryIds(state: FoldState): Set<string> {
     for (const id of record.entryIds) ids.add(id);
   }
   return ids;
+}
+
+/** 按块编号顺序取出所有记录，b1、b2、b10 不会排成 b1、b10、b2 */
+export function sortedRecords(state: FoldState): FoldRecord[] {
+  return [...state.records.values()].sort((a, b) => seqOf(a.blockId) - seqOf(b.blockId));
 }

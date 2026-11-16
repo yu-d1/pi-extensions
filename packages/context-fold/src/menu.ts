@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_CONFIG, configSummary, loadConfig, saveConfig, tokenLabel, TRIGGER_MODE_LABELS, triggerModeLabel, type FoldConfig } from "./config.js";
+import { batchModeLabel, DEFAULT_CONFIG, configSummary, loadConfig, saveConfig, tokenLabel, CONCURRENCY_OPTIONS, type FoldConfig } from "./config.js";
 import { startSummarize } from "./run.js";
 import type { FoldState } from "./state.js";
 import { buildStatusText } from "./tools.js";
@@ -11,6 +11,8 @@ const MENU_DONE = "完成";
 const FOLD_AT_CHOICES = ["50K", "100K", "150K", "200K", "自定义输入"];
 const KEEP_CHOICES = ["10K", "20K", "40K", "自定义输入"];
 const SAFETY_CHOICES = ["关闭", "80%", "90%", "95%", "自定义输入"];
+const BATCH_MODE_CHOICES = ["逐步", "并发"];
+const CONCURRENCY_CHOICES = [...CONCURRENCY_OPTIONS.map(String), "自定义输入"];
 
 const USAGE = [
   "用法: /fold [子命令]",
@@ -26,19 +28,18 @@ async function editSettings(ctx: ExtensionContext): Promise<void> {
   const next: FoldConfig = { ...loadConfig() };
 
   while (true) {
-    // 模型判断模式下，触发阈值不适用，从菜单里隐藏
     const options = [
       `启用折叠（当前: ${next.enabled ? "是" : "否"}）`,
-      `触发方式（当前: ${triggerModeLabel(next.triggerMode)}）`,
-    ];
-    if (next.triggerMode === "threshold") {
-      options.push(`触发阈值（当前: ${tokenLabel(next.foldAtTokens)}）`);
-    }
-    options.push(
+      `触发阈值（当前: ${tokenLabel(next.foldAtTokens)}）`,
       `保留最近（当前: ${tokenLabel(next.keepRecentTokens)}）`,
       `保底触发（当前: ${next.safetyRatio > 0 ? `${Math.round(next.safetyRatio * 100)}%` : "关闭"}）`,
-      MENU_DONE,
-    );
+      `执行方式（当前: ${batchModeLabel(next.batchMode)}）`,
+    ];
+    // 并发个数只在并发时出现
+    if (next.batchMode === "parallel") {
+      options.push(`并发个数（当前: ${next.batchConcurrency}）`);
+    }
+    options.push(MENU_DONE);
 
     const choice = await ctx.ui.select("设置", options);
     if (!choice || choice === MENU_DONE) break;
@@ -47,10 +48,25 @@ async function editSettings(ctx: ExtensionContext): Promise<void> {
       const pick = await ctx.ui.select("启用折叠", ["是", "否"]);
       if (pick === undefined) continue;
       next.enabled = pick === "是";
-    } else if (choice.startsWith("触发方式")) {
-      const pick = await ctx.ui.select("触发方式", [TRIGGER_MODE_LABELS.threshold, TRIGGER_MODE_LABELS.model]);
+    } else if (choice.startsWith("执行方式")) {
+      const pick = await ctx.ui.select("多批摘要怎么执行", BATCH_MODE_CHOICES);
       if (pick === undefined) continue;
-      next.triggerMode = pick === TRIGGER_MODE_LABELS.model ? "model" : "threshold";
+      next.batchMode = pick === "并发" ? "parallel" : "serial";
+    } else if (choice.startsWith("并发个数")) {
+      const pick = await ctx.ui.select("同时发起几个摘要请求", CONCURRENCY_CHOICES);
+      if (pick === undefined) continue;
+      if (pick === "自定义输入") {
+        const input = await ctx.ui.input("并发个数（1-8）", String(next.batchConcurrency));
+        if (input === undefined) continue;
+        const num = Number(input.trim());
+        if (!Number.isFinite(num) || num < 1 || num > 8) {
+          ctx.ui.notify("请输入 1 到 8 之间的数字", "error");
+          continue;
+        }
+        next.batchConcurrency = Math.round(num);
+      } else {
+        next.batchConcurrency = Number(pick);
+      }
     } else if (choice.startsWith("触发阈值")) {
       const pick = await ctx.ui.select("上下文达到多少 token 时折叠", FOLD_AT_CHOICES);
       if (pick === undefined) continue;
@@ -112,7 +128,7 @@ async function foldNow(ctx: ExtensionContext, state: FoldState): Promise<void> {
     return;
   }
   if (state.pending !== undefined) {
-    ctx.ui.notify(`块 ${state.pending.blockId} 已生成，本轮结束时会自动生效`, "info");
+    ctx.ui.notify(`${state.pending.length} 块已生成，本轮结束时会自动生效`, "info");
     return;
   }
 
