@@ -287,7 +287,9 @@ export function toolsToJson(tools: readonly Tool[] | undefined): unknown[] {
  */
 export const CCGO_THINKING_LEVEL_MAP: Record<string, string> = {
 	off: "off",
-	minimal: "low",
+	// 上游不支持 minimal（400）。借位到 off：选 minimal 等于关闭思考，
+	// 这样用户想要真正关掉时有路可走（pi 不会把 off 档下发给上游）。
+	minimal: "off",
 	low: "low",
 	medium: "medium",
 	high: "high",

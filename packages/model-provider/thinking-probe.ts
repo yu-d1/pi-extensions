@@ -1,51 +1,73 @@
 /**
- * 思考等级探测：实测每个模型真正支持哪些档位，生成 thinkingLevelMap。
+ * 思考等级探测：直连供应商接口，实测每个模型真正支持哪些档位。
  *
- * 为什么需要：pi 用 thinkingLevelMap 决定 /settings 里显示哪些档位
- * （null 表示该档不支持，会被过滤掉）。不探测就只能一律给全档，
- * 用户选到不支持的档会直接 400。
+ * 为什么要直连而不是走 pi 的 modelRegistry：
+ *   1. pi 内部把 `reasoning: "off"` 转成 undefined，off 档永远发不出去；
+ *   2. pi 是否下发思考参数取决于 model.compat.thinkingFormat —— 而那正是
+ *      我们要测出来的东西，形成循环依赖；
+ *   3. 没设 thinkingFormat 时所有档位的请求完全相同，全部 200，
+ *      于是全部被判为支持（历史配置里的错误档位就是这么来的）。
  *
- * 请求走 modelRegistry.complete，由各供应商自己的 streamSimple 处理：
- * 通用供应商用 pi 内置的 api 实现，commandcodego 用扩展注册的
- * 私有通道（/alpha/generate 的 NDJSON 等）。这里不拼任何 HTTP 请求，
- * 否则等于把每家协议重写一遍，而且必然和真实对话路径不一致。
+ * 因此这里自己拼请求，按 pi-ai 支持的 thinkingFormat 逐个试，
+ * 命中后再逐档验证，一次探测同时得出「哪些档可用」和「该用哪种参数格式」。
  */
 
 /** pi 的全部思考档位（用于排序参照） */
 export const ALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
-/**
- * 需要逐档实测的档位。
- *
- * 不含 off（那是「关掉思考」，另一套判定）与 minimal（太细，实测用处不大，
- * 统一隐藏）。隐不掉就删掉，所以生成 map 时会把它写成 null。
- */
-const PROBE_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+/** 需要逐档验证的档位，不含 off（关闭是另一套判定） */
+const PROBE_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
-/** pi 里有、但我们不提供的档位，生成 map 时置 null 隐藏 */
-const HIDDEN_LEVELS = ["minimal"] as const;
+/**
+ * 寻找格式时用的档位。
+ *
+ * 选 medium 而非 low：low 在部分实现上等价于关闭，会被误判成「这个格式不支持思考」。
+ */
+const FORMAT_PROBE_LEVEL = "medium";
 
 /**
  * 探测提问。
  *
  * 用写代码而不是简单问答：推理模型面对「哪个数大」这类题会直接作答，
- * 不产生思考内容，容易被误判成「不支持该档」。冒泡排序要理清边界条件，
- * 多数推理模型会真正展开思考。
+ * 不产生思考内容，容易被误判成「不支持该档」。
  */
 const PROBE_QUESTION = "用 Java 写一个冒泡排序，只要代码。";
 
-/**
- * 探测顺序。
- *
- * 先试 low：它是最省的一档，模型若不支持会立刻报错，
- * 比先试 medium 少一次长思考。
- */
-const FIRST_LEVEL = "low";
+/** 探测请求的输出预算：够写下代码即可，不追求完整 */
+const PROBE_MAX_TOKENS = 512;
 
-/** 单个档位的判定结果 */
-export interface LevelResult {
+/** 单次请求超时 */
+const PROBE_TIMEOUT_MS = 45_000;
+
+/**
+ * 借用 minimal 档位承载「真正关闭思考」。
+ *
+ * 实测 deepseek 系列不认 `thinking: {type:"disabled"}`，只有
+ * `reasoning_effort: "off"` 能关掉，而 pi 内部会把 off 档转成 undefined 不下发。
+ * 因此把关闭值挂到 minimal 上：用户选 minimal 即等于关闭思考。
+ */
+const BORROWED_CLOSE_LEVEL = "minimal";
+
+/** 关闭思考的各种写法。不同厂商认的不一样，逐个试到能关掉为止。 */
+const CLOSE_SHAPES: Array<{ value?: string; params: Record<string, unknown> }> = [
+	// 实测 deepseek 只认这个；mimo 会对它报 400
+	{ value: "off", params: { reasoning_effort: "off" } },
+	// mimo / openrouter 系认这个
+	{ value: "none", params: { reasoning_effort: "none" } },
+	// 不发 effort，改用开关字段
+	{ params: { thinking: { type: "disabled" } } },
+	{ params: { enable_thinking: false } },
+{ params: { chat_template_kwargs: { enable_thinking: false } } },
+];
+
+/** 一次请求的判定结果 */
+export type Verdict = "ok" | "no-think" | "error";
+
+/** 单档探测记录 */
+export interface LevelProbe {
 	level: string;
-	ok: boolean;
+	format: string;
+	verdict: Verdict;
 	note: string;
 }
 
@@ -53,87 +75,214 @@ export interface LevelResult {
 export interface ModelProbeResult {
 	/** 真正生效的档位（不含 off） */
 	levels: string[];
+	/** 命中的参数格式，写进 compat.thinkingFormat */
+	thinkingFormat?: string;
+	/** 关闭思考是否真的生效 */
+	offClosable: boolean;
+	/** 关闭思考用的 effort 值（如 "off"、"none"），可借位到 minimal 档 */
+	closeValue?: string;
 	/** 逐档过程，用于排查与展示 */
-	trace: LevelResult[];
+	trace: LevelProbe[];
 }
 
-/** 不能算成功的结束原因 */
-const FAILED_STOP_REASONS = new Set(["error", "aborted"]);
+/** 探测目标：直连所需的全部信息 */
+export interface ProbeTarget {
+	/** 对话端点前缀，例如 https://api.xiaomimimo.com/v1 */
+	baseUrl: string;
+	apiKey: string;
+	modelId: string;
+	/**
+	 * 参数格式候选。按优先级排列，命中即停。
+	 * 每个格式自带「各档位要发什么」，与 pi-ai 的 thinkingFormat 分支保持一致。
+	 */
+	formats: ThinkFormat[];
+}
+
+/** 一种思考参数格式 */
+export interface ThinkFormat {
+	/** 对应 pi-ai 的 compat.thinkingFormat */
+	name: string;
+	/** 构造该档位下的请求增量；返回 null 表示此格式下该档没有额外参数 */
+	build: (level: string) => Record<string, unknown> | null;
+}
 
 /**
- * 判定一档是否支持：请求被接受就算支持。
+ * 常见格式候选。
  *
- * 不看响应里有没有思考内容：部分网关不透传 reasoning 字段，
- * 按内容判定会把能用的一律归为「不支持」。
- *
- * 但必须看 stopReason：pi 的 complete 失败时不抛错，而是返回带
- * stopReason: "error" 的消息，只看“有没有返回”会把失败当成功。
+ * 与 pi-ai openai-completions 的分支一一对应；只列能纯靠请求体区分的那几种，
+ * 协议级差异（anthropic messages、commandcode 私有通道）不走这里。
  */
-function shortError(error: unknown): string {
-	const text = error instanceof Error ? error.message : String(error);
+export const THINK_FORMATS: ThinkFormat[] = [
+	{
+		// 实测 deepseek：关闭只认 reasoning_effort:"off"，不认 thinking:disabled
+		name: "deepseek",
+		build: (level) => (level === "off" ? { reasoning_effort: "off" } : { thinking: { type: "enabled" }, reasoning_effort: level }),
+	},
+	{
+		name: "zai",
+		build: (level) => (level === "off" ? { thinking: { type: "disabled" } } : { thinking: { type: "enabled", clear_thinking: false }, reasoning_effort: level }),
+	},
+	{
+		name: "openrouter",
+		build: (level) => ({ reasoning: { effort: level === "off" ? "none" : level } }),
+	},
+	{
+		name: "ant-ling",
+		build: (level) => (level === "off" ? { reasoning: { effort: "none" } } : { reasoning: { effort: level } }),
+	},
+	{
+		name: "qwen",
+		build: (level) => (level === "off" ? { enable_thinking: false } : { enable_thinking: true, reasoning_effort: level }),
+	},
+	{
+		name: "qwen-chat-template",
+		build: (level) => ({ chat_template_kwargs: { enable_thinking: level !== "off" } }),
+	},
+];
+
+/**
+ * 判断响应里是否真的出现了思考内容。
+ *
+ * 只看「思考内容」不看状态码：参数被忽略时各家都会正常回话（200），
+ * 仅凭状态码会把不支持的档误判为支持。
+ */
+function hasReasoningContent(json: any): boolean {
+	const message = json?.choices?.[0]?.message;
+	if (typeof message?.reasoning_content === "string" && message.reasoning_content.trim().length > 0) return true;
+	if (typeof message?.reasoning === "string" && message.reasoning.trim().length > 0) return true;
+	if (Array.isArray(message?.reasoning_content) && message.reasoning_content.length > 0) return true;
+	if (Array.isArray(message?.content) && message.content.some((b: any) => b?.type === "thinking" || b?.type === "reasoning")) {
+		return true;
+	}
+	const reasoningTokens = json?.usage?.completion_tokens_details?.reasoning_tokens;
+	return typeof reasoningTokens === "number" && reasoningTokens > 0;
+}
+
+function shortError(value: unknown): string {
+	const text = typeof value === "string" ? value : value instanceof Error ? value.message : JSON.stringify(value ?? "");
 	const oneLine = text.replace(/\s+/g, " ").trim();
-	return oneLine.length > 120 ? `${oneLine.slice(0, 120)}…` : oneLine;
+	return oneLine.length > 140 ? `${oneLine.slice(0, 140)}…` : oneLine;
+}
+
+/** 发一次请求并判定 */
+async function requestOnce(
+	target: ProbeTarget,
+	level: string,
+	params: Record<string, unknown> | null,
+	signal?: AbortSignal,
+): Promise<{ verdict: Verdict; note: string }> {
+	const url = `${target.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(new Error("探测超时")), PROBE_TIMEOUT_MS);
+	const onAbort = () => controller.abort(signal?.reason);
+	if (signal !== undefined) {
+		if (signal.aborted) controller.abort(signal.reason);
+		else signal.addEventListener("abort", onAbort, { once: true });
+	}
+
+	try {
+		const resp = await fetch(url, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${target.apiKey}` },
+			body: JSON.stringify({
+				model: target.modelId,
+				stream: false,
+				max_tokens: PROBE_MAX_TOKENS,
+				messages: [{ role: "user", content: PROBE_QUESTION }],
+				...params,
+			}),
+			signal: controller.signal,
+		});
+		const text = await resp.text();
+		// 参数不被接受时，网关普遍用 400/422 明确拒绝
+		if (resp.status === 400 || resp.status === 422) return { verdict: "error", note: shortError(text) };
+		if (!resp.ok) return { verdict: "error", note: `HTTP ${resp.status} ${shortError(text)}` };
+
+		let json: any;
+		try {
+			json = JSON.parse(text);
+		} catch {
+			return { verdict: "error", note: "响应不是 JSON" };
+		}
+		if (hasReasoningContent(json)) return { verdict: "ok", note: "出现思考内容" };
+		return { verdict: "no-think", note: "200 但无思考内容" };
+	} catch (error) {
+		return { verdict: "error", note: shortError(error) };
+	} finally {
+		clearTimeout(timer);
+		signal?.removeEventListener("abort", onAbort);
+	}
 }
 
 /**
  * 探测一个模型支持哪些思考档位。
  *
- * @param registry pi 的 modelRegistry，负责按供应商路由与认证
- * @param model 已注册的模型对象（含 api / provider / baseUrl）
+ * 流程：先找出哪种参数格式能触发思考（只试 medium），命中后在该格式下逐档验证，
+ * 最后单独验证关闭是否生效。
  */
 export async function probeThinkingLevels(
-	registry: any,
-	model: any,
+	target: ProbeTarget,
 	signal?: AbortSignal,
 	onProgress?: (note: string) => void,
 ): Promise<ModelProbeResult> {
-	const trace: LevelResult[] = [];
+	const trace: LevelProbe[] = [];
+	const empty: ModelProbeResult = { levels: [], offClosable: false, trace };
 
-	// 先确认能正常调用，避免把「密钥失效」误当成「不支持思考」
-	const first = await probeOne(registry, model, FIRST_LEVEL, signal);
-	trace.push(first);
-	onProgress?.(`${FIRST_LEVEL} ${first.ok ? "✓" : "✗"}`);
-	if (!first.ok) {
-		// 第一档就失败时无法区分「不支持」与「认证/网络问题」，
-		// 返回空让调用方保持原配置，不误杀
-		return { levels: [], trace };
-	}
-
-	const levels = [FIRST_LEVEL];
-	for (const level of PROBE_LEVELS) {
-		if (level === FIRST_LEVEL) continue;
-		if (signal?.aborted) break;
-		const one = await probeOne(registry, model, level, signal);
-		trace.push(one);
-		onProgress?.(`${level} ${one.ok ? "✓" : "✗"}`);
-		if (one.ok) levels.push(level);
-	}
-
-	return { levels: levels.sort(byLevelOrder), trace };
-}
-
-/** 用指定档位请求一次，看是否真的产生思考内容 */
-async function probeOne(
-	registry: any,
-	model: any,
-	level: string,
-	signal?: AbortSignal,
-): Promise<LevelResult> {
-	try {
-		const message = await registry.complete(
-			model,
-			{ messages: [{ role: "user", content: PROBE_QUESTION, timestamp: Date.now() }] },
-			{ reasoning: level, maxTokens: 256, signal },
-		);
-		// 能正常返回就说明该档被接受；是否真的产生思考内容不追究
-		if (message === undefined || message === null) return { level, ok: false, note: "空响应" };
-		if (FAILED_STOP_REASONS.has(message.stopReason)) {
-			return { level, ok: false, note: shortError(message.errorMessage ?? message.stopReason) };
+	// ── 1. 找格式 ──────────────────────────────────────────────
+	let hit: ThinkFormat | undefined;
+	for (const format of target.formats) {
+		if (signal?.aborted) return empty;
+		const params = format.build(FORMAT_PROBE_LEVEL);
+		const r = await requestOnce(target, FORMAT_PROBE_LEVEL, params, signal);
+		trace.push({ level: FORMAT_PROBE_LEVEL, format: format.name, verdict: r.verdict, note: r.note });
+		onProgress?.(`格式 ${format.name} ${r.verdict === "ok" ? "✓" : "✗"}`);
+		if (r.verdict === "ok") {
+			hit = format;
+			break;
 		}
-		return { level, ok: true, note: "已接受" };
-	} catch (error) {
-		return { level, ok: false, note: shortError(error) };
 	}
+
+	// 一种格式都不通：可能是模型不支持思考，也可能是密钥/网络问题，
+	// 无法区分时保持原配置不动，避免误杀
+	if (hit === undefined) return empty;
+
+	// ── 2. 逐档验证 ────────────────────────────────────────────
+	const levels: string[] = [];
+	for (const level of PROBE_LEVELS) {
+		if (signal?.aborted) break;
+		const params = hit.build(level);
+		const r = await requestOnce(target, level, params, signal);
+		trace.push({ level, format: hit.name, verdict: r.verdict, note: r.note });
+		onProgress?.(`${level} ${r.verdict === "ok" ? "✓" : "✗"}`);
+		if (r.verdict === "ok") levels.push(level);
+	}
+
+	// ── 3. 验证关闭 ────────────────────────────────────────────
+	// 不能只试当前格式的关闭写法：deepseek 认 reasoning_effort:"off"，
+	// mimo 认 "none"，只试一种会把能关的模型误判成关不掉。
+	let offClosable = false;
+	let closeValue: string | undefined;
+	for (const shape of CLOSE_SHAPES) {
+		if (signal?.aborted) break;
+		const r = await requestOnce(target, "off", shape.params, signal);
+		// 关闭看的是「有没有思考」：没思考才算真的关掉了
+		if (r.verdict === "no-think") {
+			offClosable = true;
+			closeValue = shape.value;
+			trace.push({ level: "off", format: hit.name, verdict: r.verdict, note: "思考已关闭 ✓" });
+			break;
+		}
+		trace.push({ level: "off", format: hit.name, verdict: r.verdict, note: r.note });
+	}
+	onProgress?.(`off ${offClosable ? "✓ 可关闭" : "✗ 关不掉"}`);
+
+	return {
+		levels: levels.sort(byLevelOrder),
+		thinkingFormat: hit.name,
+		offClosable,
+		...(closeValue !== undefined ? { closeValue } : {}),
+		trace,
+	};
 }
 
 /** 按 pi 的档位顺序排列，避免探测顺序决定展示顺序 */
@@ -143,19 +292,54 @@ function byLevelOrder(a: string, b: string): number {
 }
 
 /**
- * 把探测到的档位转成 thinkingLevelMap。
+ * 把探测结果转成 thinkingLevelMap。
  *
- * pi 的规则：null = 该档不支持（会被 /settings 过滤）；
- * 但要特别小心：xhigh / max 之外，map 里缺键（undefined）会被当成**支持**。
- * 所以不需要的档必须显式写 null，否则它仍会出现在 /settings 里。
+ * 不支持的档位不应该出现在配置里，所以：
+ *   - xhigh / max：pi 不写键就当不支持，直接省略，配置保持干净；
+ *   - minimal / low / medium / high：pi 不写键会当成支持，
+ *     只能用 null 表达不支持（这是 pi 的约定，没得选）。
+ *
+ * @param levels 探测到的可用档位
+ * @param borrowedClose 关闭思考用的 effort 值。有值时挂到 minimal，
+ *        给用户一个「真正关掉」的可选项。
  */
-export function buildThinkingLevelMap(levels: string[]): Record<string, string | null> {
-	const map: Record<string, string | null> = { off: "none" };
-	for (const level of PROBE_LEVELS) {
+export function buildThinkingLevelMap(
+	levels: string[],
+	borrowedClose?: string,
+): Record<string, string | null> {
+	const map: Record<string, string | null> = { off: borrowedClose ?? "none" };
+
+	// 不支持时必须写 null 才能隐藏
+	for (const level of ["minimal", "low", "medium", "high"] as const) {
+		if (level === BORROWED_CLOSE_LEVEL && borrowedClose !== undefined) {
+			map[level] = borrowedClose;
+			continue;
+		}
 		map[level] = levels.includes(level) ? level : null;
 	}
-	for (const level of HIDDEN_LEVELS) {
-		map[level] = null;
+
+	// 不支持时省略键即可
+	for (const level of ["xhigh", "max"] as const) {
+		if (levels.includes(level)) map[level] = level;
 	}
+
 	return map;
+}
+
+/**
+ * 该格式下「关闭思考」对应的 effort 值。
+ *
+ * 实际值由探测得出（deepseek 认 "off"，mimo 认 "none"）；这里只在没有探测结果时
+ * 按格式给一个默认值。
+ */
+export function closeValueOf(format: string): string | undefined {
+	switch (format) {
+		case "deepseek":
+			return "off";
+		case "openrouter":
+		case "ant-ling":
+			return "none";
+		default:
+			return undefined;
+	}
 }

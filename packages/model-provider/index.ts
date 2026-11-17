@@ -25,7 +25,7 @@ import {
 	type CommandCodeGoConfig,
 } from "./commandcode-go";
 import type { CcgoPlanMode } from "./commandcode-api";
-import { buildThinkingLevelMap, probeThinkingLevels } from "./thinking-probe";
+import { buildThinkingLevelMap, probeThinkingLevels, THINK_FORMATS } from "./thinking-probe";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -91,6 +91,8 @@ export interface StoredModel {
 	maxTokens?: number;
 	cost?: StoredCost;
 	thinkingLevelMap?: Record<string, string | null>;
+	/** 思考参数格式（pi-ai 的 compat.thinkingFormat），由“刷新启用模型思考”实测得出。 */
+	thinkingFormat?: string;
 	/** Command Code 模型目录声明的应答端点，用于 API 通道选路。 */
 	supportedEndpoints?: string[];
 	/** 勾选启用：true/undefined = 启用并显示在 /model；false = 不显示（配置保留）。 */
@@ -179,6 +181,7 @@ function normalizeStoredModels(raw: unknown): StoredModel[] {
 			...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}),
 			...(m.cost ? { cost: m.cost } : {}),
 			...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
+			...(typeof m.thinkingFormat === "string" && m.thinkingFormat ? { thinkingFormat: m.thinkingFormat } : {}),
 			...(Array.isArray(m.supportedEndpoints) ? { supportedEndpoints: m.supportedEndpoints.map(String) } : {}),
 			...(typeof m.enabled === "boolean" ? { enabled: m.enabled } : {}),
 		}));
@@ -546,7 +549,24 @@ async function fetchModelsByApi(api: string, baseUrl: string, apiKey?: string): 
 // 通用注册：builtin + common 供应商
 // =============================================================================
 
+/**
+ * 推断模型的初始思考参数格式。
+ *
+ * 只作为探测前的默认值：真正准确的格式由“刷新启用模型思考”实测写入。
+ * pi-ai 只有命中某个 thinkingFormat 分支才会下发思考参数，不设这个字段
+ * 时无论传什么 reasoning 都会被静默丢弃。
+ *
+ * pi 自带的 detectCompat 只按 provider 名或 baseUrl 判断，聚合供应商
+ * （如 commandcodego）下的模型识别不出来，所以这里按模型 id 兜一个。
+ */
+function inferThinkingFormat(modelId: string): string | undefined {
+	if (/^deepseek[\/-]/i.test(modelId)) return "deepseek";
+	return undefined;
+}
+
 function normalizeModel(m: StoredModel): any {
+	// 实测写入的优先，没测过才按 id 前缀兜个默认值
+	const thinkingFormat = m.thinkingFormat ?? inferThinkingFormat(m.id);
 	const base: any = {
 		id: m.id,
 		name: m.name ?? m.id,
@@ -561,6 +581,7 @@ function normalizeModel(m: StoredModel): any {
 			// pi-ai 默认会在 reasoning 模型上把系统提示词发成 developer 角色，导致 400
 			// “unknown variant `developer`”。这里统一退回 system 角色。
 			supportsDeveloperRole: false,
+			...(thinkingFormat ? { thinkingFormat } : {}),
 		},
 	};
 	if (m.thinkingLevelMap) base.thinkingLevelMap = m.thinkingLevelMap;
@@ -915,10 +936,12 @@ async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void
 }
 
 /**
- * 实测已启用模型真正支持哪些思考档位，写回 thinkingLevelMap。
+ * 实测已启用模型真正支持哪些思考档位，写回 thinkingLevelMap 与 thinkingFormat。
  *
- * 为什么要测：pi 用 thinkingLevelMap 决定 /settings 里能选哪些档，
- * 不探测只能一律给全档，用户选到不支持的档会直接 400。
+ * 为什么必须直连而不是走 pi 的 modelRegistry：
+ *   pi 内部把 reasoning:"off" 转成 undefined，off 档永远发不出去；
+ *   而且是否下发思考参数取决于 thinkingFormat —— 那正是要测的东西，
+ *   没设时所有档位请求完全相同，会全部 200、全部误判为支持。
  */
 async function refreshThinkingLevels(ctx: any, entry: ProviderEntry): Promise<void> {
 	const targets = entry.models.filter(isModelEnabled);
@@ -927,11 +950,23 @@ async function refreshThinkingLevels(ctx: any, entry: ProviderEntry): Promise<vo
 		return;
 	}
 
+	// 直连需要真实地址与密钥
+	const connection = resolveProbeConnection(entry);
+	if (connection === undefined) {
+		ctx.ui.notify("当前供应商无法直连探测（私有协议或未配置地址），已跳过。", "warning");
+		return;
+	}
+	const apiKey = await getProviderApiKey(ctx, [entry.name]);
+	if (!apiKey) {
+		ctx.ui.notify(`未找到 ${entry.name} 的密钥，请先登录或配置 API Key。`, "error");
+		return;
+	}
+
 	const abort = new AbortController();
 	let index = 0;
 	let updated = 0;
 	const unchanged: string[] = [];
-	const errors: string[] = [];
+	const notes: string[] = [];
 
 	try {
 		for (const model of targets) {
@@ -939,28 +974,31 @@ async function refreshThinkingLevels(ctx: any, entry: ProviderEntry): Promise<vo
 			index += 1;
 			ctx.ui.setStatus("model-provider", `正在探测 ${index}/${targets.length}：${model.id}`);
 
-			// 取已注册的模型对象：让它带上正确的 api / provider / baseUrl，
-			// 请求才能由该供应商自己的 streamSimple 处理
-			const registered = findRegisteredModel(ctx, entry.name, model.id);
-			if (!registered) {
-				unchanged.push(model.id);
-				errors.push(`${model.id}：模型未注册到运行时`);
-				continue;
-			}
+			const result = await probeThinkingLevels(
+				{ baseUrl: connection.baseUrl, apiKey, modelId: model.id, formats: THINK_FORMATS },
+				abort.signal,
+				(note) => {
+					ctx.ui.setStatus("model-provider", `正在探测 ${index}/${targets.length}：${model.id} · ${note}`);
+				},
+			);
 
-			const result = await probeThinkingLevels(ctx.modelRegistry, registered, abort.signal, (note) => {
-				ctx.ui.setStatus("model-provider", `正在探测 ${index}/${targets.length}：${model.id} · ${note}`);
-			});
-
-			if (result.levels.length === 0) {
-				// 一档都探不出来：保持原配置不动，避免把认证/网络问题误当成不支持
+			if (result.thinkingFormat === undefined) {
+				// 一种格式都不通：可能是模型不支持思考，也可能是密钥/网络问题，
+				// 无法区分时保持原配置不动，避免误杀
 				unchanged.push(model.id);
 				continue;
 			}
 
 			model.reasoning = true;
-			model.thinkingLevelMap = buildThinkingLevelMap(result.levels);
+			model.thinkingFormat = result.thinkingFormat;
+			// 关闭生效时把实测出的关闭值挂到 minimal，给用户一个真正能关掉的选项
+			model.thinkingLevelMap = buildThinkingLevelMap(result.levels, result.offClosable ? result.closeValue : undefined);
 			updated += 1;
+
+			const summary = result.levels.length > 0 ? result.levels.join("/") : "无";
+			notes.push(
+				`${model.id}：${result.thinkingFormat} 格式，档位 ${summary}${result.offClosable ? `，可关闭（${result.closeValue ?? "开关字段"}）` : "，关不掉"}`,
+			);
 		}
 
 		if (updated > 0) {
@@ -968,31 +1006,35 @@ async function refreshThinkingLevels(ctx: any, entry: ProviderEntry): Promise<vo
 			await saveStore();
 		}
 	} catch (e) {
-		errors.push(e instanceof Error ? e.message : String(e));
+		notes.push(e instanceof Error ? e.message : String(e));
 	} finally {
 		ctx.ui.setStatus("model-provider", undefined);
 	}
 
 	const lines = [`已更新 ${updated} / ${targets.length} 个模型的思考等级。`];
-	if (unchanged.length > 0) lines.push(`\n没探到思考档位（配置保持原样）：${unchanged.join("、")}`);
-	if (errors.length > 0) lines.push(`\n${errors.join("\n")}`);
+	if (notes.length > 0) lines.push("", ...notes);
+	if (unchanged.length > 0) lines.push("", `没探到思考档位（配置保持原样）：${unchanged.join("、")}`);
+	if (updated > 0) lines.push("", "改写配置后需重启 pi 生效。");
 	ctx.ui.notify(lines.join("\n"), updated > 0 ? "info" : "warning");
 }
 
-/** 从运行时找已注册的模型对象，探测时要用它才能走到正确的供应商通道 */
-function findRegisteredModel(ctx: any, provider: string, modelId: string): any {
-	try {
-		const found = ctx?.modelRegistry?.find?.(provider, modelId);
-		if (found) return found;
-	} catch {
-		// 运行时未就绪时退回下面的全量扫描
+/**
+ * 解析直连探测用的端点前缀。
+ *
+ * 只有走标准 chat/completions 的供应商能直连；私有协议（commandcode 的 GO 通道）
+ * 与 Anthropic 协议一律返回 undefined，保持原配置不动。
+ */
+function resolveProbeConnection(entry: ProviderEntry): { baseUrl: string } | undefined {
+	if (entry.kind === "builtin") {
+		// GO 套餐走 /alpha/generate 私有 NDJSON，不是 chat/completions，跳过
+		if (entry.commandcodeGo.planMode !== "api") return undefined;
+		const base = (entry.commandcodeGo.baseUrl || CCGO_BASE_URL).replace(/\/+$/, "");
+		return { baseUrl: `${base}/provider/v1` };
 	}
-	try {
-		const all = ctx?.modelRegistry?.getAll?.() ?? [];
-		return all.find((m: any) => m.provider === provider && m.id === modelId);
-	} catch {
-		return undefined;
-	}
+	// Claude Messages 协议参数结构不同，暂不直连
+	if (entry.api !== "openai-completions") return undefined;
+	const base = (entry.baseUrl || "").trim().replace(/\/+$/, "");
+	return base ? { baseUrl: base } : undefined;
 }
 
 async function addModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
@@ -1545,7 +1587,7 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 		const enabledCount = entry.models.filter(isModelEnabled).length;
 		const items = [
 			"启用模型",
-			"刷新启用模型思考等级",
+			"刷新启用模型思考",
 			"刷新模型",
 			"新增模型",
 			"删除模型",
@@ -1558,7 +1600,7 @@ async function modelOpsMenu(ctx: any, entry: ProviderEntry): Promise<void> {
 		const action = await ctx.ui.select(`模型管理：${entry.name}（启用 ${enabledCount} / 共 ${entry.models.length} 个）`, items);
 		if (!action || action === "返回供应商列表") return;
 		if (action === "启用模型") await toggleModelsFlow(ctx, entry);
-		else if (action === "刷新启用模型思考等级") await refreshThinkingLevels(ctx, entry);
+		else if (action === "刷新启用模型思考") await refreshThinkingLevels(ctx, entry);
 		else if (action === "刷新模型") await refreshCommonModels(ctx, entry);
 		else if (action === "新增模型") await addModelsFlow(ctx, entry);
 		else if (action === "删除模型") await removeModelFlow(ctx, entry);
