@@ -59,7 +59,10 @@ export const SAFETY_RATIO_OPTIONS = [0, 0.8, 0.9, 0.95] as const;
 export const BATCH_MODE_OPTIONS = ["逐步", "并发"] as const;
 
 /** 并发个数选项 */
-export const CONCURRENCY_OPTIONS = [2, 3, 5] as const;
+export const CONCURRENCY_OPTIONS = [2, 5, 10, 20] as const;
+
+/** 并发上限。再高就只是在刷新服务端限流，不会更快。 */
+export const MAX_CONCURRENCY = 20;
 
 /**
  * 给 pi 原生压缩留的余量。
@@ -120,7 +123,7 @@ export function normalizeConfig(raw: unknown): FoldConfig {
   }
 
   if (typeof r.batchConcurrency === "number" && Number.isFinite(r.batchConcurrency)) {
-    base.batchConcurrency = clamp(Math.floor(r.batchConcurrency), 1, 8);
+    base.batchConcurrency = clamp(Math.floor(r.batchConcurrency), 1, MAX_CONCURRENCY);
   }
 
   if (typeof r.foldAtTokens === "number" && Number.isFinite(r.foldAtTokens)) {

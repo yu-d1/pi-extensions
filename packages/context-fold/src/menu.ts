@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { batchModeLabel, DEFAULT_CONFIG, configSummary, loadConfig, saveConfig, tokenLabel, CONCURRENCY_OPTIONS, type FoldConfig } from "./config.js";
+import { batchModeLabel, DEFAULT_CONFIG, configSummary, loadConfig, MAX_CONCURRENCY, saveConfig, tokenLabel, CONCURRENCY_OPTIONS, type FoldConfig } from "./config.js";
 import { startSummarize } from "./run.js";
 import type { FoldState } from "./state.js";
 import { buildStatusText } from "./tools.js";
@@ -56,11 +56,11 @@ async function editSettings(ctx: ExtensionContext): Promise<void> {
       const pick = await ctx.ui.select("同时发起几个摘要请求", CONCURRENCY_CHOICES);
       if (pick === undefined) continue;
       if (pick === "自定义输入") {
-        const input = await ctx.ui.input("并发个数（1-8）", String(next.batchConcurrency));
+        const input = await ctx.ui.input(`并发个数（1-${MAX_CONCURRENCY}）`, String(next.batchConcurrency));
         if (input === undefined) continue;
         const num = Number(input.trim());
-        if (!Number.isFinite(num) || num < 1 || num > 8) {
-          ctx.ui.notify("请输入 1 到 8 之间的数字", "error");
+        if (!Number.isFinite(num) || num < 1 || num > MAX_CONCURRENCY) {
+          ctx.ui.notify(`请输入 1 到 ${MAX_CONCURRENCY} 之间的数字`, "error");
           continue;
         }
         next.batchConcurrency = Math.round(num);
@@ -122,7 +122,7 @@ async function editSettings(ctx: ExtensionContext): Promise<void> {
 }
 
 /** 手动触发一次折叠，绕过阈值判断 */
-async function foldNow(ctx: ExtensionContext, state: FoldState): Promise<void> {
+async function foldNow(ctx: ExtensionContext, state: FoldState, level?: string): Promise<void> {
   if (state.summarizing) {
     ctx.ui.notify("摘要正在生成中，请稍候", "warning");
     return;
@@ -132,7 +132,7 @@ async function foldNow(ctx: ExtensionContext, state: FoldState): Promise<void> {
     return;
   }
 
-  const started = startSummarize(ctx, state, loadConfig());
+  const started = startSummarize(ctx, state, loadConfig(), undefined, undefined, level);
   if (!started) {
     ctx.ui.notify("没有可折叠的区间（需要至少两轮已完成的对话，且区间够大）", "warning");
     return;
@@ -171,7 +171,7 @@ export function registerMenu(pi: ExtensionAPI, state: FoldState): void {
         case "now":
         case "run":
         case "f":
-          await foldNow(ctx, state);
+          await foldNow(ctx, state, typeof pi.getThinkingLevel === "function" ? pi.getThinkingLevel() : undefined);
           return;
         case "config":
         case "settings":

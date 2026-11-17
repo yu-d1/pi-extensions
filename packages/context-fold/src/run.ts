@@ -1,9 +1,9 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { atSafetyLimit, canFoldWindow, effectiveFoldAt, type FoldConfig } from "./config.js";
+import { atSafetyLimit, canFoldWindow, effectiveFoldAt, MAX_CONCURRENCY, type FoldConfig } from "./config.js";
 import { fallbackBatches, normalizeBatches, pickRange, toFoldRange, type BatchPlan, type Candidates } from "./fold.js";
 import type { FoldState } from "./state.js";
 import { foldedEntryIds, reserveBlockIds } from "./state.js";
-import { splitCandidates, summarizeRange, SummarizeError } from "./summarize.js";
+import { splitCandidates, summarizeRange } from "./summarize.js";
 
 /** 连续失败这么多轮后暂停自动折叠 */
 export const MAX_FAILURES = 3;
@@ -50,6 +50,8 @@ export function startSummarize(
   signal?: AbortSignal,
   /** 后台任务结束时回调，用于刷新 footer 状态 */
   onSettled?: () => void,
+  /** 当前会话的思考等级，摘要与切分都跟随它 */
+  reasoning?: string,
 ): boolean {
   if (state.summarizing) return false;
 
@@ -76,7 +78,7 @@ export function startSummarize(
       // 切分：失败就用兜底方案，不影响折叠本身
       let plans: BatchPlan[] | undefined;
       try {
-        plans = await splitCandidates(ctx, { candidates, signal });
+        plans = await splitCandidates(ctx, { candidates, signal, reasoning });
       } catch {
         plans = undefined;
       }
@@ -103,6 +105,7 @@ export function startSummarize(
               range,
               signal,
               topic: batch.topic,
+              reasoning,
             });
             records?.push({
               blockId,
@@ -128,7 +131,7 @@ export function startSummarize(
       };
 
       if (config.batchMode === "parallel") {
-        const limit = Math.max(1, Math.min(8, config.batchConcurrency));
+        const limit = Math.max(1, Math.min(MAX_CONCURRENCY, config.batchConcurrency));
         let cursor = 0;
         const workers = Array.from({ length: Math.min(limit, batches.length) }, async () => {
           while (cursor < batches.length) {
@@ -153,10 +156,8 @@ export function startSummarize(
         state.pending = records;
       }
       state.failures = failed > 0 ? state.failures + 1 : 0;
-    } catch (error) {
-      if (error instanceof SummarizeError || error instanceof Error) {
-        state.failures += 1;
-      }
+    } catch {
+      state.failures += 1;
     } finally {
       state.summarizing = false;
       state.batchTotal = 0;

@@ -97,15 +97,25 @@ export default function contextFold(pi: ExtensionAPI): void {
 
     abort?.abort();
     abort = new AbortController();
+    // 摘要跟随当前会话的思考等级：自己另指定一套只会与对话脱节，
+    // 而且固定传 "off" 在部分供应商上等于不下发任何参数，反而按默认强度思考
+    const level = typeof pi.getThinkingLevel === "function" ? pi.getThinkingLevel() : undefined;
     // 摘要完成时刷新 footer；后台上下文里的 ctx 可能已失效，所以只改状态，
     // 真正的 UI 刷新由下一个边界事件负责
-    const started = startSummarize(ctx, state, config, abort.signal, () => {
-      try {
-        updateStatus(ctx, state);
-      } catch {
-        // 会话已关闭，忽略
-      }
-    });
+    const started = startSummarize(
+      ctx,
+      state,
+      config,
+      abort.signal,
+      () => {
+        try {
+          updateStatus(ctx, state);
+        } catch {
+          // 会话已关闭，忽略
+        }
+      },
+      level,
+    );
     if (started) updateStatus(ctx, state);
     return started;
   };

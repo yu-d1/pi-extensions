@@ -3,9 +3,7 @@ import type { BatchPlan, Candidates, FoldRange } from "./fold.js";
 import { buildFoldPrompt, buildSplitPrompt, buildSummaryHeader, parseSplitResponse, serializeRange } from "./prompt.js";
 import { estimateTokensFromSummary } from "./tokens.js";
 
-/** 摘要输出预算：论文实测中位数 185 token，2K 已经很宽松 */
-const SUMMARY_MAX_TOKENS = 2_000;
-/** 单次摘要请求总超时，避免后台任务一直挂着 */
+/** 摘要请求总超时，避免后台任务一直挂着 */
 const SUMMARY_TIMEOUT_MS = 90_000;
 /** 切分只看用户原话，响应应该很快 */
 const SPLIT_TIMEOUT_MS = 30_000;
@@ -26,6 +24,8 @@ export interface SummarizeInput {
   signal?: AbortSignal;
   /** 本批主题，用作摘要侧重点与摘要头 */
   topic?: string;
+  /** 当前会话的思考等级，与对话保持一致，不另外指定 */
+  reasoning?: string;
 }
 
 export class SummarizeError extends Error {
@@ -68,15 +68,33 @@ function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
 }
 
 /**
+ * 组装请求选项。
+ *
+ * 不设 maxTokens：交给模型自身的输出上限，与 pi 原生压缩的做法一致
+ * （pi 源码：summaries use the model's output limit）。人为压低预算会让
+ * 正文被思维链挤空而导致摘要残缺。
+ *
+ * reasoning 只在模型确实支持且等级不是 off 时传入。pi-ai 内部会把
+ * "off" 直接转成 undefined，传了等于放弃控制，上游反而按默认最高强度思考。
+ */
+function requestOptions(model: unknown, level: string | undefined, signal: AbortSignal): Record<string, unknown> {
+  const options: Record<string, unknown> = { signal };
+  const supportsReasoning = (model as { reasoning?: boolean } | undefined)?.reasoning === true;
+  if (supportsReasoning && level !== undefined && level !== "off") options.reasoning = level;
+  return options;
+}
+
+/**
  * 调用当前模型生成摘要。
  *
- * 关闭 reasoning：推理模型的思维链会把 2K 输出预算吃光，正文摘要变空。
+ * 思考等级跟随当前会话，不再固定关闭：关闭并不能真正省下开销，
+ * 反而可能让上游按默认强度思考并吃光输出预算。
  */
 export async function summarizeRange(
   ctx: ExtensionContext,
   input: SummarizeInput,
 ): Promise<SummaryResult> {
-  const { blockId, branch, range, signal: externalSignal, topic } = input;
+  const { blockId, branch, range, signal: externalSignal, topic, reasoning } = input;
   const model = ctx.model;
   if (model === undefined) throw new SummarizeError("当前没有可用模型");
 
@@ -97,11 +115,7 @@ export async function summarizeRange(
     raw = await ctx.modelRegistry.complete(
       model,
       { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-      {
-        maxTokens: SUMMARY_MAX_TOKENS,
-        reasoning: "off",
-        signal,
-      },
+      requestOptions(model, reasoning, signal) as Parameters<typeof ctx.modelRegistry.complete>[2],
     );
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -109,6 +123,11 @@ export async function summarizeRange(
   }
 
   if (signal.aborted) throw new SummarizeError("摘要请求已取消");
+
+  // 不完整的结果不能当摘要用：截断说明输出上限不够，继续写进上下文会丢信息
+  if ((raw as { stopReason?: string } | undefined)?.stopReason === "length") {
+    throw new SummarizeError("摘要不完整（被输出上限截断）");
+  }
 
   const summary = extractText(raw);
   if (summary.length === 0) throw new SummarizeError("模型返回的摘要为空");
@@ -122,10 +141,9 @@ export async function summarizeRange(
 export interface SplitInput {
   candidates: Candidates;
   signal?: AbortSignal;
+  /** 当前会话的思考等级，与摘要请求保持一致 */
+  reasoning?: string;
 }
-
-/** 切分请求的输出预算：几十条边界，1K 足够 */
-const SPLIT_MAX_TOKENS = 1_500;
 
 /**
  * 让模型决定候选区间怎么切成几批。
@@ -148,7 +166,7 @@ export async function splitCandidates(ctx: ExtensionContext, input: SplitInput):
     raw = await ctx.modelRegistry.complete(
       model,
       { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-      { maxTokens: SPLIT_MAX_TOKENS, reasoning: "off", signal },
+      requestOptions(model, input.reasoning, signal) as Parameters<typeof ctx.modelRegistry.complete>[2],
     );
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -156,6 +174,10 @@ export async function splitCandidates(ctx: ExtensionContext, input: SplitInput):
   }
 
   if (signal.aborted) throw new SummarizeError("切分请求已取消");
+
+  if ((raw as { stopReason?: string } | undefined)?.stopReason === "length") {
+    throw new SummarizeError("切分方案不完整（被输出上限截断）");
+  }
 
   const text = extractText(raw);
   if (text.length === 0) throw new SummarizeError("模型返回的切分方案为空");
