@@ -1,6 +1,13 @@
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { BatchPlan, Candidates, FoldRange } from "./fold.js";
-import { buildFoldPrompt, buildSplitPrompt, buildSummaryHeader, parseSplitResponse, serializeRange } from "./prompt.js";
+import {
+  buildConsolidatePrompt,
+  buildFoldPrompt,
+  buildSplitPrompt,
+  buildSummaryHeader,
+  parseSplitResponse,
+  serializeRange,
+} from "./prompt.js";
 import { estimateTokensFromSummary } from "./tokens.js";
 
 /** 摘要请求总超时，避免后台任务一直挂着 */
@@ -26,6 +33,14 @@ export interface SummarizeInput {
   topic?: string;
   /** 当前会话的思考等级，与对话保持一致，不另外指定 */
   reasoning?: string;
+  /**
+   * 合并折叠时传入旧摘要。
+   *
+   * 旧摘要的原文已经不可见，只有并进新摘要才能保住那部分信息。
+   */
+  previousSummary?: string;
+  /** 本次折叠总共覆盖多少条原文（合并时要算上旧块），用于摘要头 */
+  totalEntryCount?: number;
 }
 
 export class SummarizeError extends Error {
@@ -94,7 +109,7 @@ export async function summarizeRange(
   ctx: ExtensionContext,
   input: SummarizeInput,
 ): Promise<SummaryResult> {
-  const { blockId, branch, range, signal: externalSignal, topic, reasoning } = input;
+  const { blockId, branch, range, signal: externalSignal, topic, reasoning, previousSummary } = input;
   const model = ctx.model;
   if (model === undefined) throw new SummarizeError("当前没有可用模型");
 
@@ -106,6 +121,7 @@ export async function summarizeRange(
     messageCount: range.entryIds.length,
     tokensInRange: range.tokensBefore,
     focus: topic,
+    previousSummary,
   });
 
   const signal = withTimeout(externalSignal, SUMMARY_TIMEOUT_MS);
@@ -134,7 +150,7 @@ export async function summarizeRange(
   if (summary.length < 30) throw new SummarizeError("模型返回的摘要过短");
 
   const tokensAfter = estimateTokensFromSummary(summary);
-  const header = buildSummaryHeader(blockId, range.entryIds.length, summary, topic);
+  const header = buildSummaryHeader(blockId, input.totalEntryCount ?? range.entryIds.length, summary, topic);
 
   return { summary, header, tokensAfter };
 }
@@ -188,4 +204,45 @@ export async function splitCandidates(ctx: ExtensionContext, input: SplitInput):
     const msg = error instanceof Error ? error.message : String(error);
     throw new SummarizeError(`切分方案无法解析: ${msg}`);
   }
+}
+
+/**
+ * 把已经积累的旧摘要压缩成一段。
+ *
+ * 它和本次各批摘要一起并发跑，所以会占用并发额度里的一格。
+ * 失败返回 undefined，调用方退回使用旧摘要原文，不丢内容。
+ */
+export async function mergeSummaries(
+  ctx: ExtensionContext,
+  input: { summaries: string[]; signal?: AbortSignal; reasoning?: string },
+): Promise<string | undefined> {
+  const model = ctx.model;
+  if (model === undefined) return undefined;
+
+  const joined = input.summaries
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .join("\n\n");
+  if (joined.length === 0) return undefined;
+
+  const prompt = buildConsolidatePrompt(joined);
+  const signal = withTimeout(input.signal, SUMMARY_TIMEOUT_MS);
+
+  let raw: unknown;
+  try {
+    raw = await ctx.modelRegistry.complete(
+      model,
+      { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+      requestOptions(model, input.reasoning, signal) as Parameters<typeof ctx.modelRegistry.complete>[2],
+    );
+  } catch {
+    return undefined;
+  }
+
+  if (signal.aborted) return undefined;
+  if ((raw as { stopReason?: string } | undefined)?.stopReason === "length") return undefined;
+
+  const summary = extractText(raw);
+  if (summary.length < 30) return undefined;
+  return summary;
 }

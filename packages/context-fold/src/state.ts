@@ -29,6 +29,14 @@ export interface FoldState {
   lastFoldTokens: number | null;
   /** 基线待重读：刚折叠完，下次 agent_settled 读到的才是折叠后的值 */
   baselinePending: boolean;
+  /**
+   * 真实 token / 本地估算的比值。
+   *
+   * chars/4 对中文偏低（一个字往往就是一个 token），会话里中英混排时
+   * 全部阈值、保留量都会算得偏小。这里用真实 usage 学一个系数修正。
+   * 0 表示还没有可用样本。
+   */
+  tokenScale: number;
   /** 正在后台生成摘要 */
   summarizing: boolean;
   /** 摘要已生成，等待在下一个边界应用（多批时会有多条） */
@@ -47,6 +55,7 @@ export function createState(): FoldState {
     nextSeq: 1,
     lastFoldTokens: null,
     baselinePending: false,
+    tokenScale: 0,
     summarizing: false,
     pending: undefined,
     batchTotal: 0,
@@ -60,6 +69,7 @@ export function resetState(state: FoldState): void {
   state.nextSeq = 1;
   state.lastFoldTokens = null;
   state.baselinePending = false;
+  state.tokenScale = 0;
   state.summarizing = false;
   state.pending = undefined;
   state.batchTotal = 0;
@@ -136,10 +146,24 @@ export function onBranch(branch: SessionEntry[], entryId: string): boolean {
 }
 
 /** 已被折叠过的条目 id 集合，选新区间时用来跳过 */
-export function foldedEntryIds(state: FoldState): Set<string> {
+/**
+ * 已被折叠过的条目 id 集合，选新区间时用来跳过。
+ *
+ * 除了记录里的 entryIds，还要看分支上实际生效的 context_edit：
+ * 折叠记录可能因为切分支、回退而不在当前分支上，但那些条目
+ * 依然已经被摘要替代了。只看记录会把它们当成未折叠内容再折一遍。
+ */
+export function foldedEntryIds(state: FoldState, branch?: SessionEntry[]): Set<string> {
   const ids = new Set<string>();
   for (const record of state.records.values()) {
     for (const id of record.entryIds) ids.add(id);
+  }
+  if (branch !== undefined) {
+    for (const entry of branch) {
+      if (entry.type !== "context_edit") continue;
+      ids.add((entry as { targetId?: string }).targetId ?? "");
+    }
+    ids.delete("");
   }
   return ids;
 }

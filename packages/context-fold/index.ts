@@ -5,6 +5,7 @@ import { registerMenu } from "./src/menu.js";
 import { buildSummaryHeader } from "./src/prompt.js";
 import { MAX_FAILURES, shouldFold, startSummarize } from "./src/run.js";
 import { createState, foldedEntryIds, onBranch, rebuildFromBranch, resetState, sortedRecords, type FoldState } from "./src/state.js";
+import { computeTokenScale } from "./src/tokens.js";
 import { registerTools } from "./src/tools.js";
 
 const STATUS_KEY = "context-fold";
@@ -31,33 +32,68 @@ function branchOf(ctx: ExtensionContext): SessionEntry[] {
 }
 
 /** 把 pending 转成待追加条目；逐批校验，对不上的那批丢弃 */
+/**
+ * 把待生效的折叠写进上下文。
+ *
+ * pending 里只有一条记录：它已经包含了旧摘要与新内容的合并结果，
+ * 所以这里只需要把旧块原有的摘要头条目清空，再把本块头条目换成
+ * 新摘要，其余条目一律从投影中移除。上下文里始终只有一份摘要。
+ */
+/**
+ * 把待生效的块写进上下文。
+ *
+ * 待生效里可能同时有合并块与本次新块。合并块复用了最早旧块的编号与头位置，
+ * 所以那些旧块要先从上下文和状态里清掉，否则两份摘要会同时挂在上面。
+ */
 function drainPending(state: FoldState, branch: SessionEntry[]): Array<Record<string, unknown>> | undefined {
   const pending = state.pending;
   if (pending === undefined) return undefined;
   state.pending = undefined;
 
-  const folded = foldedEntryIds(state);
   const all: Array<Record<string, unknown>> = [];
+
+  // 待生效里如果有一个编号已在状态中的块，说明本次做了合并，
+  // 它顶替了其他旧块的位置，那些旧块要清掉。
+  // 合并失败时 pending 里只有新块，旧块原封不动。
+  const mergeBlockId = pending.find((r) => state.records.has(r.blockId))?.blockId;
+
+  if (mergeBlockId !== undefined) {
+    for (const old of sortedRecords(state)) {
+      if (old.blockId === mergeBlockId) continue;
+      if (!onBranch(branch, old.headEntryId)) continue;
+      all.push({ type: "context_edit", targetId: old.headEntryId, replacement: null });
+      state.records.delete(old.blockId);
+    }
+  }
+
+  // 已在上下文里躺着的条目，不需要再发一次 context_edit
+  const already = foldedEntryIds(state, branch);
 
   for (const record of pending) {
     // 头部不在当前分支上，说明被 /tree 切走了
     if (!onBranch(branch, record.headEntryId)) continue;
 
-    // 区间内已有条目被折叠过，状态错乱，丢弃这一批
-    if (record.entryIds.some((id) => folded.has(id))) continue;
+    // 合并块会覆盖旧块已折叠的条目，这是正常的；新块区间不该有重叠。
+    const isMerge = record.blockId === mergeBlockId;
+    if (!isMerge && record.entryIds.some((id) => already.has(id))) continue;
 
+    const header = buildSummaryHeader(record.blockId, record.entryIds.length, record.summary, record.topic);
     const range: FoldRange = {
       entryIds: record.entryIds,
       headEntryId: record.headEntryId,
       tokensBefore: record.tokensBefore,
     };
-    const header = buildSummaryHeader(record.blockId, record.entryIds.length, record.summary, record.topic);
     const drafts = buildDrafts(range, record.blockId, record.summary, header, record.tokensAfter, record.topic);
 
+    // 只有头条目真正需要写摘要，其余条目早在旧块里就已置空
+    const edits = (drafts.entries as Array<Record<string, unknown>>).filter((e) => {
+      if (e.type !== "context_edit") return true;
+      if (e.targetId === record.headEntryId) return true;
+      return !already.has(e.targetId as string);
+    });
+
     state.records.set(record.blockId, drafts.record);
-    // 后续批次要与这一批的去重集合比对，避免区间交叉
-    for (const id of record.entryIds) folded.add(id);
-    all.push(...(drafts.entries as unknown as Array<Record<string, unknown>>));
+    all.push(...edits);
   }
 
   return all.length > 0 ? all : undefined;
@@ -130,8 +166,27 @@ export default function contextFold(pi: ExtensionAPI): void {
     }
   };
 
+  /**
+   * 用真实 usage 校准本地估算的比例。
+   *
+   * chars/4 对中文偏低，折叠后 pi 回退到该估算，状态栏就会显示得比实际小。
+   * 每轮拿最近一条真实 usage 算一次，平滑一下避免单次抖动。
+   */
+  const syncTokenScale = (ctx: ExtensionContext): void => {
+    try {
+      const messages = ctx.sessionManager.buildSessionProjection().messages;
+      const next = computeTokenScale(messages);
+      if (next === undefined) return;
+      // 首次直接采用，之后小幅跟随，避免个别异常样本把系数拉飞
+      state.tokenScale = state.tokenScale === 0 ? next : state.tokenScale * 0.7 + next * 0.3;
+    } catch {
+      // 投影不可用时跳过，保持上一个值
+    }
+  };
+
   pi.on("agent_settled", async (_event, ctx) => {
     syncBaseline(ctx);
+    syncTokenScale(ctx);
     triggerFold(ctx);
   });
 

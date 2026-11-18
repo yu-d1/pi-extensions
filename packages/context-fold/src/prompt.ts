@@ -102,12 +102,31 @@ export interface PromptInput {
   tokensInRange: number;
   /** 模型指定的摘要侧重点：哪些结论必须留住 */
   focus?: string;
+  /**
+   * 已有的旧摘要（合并折叠时传入）。
+   *
+   * 旧摘要覆盖的是更早的历史，它的原文已经不可见了，
+   * 所以必须并进新摘要，否则那部分信息彻底丢失。
+   */
+  previousSummary?: string;
 }
 
 export function buildFoldPrompt(input: PromptInput): string {
+  const merging = input.previousSummary !== undefined && input.previousSummary.trim().length > 0;
   return [
-    "你要为一段即将从上下文中折叠掉的对话历史生成摘要。",
+    merging
+      ? "你要把一份旧摘要和一段新的对话历史合并成一份新摘要。"
+      : "你要为一段即将从上下文中折叠掉的对话历史生成摘要。",
     "摘要会替代原文继续参与后续对话，所以它必须承载后续任务真正需要的信息。",
+    ...(merging
+      ? [
+          "",
+          "## 合并要求",
+          "旧摘要对应的原文已经不在上下文里了，只有旧摘要还在。",
+          "新摘要要同时覆盖旧摘要的全部要点和下面这段新对话，不要丢掉旧摘要里的路径、决定和未解决问题。",
+          "合并后应当是一份完整的、按时间顺序的历史，读起来不像两段拼接。",
+        ]
+      : []),
     "",
     "## 必须逐字保留",
     "- 文件路径与行号（例如 src/config.ts:120）",
@@ -140,6 +159,7 @@ export function buildFoldPrompt(input: PromptInput): string {
     "- 不要写「总结如下」之类的开场白",
     "- 按时间顺序组织",
     "",
+    ...(merging ? ["<previous_summary>", neutralize(input.previousSummary!.trim()), "</previous_summary>", ""] : []),
     `本段包含 ${input.messageCount} 条消息，约 ${input.tokensInRange} tokens。`,
     "",
     "<conversation>",
@@ -160,6 +180,46 @@ export function buildSummaryHeader(
       ? `[历史摘要 ${blockId} · 覆盖 ${messageCount} 条消息 · ${topic.trim()}]`
       : `[历史摘要 ${blockId} · 覆盖 ${messageCount} 条消息]`;
   return [title, "", summary, "", `需要原文时调用 recall("${blockId}")。`].join("\n");
+}
+
+/**
+ * 把已经积累的旧摘要压缩成一段。
+ *
+ * 它是并发任务里的一格，和新内容的各批摘要同时跑，
+ * 结果作为最终摘要的开头一段接在本次各批结果之前。
+ */
+/**
+ * 把已经折叠过的各块摘要压成一段。
+ *
+ * 它承载的是整段旧历史，目标是尽量短；本次刚折的新内容另存为独立的块，
+ * 细节在那几块里，所以这里可以放心地只留骨架。
+ */
+export function buildConsolidatePrompt(summaries: string): string {
+  return [
+    "下面几段是同一个会话已经折叠过的历史摘要，按时间顺序排列。",
+    "你要把它们压成一段。这段会作为整段旧历史的唯一记录长期保留。",
+    "",
+    "## 必须保留",
+    "- 用户明确提出的约束、偏好与禁止事项",
+    "- 已做出的决定及其理由，尤其是被推翻过的方案",
+    "- 关键文件路径、函数名、配置项名",
+    "- 尚未解决的问题和已知风险",
+    "",
+    "## 尽量压缩",
+    "- 探索过程只留结论，不要写试了哪些、失败了哪些",
+    "- 工具输出、日志、报错原文只要最终结论，不要贴原文",
+    "- 已经彻底结束、与后续无关的子任务只需一句带过",
+    "- 重复出现过的内容只写一次",
+    "",
+    "## 输出",
+    "- 一段连贯的纯文本，能独立读懂",
+    "- 不要分小标题、不要列表分段、不要开场白",
+    "- 越早期的内容压得越紧，越靠近结尾的保留得越具体",
+    "",
+    "<summaries>",
+    neutralize(summaries),
+    "</summaries>",
+  ].join("\n");
 }
 
 export interface SplitPromptInput {

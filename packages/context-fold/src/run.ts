@@ -1,9 +1,58 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { atSafetyLimit, canFoldWindow, effectiveFoldAt, MAX_CONCURRENCY, type FoldConfig } from "./config.js";
 import { fallbackBatches, normalizeBatches, pickRange, toFoldRange, type BatchPlan, type Candidates } from "./fold.js";
-import type { FoldState } from "./state.js";
-import { foldedEntryIds, reserveBlockIds } from "./state.js";
-import { splitCandidates, summarizeRange } from "./summarize.js";
+import type { FoldRecord, FoldState } from "./state.js";
+import { foldedEntryIds, reserveBlockIds, sortedRecords } from "./state.js";
+import { mergeSummaries, splitCandidates, summarizeRange } from "./summarize.js";
+
+/**
+ * 产出本次折叠要写进上下文的记录。
+ *
+ * 形态：1 个合并块 + N 个新块。
+ *   合并块承载全部历史，用一个块就够了，块数不会随折叠次数增长；
+ *   新块对应本次切分出的子任务，各存细节，recall 时能精确取回。
+ */
+function collect(fresh: FoldRecord[], merged: FoldRecord | undefined): FoldRecord[] {
+  const blocks = fresh.filter((r) => r.summary.trim().length > 0);
+  if (merged !== undefined && merged.summary.trim().length > 0) blocks.unshift(merged);
+  return blocks;
+}
+
+/**
+ * 把现有各块的摘要压成一段。
+ *
+ * 复用最早一块的编号与头位置：它在上下文里本来就排在最前，
+ * 原地换成新摘要，后面的字节不受影响，前缀缓存命中最大化。
+ * entryIds 累积所有块的全部条目，recall 仍能取回最早的历史原文。
+ */
+function buildMerged(
+  base: FoldRecord,
+  records: FoldRecord[],
+  summary: string,
+): FoldRecord {
+  const entryIds: string[] = [];
+  const seen = new Set<string>();
+  for (const record of records) {
+    for (const id of record.entryIds) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entryIds.push(id);
+    }
+  }
+  // 头条目必须排第一，它承载摘要正文
+  const rest = entryIds.filter((id) => id !== base.headEntryId);
+  return {
+    blockId: base.blockId,
+    entryIds: [base.headEntryId, ...rest],
+    headEntryId: base.headEntryId,
+    summary,
+    topic: base.topic,
+    // 旧块之间可能已有包含关系，累加会虚高；取去重后的总量
+    tokensBefore: records.reduce((sum, r) => sum + r.tokensBefore, 0),
+    tokensAfter: Math.round(summary.length / 4),
+    createdAt: Date.now(),
+  };
+}
 
 /** 连续失败这么多轮后暂停自动折叠 */
 export const MAX_FAILURES = 3;
@@ -61,11 +110,14 @@ export function startSummarize(
   const picked = pickRange(branch, {
     config,
     foldAtTokens: effectiveFoldAt(config, window),
-    folded: foldedEntryIds(state),
+    folded: foldedEntryIds(state, branch),
+    currentTokens: usage?.tokens ?? undefined,
+    tokenScale: state.tokenScale,
   });
   if (picked.candidates === undefined) return false;
 
   const candidates = picked.candidates;
+
   state.summarizing = true;
   state.batchDone = 0;
   state.batchTotal = 0;
@@ -87,9 +139,16 @@ export function startSummarize(
       const batches = planBatches(candidates, plans);
       if (batches.length === 0) return;
 
-      // 编号一次预留，并发完成顺序不会影响块顺序
+      // 编号一次预留，并发完成顺序不会影响块顺序。
+      // 合并块复用最早旧块的编号，不占新号。
+      const oldBlocks = sortedRecords(state);
+      const base = oldBlocks[0];
       const blockIds = reserveBlockIds(state, batches.length);
-      state.batchTotal = batches.length;
+
+      // 任务表：N 个摘要 +（有旧块时）1 个合并
+      state.batchTotal = batches.length + (base !== undefined ? 1 : 0);
+
+      let mergedRecord: FoldRecord | undefined;
 
       const runOne = async (batch: BatchPlan, blockId: string): Promise<void> => {
         const range = toFoldRange(candidates, batch);
@@ -130,14 +189,35 @@ export function startSummarize(
         onSettled?.();
       };
 
+      // 合并任务：把现有各块压成一段。与各批摘要一起排队，不额外拖尾。
+      // 失败就保留旧块原样，下次折叠再试，不影响本次新块写入。
+      const runMerge = async (): Promise<void> => {
+        if (base === undefined || signal?.aborted) return;
+        try {
+          const merged = await mergeSummaries(ctx, {
+            summaries: oldBlocks.map((r) => r.summary),
+            signal,
+            reasoning,
+          });
+          if (merged !== undefined) mergedRecord = buildMerged(base, oldBlocks, merged);
+        } catch {
+          // 保留旧块，不记为失败
+        }
+        state.batchDone += 1;
+        onSettled?.();
+      };
+
       if (config.batchMode === "parallel") {
         const limit = Math.max(1, Math.min(MAX_CONCURRENCY, config.batchConcurrency));
+        const tasks: Array<() => Promise<void>> = batches.map((b, i) => () => runOne(b, blockIds[i]));
+        if (base !== undefined) tasks.push(() => runMerge());
+
         let cursor = 0;
-        const workers = Array.from({ length: Math.min(limit, batches.length) }, async () => {
-          while (cursor < batches.length) {
+        const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+          while (cursor < tasks.length) {
             const i = cursor++;
             if (signal?.aborted) return;
-            await runOne(batches[i], blockIds[i]);
+            await tasks[i]();
           }
         });
         await Promise.all(workers);
@@ -148,13 +228,13 @@ export function startSummarize(
           // 串行时某一个失败就停，没必要继续烧钱
           if (failed > 0) break;
         }
+        if (failed === 0) await runMerge();
       }
 
       if (signal?.aborted) return;
 
-      if (records !== undefined && records.length > 0) {
-        state.pending = records;
-      }
+      const blocks = collect(records ?? [], mergedRecord);
+      if (blocks.length > 0) state.pending = blocks;
       state.failures = failed > 0 ? state.failures + 1 : 0;
     } catch {
       state.failures += 1;

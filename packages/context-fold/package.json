@@ -1,6 +1,6 @@
 {
   "name": "@liziy/context-fold",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "description": "AI 上下文折叠扩展 —— 对话变长后后台静默压缩历史，保留原文随时可查，与 pi 原生压缩共存",
   "keywords": [
     "pi-extension",

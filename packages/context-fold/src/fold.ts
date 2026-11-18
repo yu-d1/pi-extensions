@@ -141,6 +141,10 @@ export interface PickOptions {
   foldAtTokens: number;
   /** 已被折叠过的条目 id */
   folded: Set<string>;
+  /** 当前投影的真实 token，用于判断折完是否还有意义 */
+  currentTokens?: number;
+  /** 真实 token / 本地估算的比值，用于把保留量换算成真实口径 */
+  tokenScale?: number;
 }
 
 /**
@@ -153,30 +157,51 @@ export function pickRange(branch: SessionEntry[], options: PickOptions): PickRes
   const turns = splitTurns(branch);
   if (turns.length === 0) return { reason: "no-turns" };
 
-  // 最后一个 turn 是当前任务，永远保留
-  const usable = turns.slice(0, -1);
-  if (usable.length === 0) return { reason: "no-completed-turns" };
-
-  // 第一个 turn 不特殊保护。长会话里首轮可能跑了几十条工具调用，
-  // 而且用户的需求早都换过好几轮了，留着它只会白白占上下文。
-  const candidates = usable;
+  // 最后一个 turn 是当前任务。它通常已经跑完（agent_before_settle 阶段），
+  // 可以一起参与折叠；但末尾还悬着 toolCall 时说明结果没回来，
+  // 折掉会让 toolResult 变成孤儿，pi 直接报错，这种轮次必须整轮保留。
+  const current = turns[turns.length - 1];
+  const candidates = isTurnComplete(branch, current) ? turns : turns.slice(0, -1);
+  if (candidates.length === 0) return { reason: "no-completed-turns" };
 
   // 保留量不能占满整个阈值，否则折完也省不下空间
   const keepBudget = Math.max(
     MIN_KEEP_TOKENS,
     Math.min(options.config.keepRecentTokens, Math.max(MIN_KEEP_TOKENS, options.foldAtTokens - MIN_HEADROOM_TOKENS)),
   );
+  // 保留量按真实 token 理解，而 turn.tokens 是 chars/4 估算，
+  // 中文多的会话里两者差 30% 以上，不换算会实际多留一大截
+  const scale = options.tokenScale !== undefined && options.tokenScale > 0 ? options.tokenScale : 1;
 
-  // 从尾部往前保留 keepBudget
+  // 从尾部往前累加「未被折叠」的量。
+  // 已折叠的条目在上下文里只剩摘要，不能再按原始大小占预算，
+  // 否则保留量会被虚高的数字填满，实际保留了远多于配置的量。
   let kept = 0;
   let cut = candidates.length;
   for (let i = candidates.length - 1; i >= 0; i--) {
-    if (kept >= keepBudget) break;
-    kept += candidates[i].tokens;
+    const live = liveTokensOf(candidates[i], options.folded);
+    if (live === 0) {
+      // 整轮已折叠过，既不占预算也不阻断向前推进
+      cut = i;
+      continue;
+    }
+    // 放不下就整轮保留，不再多带一轮（边界只能落在轮首）
+    if ((kept + live) * scale > keepBudget) {
+      // 一轮自己就超预算时（轮内不能切分），至少要保住它，
+      // 否则会把当前任务一起折掉；此外的轮全部可折。
+      if (kept === 0) {
+        cut = i;
+        break;
+      }
+      cut = i + 1;
+      break;
+    }
+    kept += live;
     cut = i;
   }
 
-  if (cut === 0) return { reason: "nothing-beyond-protection" };
+  // cut 到底说明全部都得保留，没有可折的部分
+  if (cut >= candidates.length) return { reason: "nothing-beyond-protection" };
 
   // 防御：再对照一次 branch，确保交给 context_edit 的条目都能被编辑
   const index = new Map(branch.map((entry) => [entry.id, entry]));
@@ -209,7 +234,47 @@ export function pickRange(branch: SessionEntry[], options: PickOptions): PickRes
   // 区间太薄，白付一次摘要费用
   if (totalTokens < options.config.minFoldTokens) return { reason: "range-too-small" };
 
+  // 折完还是接近阈值，说明保留量把预算占满了，这次折叠没意义。
+  // 基准用当前投影的真实 token：currentTokens 与 foldAtTokens 同口径。
+  if (options.currentTokens !== undefined) {
+    const savedAfter = options.currentTokens - totalTokens * scale;
+    if (savedAfter >= options.foldAtTokens) return { reason: "insufficient-headroom" };
+  }
+
   return { candidates: { turns: picked, totalTokens } };
+}
+
+/** 一轮里未被折叠过的 token（已折叠部分在上下文里只剩摘要，不再占预算） */
+function liveTokensOf(turn: Turn, folded: Set<string>): number {
+  if (turn.tokens === 0) return 0;
+  let live = 0;
+  for (const id of turn.entryIds) if (!folded.has(id)) live += 1;
+  if (live === 0) return 0;
+  if (live === turn.entryIds.length) return turn.tokens;
+  return Math.round((turn.tokens * live) / turn.entryIds.length);
+}
+
+/**
+ * 一轮是否已经收尾。
+ *
+ * 收尾 = 没有悬着的 toolCall。末尾是 toolResult 或 user 则安全；
+ * 若最后一个条目是 assistant 且带 toolCall，说明结果还没回来，
+ * 折掉会让 toolResult 变成孤儿（pi 会直接报错）。
+ */
+function isTurnComplete(branch: SessionEntry[], turn: Turn): boolean {
+  for (let i = turn.end - 1; i >= turn.start; i--) {
+    const entry = branch[i];
+    if (entry?.type !== "message") continue;
+    const role = entry.message.role;
+    if (role === "toolResult" || role === "user") return true;
+    const content = entry.message.content;
+    if (!Array.isArray(content)) return true;
+    return !content.some((block) => {
+      const b = block as Record<string, unknown> | null;
+      return b !== null && typeof b === "object" && b.type === "toolCall";
+    });
+  }
+  return false;
 }
 
 /** 取一轮里的 user 原话，切分时给模型看的就是这段 */

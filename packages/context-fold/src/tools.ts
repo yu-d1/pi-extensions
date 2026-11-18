@@ -12,6 +12,7 @@ function text(value: string) {
   return { content: [{ type: "text" as const, text: value }] };
 }
 
+
 /** 超长时保留头尾：折叠块里最可能被需要的是结尾（刚做完的事、最后的报错） */
 function clipHeadsAndTails(text: string, max: number): string {
   if (text.length <= max) return text;
@@ -120,6 +121,11 @@ export function buildStatusText(state: FoldState, ctx: ExtensionContext): string
   lines.push(
     `触发阈值: ${tokenLabel(foldAt)}${capped ? `（设定 ${tokenLabel(config.foldAtTokens)}，受窗口限制）` : ""}  保留最近: ${tokenLabel(config.keepRecentTokens)}`,
   );
+  // 系数明显偏离 1 时提示一下：阈值与保留量按真实 token 生效，
+  // 而折叠刚完成时 pi 会回退到估算，两个数字会短暂对不上
+  if (state.tokenScale > 0 && Math.abs(state.tokenScale - 1) > 0.1) {
+    lines.push(`估算校正: 真实 token ≈ 本地估算 × ${state.tokenScale.toFixed(2)}（用于阈值与保留量）`);
+  }
   lines.push(
     `保底触发: ${safetyLabel}  执行方式: ${batchModeLabel(config.batchMode)}${config.batchMode === "parallel" ? `（${config.batchConcurrency}）` : ""}`,
   );
