@@ -45,6 +45,22 @@ function branchOf(ctx: ExtensionContext): SessionEntry[] {
  * 待生效里可能同时有合并块与本次新块。合并块复用了最早旧块的编号与头位置，
  * 所以那些旧块要先从上下文和状态里清掉，否则两份摘要会同时挂在上面。
  */
+/**
+ * 这个头条目当前是否还在上下文里显示内容。
+ *
+ * 折叠会把条目改成 null 从上下文移除，被后续折叠清理掉的块
+ * 它的头已经不在投影里了，不需要再发一次编辑。
+ */
+function stillVisible(branch: SessionEntry[], targetId: string): boolean {
+  let visible = true;
+  for (const entry of branch) {
+    if (entry.type !== "context_edit") continue;
+    if ((entry as { targetId?: string }).targetId !== targetId) continue;
+    visible = (entry as { replacement?: unknown }).replacement !== null;
+  }
+  return visible;
+}
+
 function drainPending(state: FoldState, branch: SessionEntry[]): Array<Record<string, unknown>> | undefined {
   const pending = state.pending;
   if (pending === undefined) return undefined;
@@ -52,15 +68,21 @@ function drainPending(state: FoldState, branch: SessionEntry[]): Array<Record<st
 
   const all: Array<Record<string, unknown>> = [];
 
-  // 待生效里如果有一个编号已在状态中的块，说明本次做了合并，
-  // 它顶替了其他旧块的位置，那些旧块要清掉。
+  // 待生效里如果有一个 merged 块，说明本次做了合并，旧块要全部清掉。
   // 合并失败时 pending 里只有新块，旧块原封不动。
-  const mergeBlockId = pending.find((r) => state.records.has(r.blockId))?.blockId;
+  const mergeBlock = pending.find((r) => r.merged === true);
 
-  if (mergeBlockId !== undefined) {
+  if (mergeBlock !== undefined) {
     for (const old of sortedRecords(state)) {
-      if (old.blockId === mergeBlockId) continue;
-      if (!onBranch(branch, old.headEntryId)) continue;
+      if (!onBranch(branch, old.headEntryId)) {
+        state.records.delete(old.blockId);
+        continue;
+      }
+      // 已经不在上下文里显示摘要的，只需清状态
+      if (!stillVisible(branch, old.headEntryId)) {
+        state.records.delete(old.blockId);
+        continue;
+      }
       all.push({ type: "context_edit", targetId: old.headEntryId, replacement: null });
       state.records.delete(old.blockId);
     }
@@ -74,7 +96,7 @@ function drainPending(state: FoldState, branch: SessionEntry[]): Array<Record<st
     if (!onBranch(branch, record.headEntryId)) continue;
 
     // 合并块会覆盖旧块已折叠的条目，这是正常的；新块区间不该有重叠。
-    const isMerge = record.blockId === mergeBlockId;
+    const isMerge = record.merged === true;
     if (!isMerge && record.entryIds.some((id) => already.has(id))) continue;
 
     const header = buildSummaryHeader(record.blockId, record.entryIds.length, record.summary, record.topic);

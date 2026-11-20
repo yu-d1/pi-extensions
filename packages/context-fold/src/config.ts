@@ -5,6 +5,17 @@ import { join } from "node:path";
 /** 多批折叠的执行方式 */
 export type BatchMode = "serial" | "parallel";
 
+/** 折叠模型引用：指定用哪个模型、用多强的思考 */
+export interface FoldModelRef {
+  provider: string;
+  modelId: string;
+  /** off / low / medium / high，模型不支持思考时忽略 */
+  reasoning: string;
+}
+
+/** 思考等级选项，与 pi 的 ThinkingLevel 一致 */
+export const REASONING_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
 /** 折叠设置。字段少是刻意的，暴露太多反而不知道该调哪个。 */
 export interface FoldConfig {
   /** 是否启用自动折叠 */
@@ -23,6 +34,13 @@ export interface FoldConfig {
   batchMode: BatchMode;
   /** 并发时的同时请求数 */
   batchConcurrency: number;
+  /**
+   * 折叠用的模型链，按顺序降级。
+   *
+   * 空数组表示跟随当前会话的模型与思考等级；非空时逐个尝试，
+   * 第一个跑不通就换下一个。所以顺序就是优先级。
+   */
+  foldModels: FoldModelRef[];
 }
 
 export const DEFAULT_CONFIG: FoldConfig = {
@@ -34,6 +52,7 @@ export const DEFAULT_CONFIG: FoldConfig = {
   minFoldTokens: 8_000,
   batchMode: "serial",
   batchConcurrency: 3,
+  foldModels: [],
 };
 
 /**
@@ -147,6 +166,20 @@ export function normalizeConfig(raw: unknown): FoldConfig {
     base.minFoldTokens = clamp(Math.floor(r.minFoldTokens), 1_000, 100_000);
   }
 
+  if (Array.isArray(r.foldModels)) {
+    base.foldModels = r.foldModels.flatMap((item) => {
+      if (item === null || typeof item !== "object") return [];
+      const o = item as Record<string, unknown>;
+      if (typeof o.provider !== "string" || typeof o.modelId !== "string") return [];
+      if (o.provider.length === 0 || o.modelId.length === 0) return [];
+      const reasoning =
+        typeof o.reasoning === "string" && (REASONING_OPTIONS as readonly string[]).includes(o.reasoning)
+          ? o.reasoning
+          : "off";
+      return [{ provider: o.provider, modelId: o.modelId, reasoning }];
+    });
+  }
+
   return base;
 }
 
@@ -202,5 +235,12 @@ export function configSummary(config: FoldConfig): string[] {
   if (config.batchMode === "parallel") {
     lines.push(`并发个数: ${config.batchConcurrency}`);
   }
+  lines.push(`折叠模型: ${foldModelsLabel(config.foldModels)}`);
   return lines;
+}
+
+/** 模型链的可读描述 */
+export function foldModelsLabel(refs: FoldModelRef[]): string {
+  if (refs.length === 0) return "跟随会话";
+  return refs.map((r) => `${r.provider}/${r.modelId}(${r.reasoning})`).join(" → ");
 }

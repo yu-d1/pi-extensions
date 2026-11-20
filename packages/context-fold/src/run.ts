@@ -21,11 +21,14 @@ function collect(fresh: FoldRecord[], merged: FoldRecord | undefined): FoldRecor
 /**
  * 把现有各块的摘要压成一段。
  *
- * 复用最早一块的编号与头位置：它在上下文里本来就排在最前，
- * 原地换成新摘要，后面的字节不受影响，前缀缓存命中最大化。
+ * 用新编号而不是复用旧块的：旧块的 fold-record 一旦写进会话就删不掉，
+ * 复用编号会让同一个 id 在文件里出现多次，重建时分不清哪份是最新的。
+ * 排在最前靠 merged 标记，不靠编号。
+ *
  * entryIds 累积所有块的全部条目，recall 仍能取回最早的历史原文。
  */
 function buildMerged(
+  blockId: string,
   base: FoldRecord,
   records: FoldRecord[],
   summary: string,
@@ -42,7 +45,7 @@ function buildMerged(
   // 头条目必须排第一，它承载摘要正文
   const rest = entryIds.filter((id) => id !== base.headEntryId);
   return {
-    blockId: base.blockId,
+    blockId,
     entryIds: [base.headEntryId, ...rest],
     headEntryId: base.headEntryId,
     summary,
@@ -51,6 +54,7 @@ function buildMerged(
     tokensBefore: records.reduce((sum, r) => sum + r.tokensBefore, 0),
     tokensAfter: Math.round(summary.length / 4),
     createdAt: Date.now(),
+    merged: true,
   };
 }
 
@@ -130,7 +134,7 @@ export function startSummarize(
       // 切分：失败就用兜底方案，不影响折叠本身
       let plans: BatchPlan[] | undefined;
       try {
-        plans = await splitCandidates(ctx, { candidates, signal, reasoning });
+        plans = await splitCandidates(ctx, { candidates, signal, reasoning, config });
       } catch {
         plans = undefined;
       }
@@ -140,13 +144,17 @@ export function startSummarize(
       if (batches.length === 0) return;
 
       // 编号一次预留，并发完成顺序不会影响块顺序。
-      // 合并块复用最早旧块的编号，不占新号。
+      // 合并块也占一个新号：旧块的 fold-record 删不掉，复用编号会让
+      // 同一个 id 在会话文件里出现多次，重建时分不清哪份最新。
       const oldBlocks = sortedRecords(state);
       const base = oldBlocks[0];
-      const blockIds = reserveBlockIds(state, batches.length);
+      const needsMerge = base !== undefined;
+      const blockIds = reserveBlockIds(state, batches.length + (needsMerge ? 1 : 0));
+      const mergeBlockId = needsMerge ? blockIds[blockIds.length - 1] : undefined;
+      const batchBlockIds = needsMerge ? blockIds.slice(0, -1) : blockIds;
 
       // 任务表：N 个摘要 +（有旧块时）1 个合并
-      state.batchTotal = batches.length + (base !== undefined ? 1 : 0);
+      state.batchTotal = batches.length + (needsMerge ? 1 : 0);
 
       let mergedRecord: FoldRecord | undefined;
 
@@ -165,6 +173,7 @@ export function startSummarize(
               signal,
               topic: batch.topic,
               reasoning,
+              config,
             });
             records?.push({
               blockId,
@@ -192,14 +201,15 @@ export function startSummarize(
       // 合并任务：把现有各块压成一段。与各批摘要一起排队，不额外拖尾。
       // 失败就保留旧块原样，下次折叠再试，不影响本次新块写入。
       const runMerge = async (): Promise<void> => {
-        if (base === undefined || signal?.aborted) return;
+        if (!needsMerge || mergeBlockId === undefined || signal?.aborted) return;
         try {
           const merged = await mergeSummaries(ctx, {
             summaries: oldBlocks.map((r) => r.summary),
             signal,
             reasoning,
+            config,
           });
-          if (merged !== undefined) mergedRecord = buildMerged(base, oldBlocks, merged);
+          if (merged !== undefined) mergedRecord = buildMerged(mergeBlockId, base!, oldBlocks, merged);
         } catch {
           // 保留旧块，不记为失败
         }
@@ -209,8 +219,8 @@ export function startSummarize(
 
       if (config.batchMode === "parallel") {
         const limit = Math.max(1, Math.min(MAX_CONCURRENCY, config.batchConcurrency));
-        const tasks: Array<() => Promise<void>> = batches.map((b, i) => () => runOne(b, blockIds[i]));
-        if (base !== undefined) tasks.push(() => runMerge());
+        const tasks: Array<() => Promise<void>> = batches.map((b, i) => () => runOne(b, batchBlockIds[i]));
+        if (needsMerge) tasks.push(() => runMerge());
 
         let cursor = 0;
         const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
@@ -224,7 +234,7 @@ export function startSummarize(
       } else {
         for (let i = 0; i < batches.length; i++) {
           if (signal?.aborted) break;
-          await runOne(batches[i], blockIds[i]);
+          await runOne(batches[i], batchBlockIds[i]);
           // 串行时某一个失败就停，没必要继续烧钱
           if (failed > 0) break;
         }

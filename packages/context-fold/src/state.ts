@@ -17,6 +17,13 @@ export interface FoldRecord {
   /** 折叠后这一块占用的 token（摘要长度） */
   tokensAfter: number;
   createdAt: number;
+  /**
+   * 这一块是由旧块合并来的。
+   *
+   * 合并块承载整段旧历史，展示时要排在所有新块之前；
+   * 编号本身不再承担这个含义，因为编号只增不减。
+   */
+  merged?: boolean;
 }
 
 /** 运行期状态。全部可以丢弃重建，不进配置。 */
@@ -134,6 +141,10 @@ export function rebuildFromBranch(state: FoldState, branch: SessionEntry[]): voi
     if (record === undefined) continue;
 
     maxSeq = Math.max(maxSeq, seqOf(record.blockId));
+
+    // 同编号的记录可能因为旧版本的编号复用而出现多份，取最新的那份。
+    const existing = state.records.get(record.blockId);
+    if (existing !== undefined && existing.createdAt >= record.createdAt) continue;
     state.records.set(record.blockId, record);
   }
 
@@ -169,6 +180,17 @@ export function foldedEntryIds(state: FoldState, branch?: SessionEntry[]): Set<s
 }
 
 /** 按块编号顺序取出所有记录，b1、b2、b10 不会排成 b1、b10、b2 */
+/**
+ * 块的展示顺序：合并块在前，其余按编号。
+ *
+ * 合并块承载整段旧历史，它在上下文里的位置也最靠前，
+ * 编号是后来分配的，不能拿来做排序依据。
+ */
 export function sortedRecords(state: FoldState): FoldRecord[] {
-  return [...state.records.values()].sort((a, b) => seqOf(a.blockId) - seqOf(b.blockId));
+  return [...state.records.values()].sort((a, b) => {
+    const am = a.merged === true ? 0 : 1;
+    const bm = b.merged === true ? 0 : 1;
+    if (am !== bm) return am - bm;
+    return seqOf(a.blockId) - seqOf(b.blockId);
+  });
 }

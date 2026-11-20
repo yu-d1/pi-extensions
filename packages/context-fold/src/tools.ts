@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { batchModeLabel, canFoldWindow, effectiveFoldAt, loadConfig, safetyFoldAt, tokenLabel } from "./config.js";
+import { batchModeLabel, canFoldWindow, effectiveFoldAt, foldModelsLabel, loadConfig, safetyFoldAt, tokenLabel } from "./config.js";
 import { renderEntry } from "./prompt.js";
 import type { FoldRecord, FoldState } from "./state.js";
 import { sortedRecords } from "./state.js";
@@ -129,6 +129,7 @@ export function buildStatusText(state: FoldState, ctx: ExtensionContext): string
   lines.push(
     `保底触发: ${safetyLabel}  执行方式: ${batchModeLabel(config.batchMode)}${config.batchMode === "parallel" ? `（${config.batchConcurrency}）` : ""}`,
   );
+  lines.push(`折叠模型: ${foldModelsLabel(config.foldModels)}`);
   if (!canFoldWindow(config, windowSize)) {
     lines.push("注意: 当前模型窗口太小，折叠腾不出空间，已跳过自动触发。");
   }
@@ -137,19 +138,37 @@ export function buildStatusText(state: FoldState, ctx: ExtensionContext): string
   if (state.records.size === 0) {
     lines.push("尚未折叠任何内容。");
   } else {
-    const records = sortedRecords(state);
-    const totalBefore = records.reduce((s, r) => s + r.tokensBefore, 0);
-    const totalAfter = records.reduce((s, r) => s + r.tokensAfter, 0);
-    const totalEntries = records.reduce((s, r) => s + r.entryIds.length, 0);
-    lines.push(`已折叠 ${records.length} 块（共覆盖 ${totalEntries} 条消息）:`);
-    for (const record of records) {
-      const preview = record.summary.replace(/\s+/g, " ").slice(0, 40);
-      lines.push(
-        `  ${record.blockId}  覆盖 ${record.entryIds.length} 条  ${tokenLabel(record.tokensBefore)} → ${tokenLabel(record.tokensAfter)}  ${preview}${record.summary.length > 40 ? "…" : ""}`,
-      );
+    // 只列当前还在上下文里生效的块：旧块被合并后头会被置空，
+    // 它们仍留在会话文件的记录里，但不该算作已折叠内容。
+    const branch = ctx.sessionManager.getBranch() as Array<{
+      type?: string;
+      targetId?: string;
+      replacement?: unknown;
+    }>;
+    const hidden = new Set<string>();
+    for (const entry of branch) {
+      if (entry.type !== "context_edit") continue;
+      if (entry.replacement !== null) continue;
+      if (entry.targetId !== undefined) hidden.add(entry.targetId);
     }
-    lines.push("");
-    lines.push(`合计 ${tokenLabel(totalBefore)} → ${tokenLabel(totalAfter)}，节省 ${tokenLabel(totalBefore - totalAfter)}`);
+
+    const records = sortedRecords(state).filter((r) => !hidden.has(r.headEntryId));
+    if (records.length === 0) {
+      lines.push("尚未折叠任何内容。");
+    } else {
+      const totalBefore = records.reduce((s, r) => s + r.tokensBefore, 0);
+      const totalAfter = records.reduce((s, r) => s + r.tokensAfter, 0);
+      const totalEntries = records.reduce((s, r) => s + r.entryIds.length, 0);
+      lines.push(`已折叠 ${records.length} 块（共覆盖 ${totalEntries} 条消息）:`);
+      for (const record of records) {
+        const preview = record.summary.replace(/\s+/g, " ").slice(0, 40);
+        lines.push(
+          `  ${record.blockId}  覆盖 ${record.entryIds.length} 条  ${tokenLabel(record.tokensBefore)} → ${tokenLabel(record.tokensAfter)}  ${preview}${record.summary.length > 40 ? "…" : ""}`,
+        );
+      }
+      lines.push("");
+      lines.push(`合计 ${tokenLabel(totalBefore)} → ${tokenLabel(totalAfter)}，节省 ${tokenLabel(totalBefore - totalAfter)}`);
+    }
   }
 
   if (state.summarizing) {

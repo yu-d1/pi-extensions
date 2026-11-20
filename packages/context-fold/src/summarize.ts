@@ -1,4 +1,5 @@
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { FoldConfig } from "./config.js";
 import type { BatchPlan, Candidates, FoldRange } from "./fold.js";
 import {
   buildConsolidatePrompt,
@@ -41,6 +42,8 @@ export interface SummarizeInput {
   previousSummary?: string;
   /** 本次折叠总共覆盖多少条原文（合并时要算上旧块），用于摘要头 */
   totalEntryCount?: number;
+  /** 折叠设置，决定用哪个模型、思考等级多强 */
+  config: FoldConfig;
 }
 
 export class SummarizeError extends Error {
@@ -100,18 +103,83 @@ function requestOptions(model: unknown, level: string | undefined, signal: Abort
 }
 
 /**
- * 调用当前模型生成摘要。
+ * 折叠请求的候选模型：按配置的顺序降级。
  *
- * 思考等级跟随当前会话，不再固定关闭：关闭并不能真正省下开销，
- * 反而可能让上游按默认强度思考并吃光输出预算。
+ * 配置为空就跟随当前会话；配置里的模型可能已被卸载或凭据失效，
+ * 这些也一并跳过。全都不用时退回会话模型，至少还能跑。
+ */
+export function resolveCandidates(
+  ctx: ExtensionContext,
+  config: FoldConfig,
+): Array<{ model: unknown; reasoning: string | undefined }> {
+  if (config.foldModels.length === 0) return [{ model: ctx.model, reasoning: undefined }];
+
+  const registry = ctx.modelRegistry as unknown as {
+    find?: (provider: string, modelId: string) => unknown;
+    hasConfiguredAuth?: (model: unknown) => boolean;
+  };
+
+  const picked: Array<{ model: unknown; reasoning: string | undefined }> = [];
+  for (const ref of config.foldModels) {
+    const model = registry.find?.(ref.provider, ref.modelId);
+    if (model === undefined) continue;
+    if (registry.hasConfiguredAuth !== undefined && !registry.hasConfiguredAuth(model)) continue;
+    picked.push({ model, reasoning: ref.reasoning });
+  }
+
+  if (picked.length === 0) return [{ model: ctx.model, reasoning: undefined }];
+  return picked;
+}
+
+/**
+ * 沿候选链发一次请求，前一个跑不通就换下一个。
+ *
+ * 降级只在链内发生：同一个模型不会重试，避免在限流时反复撞同一个口。
+ * 全部失败才抛错，由调用方决定是记一次失败还是退回兑底。
+ */
+async function completeWithFallback(
+  ctx: ExtensionContext,
+  config: FoldConfig,
+  prompt: string,
+  reasoning: string | undefined,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const candidates = resolveCandidates(ctx, config);
+  let lastError: unknown;
+  let attempted = false;
+
+  for (const candidate of candidates) {
+    if (signal.aborted) break;
+    if (candidate.model === undefined) continue;
+    attempted = true;
+    try {
+      return await ctx.modelRegistry.complete(
+        candidate.model as Parameters<typeof ctx.modelRegistry.complete>[0],
+        { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+        requestOptions(candidate.model, candidate.reasoning ?? reasoning, signal) as Parameters<
+          typeof ctx.modelRegistry.complete
+        >[2],
+      );
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!attempted) throw new SummarizeError("当前没有可用模型");
+  throw lastError ?? new SummarizeError("所有折叠模型都不可用");
+}
+
+/**
+ * 调用折叠模型生成摘要。
+ *
+ * 思考等级优先用模型配置里的值，未配置则跟随当前会话。
  */
 export async function summarizeRange(
   ctx: ExtensionContext,
   input: SummarizeInput,
 ): Promise<SummaryResult> {
-  const { blockId, branch, range, signal: externalSignal, topic, reasoning, previousSummary } = input;
-  const model = ctx.model;
-  if (model === undefined) throw new SummarizeError("当前没有可用模型");
+  const { blockId, branch, range, signal: externalSignal, topic, reasoning, previousSummary, config } = input;
+  if (ctx.model === undefined) throw new SummarizeError("当前没有可用模型");
 
   const serialized = serializeRange(branch, range.entryIds);
   if (serialized.trim().length === 0) throw new SummarizeError("区间内没有可摘要的文本");
@@ -128,11 +196,7 @@ export async function summarizeRange(
 
   let raw: unknown;
   try {
-    raw = await ctx.modelRegistry.complete(
-      model,
-      { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-      requestOptions(model, reasoning, signal) as Parameters<typeof ctx.modelRegistry.complete>[2],
-    );
+    raw = await completeWithFallback(ctx, config, prompt, reasoning, signal);
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     throw new SummarizeError(`摘要请求失败: ${msg}`);
@@ -159,6 +223,8 @@ export interface SplitInput {
   signal?: AbortSignal;
   /** 当前会话的思考等级，与摘要请求保持一致 */
   reasoning?: string;
+  /** 折叠设置，决定用哪个模型 */
+  config: FoldConfig;
 }
 
 /**
@@ -167,8 +233,7 @@ export interface SplitInput {
  * 失败（网络、解析、超时）一律抛出，由调用方退化为按轮次均分。
  */
 export async function splitCandidates(ctx: ExtensionContext, input: SplitInput): Promise<BatchPlan[]> {
-  const model = ctx.model;
-  if (model === undefined) throw new SummarizeError("当前没有可用模型");
+  if (ctx.model === undefined) throw new SummarizeError("当前没有可用模型");
 
   const prompt = buildSplitPrompt({
     turns: input.candidates.turns.map((turn) => ({ index: turn.index, userText: turn.userText })),
@@ -179,11 +244,7 @@ export async function splitCandidates(ctx: ExtensionContext, input: SplitInput):
 
   let raw: unknown;
   try {
-    raw = await ctx.modelRegistry.complete(
-      model,
-      { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-      requestOptions(model, input.reasoning, signal) as Parameters<typeof ctx.modelRegistry.complete>[2],
-    );
+    raw = await completeWithFallback(ctx, input.config, prompt, input.reasoning, signal);
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     throw new SummarizeError(`切分请求失败: ${msg}`);
@@ -214,10 +275,9 @@ export async function splitCandidates(ctx: ExtensionContext, input: SplitInput):
  */
 export async function mergeSummaries(
   ctx: ExtensionContext,
-  input: { summaries: string[]; signal?: AbortSignal; reasoning?: string },
+  input: { summaries: string[]; signal?: AbortSignal; reasoning?: string; config: FoldConfig },
 ): Promise<string | undefined> {
-  const model = ctx.model;
-  if (model === undefined) return undefined;
+  if (ctx.model === undefined) return undefined;
 
   const joined = input.summaries
     .map((s) => s.trim())
@@ -230,11 +290,7 @@ export async function mergeSummaries(
 
   let raw: unknown;
   try {
-    raw = await ctx.modelRegistry.complete(
-      model,
-      { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-      requestOptions(model, input.reasoning, signal) as Parameters<typeof ctx.modelRegistry.complete>[2],
-    );
+    raw = await completeWithFallback(ctx, input.config, prompt, input.reasoning, signal);
   } catch {
     return undefined;
   }
