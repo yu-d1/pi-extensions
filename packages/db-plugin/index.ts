@@ -1,14 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   TYPE_LABELS,
-  allDatabases,
   configFilePath,
-  enabledDatabases,
   listTargets,
   loadDbConfigs,
   loadPluginConfig,
   readRawConfigs,
   writeRawConfigs,
+  type DbTarget,
   type PluginConfig,
 } from "./src/config.js";
 import { runStartupMigration } from "./src/migrate.js";
@@ -33,12 +32,10 @@ function buildDatabaseList(): string {
   const configs = loadDbConfigs();
   const targets = listTargets(configs);
 
+  // 停用的连接与未启用的库都不出现在这里：对 AI 而言它们不存在。
+  // 列出来只会诱导模型去建议用户开启，而开启是用户自己的决定。
   if (targets.length === 0) {
-    if (configs.length === 0) {
-      return "暂无数据库连接。请告知用户先执行 /db 编辑 新增连接，再用 /db 启用 开放要访问的库。";
-    }
-    const names = configs.map((c) => c.name).join(", ");
-    return `连接 ${names} 均未启用。请告知用户执行 /db 启用，先启用连接本身，再启用需要访问的库。`;
+    return "暂无可用数据库。";
   }
 
   const lines = targets.map((target) => {
@@ -47,28 +44,54 @@ function buildDatabaseList(): string {
     return `- ${target.label} [${TYPE_LABELS[config.type]}] ${config.host}:${config.port}${desc}`;
   });
 
-  const trailing = ["", "database 参数必须使用上述「连接名/库名」之一。"];
+  // 段首先说明这就是全部，避免模型以为列表在别处而去猜连接名
+  const listHeader = `以下是当前全部可用目标（共 ${targets.length} 个），没有其它：`;
 
-  // 未启用的库与停用的连接不开放给 AI，只告知模型去提示用户
-  const hidden = configs
-    .filter((c) => c.enabled)
-    .map((c) => {
-      const enabled = new Set(enabledDatabases(c).map((d) => d.name));
-      return { name: c.name, disabled: allDatabases(c).filter((n) => !enabled.has(n)) };
-    })
-    .filter((c) => c.disabled.length > 0);
+  const hints = ["", "database 参数必须使用上述「连接名/库名」之一。"];
 
-  if (hidden.length > 0) {
-    const detail = hidden.map((c) => `${c.name}（未启用: ${c.disabled.join(", ")}）`).join("；");
-    trailing.push(`存在但未开放访问的库: ${detail}。如确需访问，提示用户执行 /db 启用。`);
+  // 多个目标时才有定位问题，只有一个就不用讲规则占地方
+  if (targets.length > 1) {
+    hints.push("", "定位规则：");
+    hints.push("1. 先定连接。用户提到数字或主机时，对应连接名里的数字（如 74 → " +
+      connectionHints(targets, "74") + "）。");
+    hints.push("2. 再定库。多连接下有同名库时，按用户说的连接、主机或业务含义定；无法区分时问一句，不要逐个试。");
+    hints.push("3. 找表在哪个库：list_tables 只写连接名，一次返回该连接全部启用库的表；再补 table 参数可直接过滤。");
+
+    const duplicates = duplicateLibraryNames(targets);
+    if (duplicates.length > 0) {
+      hints.push(`   同名库（属于多个连接，必须问清）: ${duplicates.join(", ")}`);
+    }
+
+    const sample = targets[0].config.name;
+    hints.push("", `示例：用户说「查 ${sampleNumeral(sample) ?? "74"} 的 wm_waterquality_hour_records 结构」`);
+    hints.push(`  list_tables  database=${sample}  table=wm_waterquality_hour_records`);
+    hints.push(`  describe_table  database=<命中的连接名/库名>  table=wm_waterquality_hour_records`);
   }
 
-  const disabledConnections = configs.filter((c) => !c.enabled).map((c) => c.name);
-  if (disabledConnections.length > 0) {
-    trailing.push(`已停用的连接: ${disabledConnections.join(", ")}。其下的库不可访问。`);
-  }
+  return [listHeader, ...lines, ...hints].join("\n");
+}
 
-  return [...lines, ...trailing].join("\n");
+/** 把用户说的数字映射回实际连接名，例如 74 → pg_74 */
+function connectionHints(targets: DbTarget[], number: string): string {
+  const hits = [...new Set(targets.filter((t) => t.config.name.includes(number)).map((t) => t.config.name))];
+  return hits.length > 0 ? hits.join(" / ") : `包含 ${number} 的连接`;
+}
+
+/** 从连接名里取出数字，用于示例文案 */
+function sampleNumeral(name: string): string | undefined {
+  const hit = name.match(/\d+/);
+  return hit?.[0];
+}
+
+/** 在多个连接下重名的库，选择时必须问用户 */
+function duplicateLibraryNames(targets: DbTarget[]): string[] {
+  const owners = new Map<string, Set<string>>();
+  for (const target of targets) {
+    const set = owners.get(target.database) ?? new Set<string>();
+    set.add(target.config.name);
+    owners.set(target.database, set);
+  }
+  return [...owners.entries()].filter(([, set]) => set.size > 1).map(([name]) => name);
 }
 
 // ── 导出扩展 ──────────────────────────────────────

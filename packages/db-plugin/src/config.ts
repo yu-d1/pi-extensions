@@ -239,17 +239,14 @@ export function resolveConnection(configs: DbConfig[], spec: string): Connection
     return { ok: false, error: "database 参数不能为空。" };
   }
 
+  // 只在启用且至少有一个启用库的连接里找。停用的连接当成不存在，
+  // 否则报错里的「已停用」「没有已启用的库」会把内部状态透露给模型。
   const config = findDbConfig(configs, connName);
-  if (!config) {
-    const available = configs.map((c) => c.name).join(", ") || "无";
-    return { ok: false, error: `连接 "${connName}" 未找到。可用连接: ${available}。` };
+  if (!config || !config.enabled || enabledDatabases(config).length === 0) {
+    const available = listTargets(configs).map((t) => t.label).join(", ") || "无";
+    return { ok: false, error: `连接 "${connName}" 未找到。可用数据库: ${available}。` };
   }
-  if (!config.enabled) {
-    return { ok: false, error: `连接 "${config.name}" 当前已停用。请提示用户执行 /db 启用后再试。` };
-  }
-  if (enabledDatabases(config).length === 0) {
-    return { ok: false, error: `连接 "${config.name}" 下没有已启用的库。请提示用户执行 /db 启用后再试。` };
-  }
+
   return { ok: true, config };
 }
 
@@ -274,7 +271,7 @@ export function resolveTarget(configs: DbConfig[], spec: string): TargetResult {
     }
     return {
       ok: false,
-      error: `连接 "${config.name}" 下有多个已启用的库，database 参数必须写成「连接名/库名」。可用库: ${enabled.map((d) => d.name).join(", ")}。`,
+      error: `连接 "${config.name}" 下有多个可用库，database 参数必须写成「连接名/库名」。可用库: ${enabled.map((d) => d.name).join(", ")}。`,
     };
   }
 
@@ -282,7 +279,7 @@ export function resolveTarget(configs: DbConfig[], spec: string): TargetResult {
   if (!hit) {
     return {
       ok: false,
-      error: `连接 "${config.name}" 下的库 "${dbName}" 未启用或不存在。可用库: ${enabled.map((d) => d.name).join(", ")}。`,
+      error: `库 "${dbName}" 不存在。可用库: ${enabled.map((d) => d.name).join(", ")}。`,
     };
   }
   return { ok: true, target: { config, database: hit.name, label: `${config.name}/${hit.name}` } };

@@ -1,6 +1,6 @@
 {
   "name": "@liziy/db-plugin",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "AI 接入数据库扩展 —— 管理数据库连接与启用库，支持 PostgreSQL / MySQL / Oracle，提供查询工具给 LLM",
   "keywords": [
     "pi-extension",
