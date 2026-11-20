@@ -39,6 +39,18 @@ function resolveServer(name: string): { config?: SshConfig; error?: string } {
   return { config };
 }
 
+/**
+ * server 参数描述里直接把启用中的连接名列出来。
+ *
+ * 不能只说「需与 ssh_list_servers 返回的一致」：模型会为此多调一次工具，
+ * 而名字本已写在系统提示里。参数是每次调用都读的位置，写在这里最稳。
+ */
+function serverParam(): string {
+  const names = sortedByName(enabledConfigs(loadConfigs())).map((c) => c.name);
+  if (names.length === 0) return "SSH 连接名称。当前没有启用的连接，请提示用户执行 /ssh enable。";
+  return `SSH 连接名称。当前可用: ${names.join(", ")}。`;
+}
+
 export function registerTools(pi: ExtensionAPI) {
   // ── 执行远程命令 ────────────────────────────────
   pi.registerTool({
@@ -47,9 +59,9 @@ export function registerTools(pi: ExtensionAPI) {
     description:
       "通过 SSH 在已启用的服务器上执行命令，返回标准输出、错误输出与退出码。受只读模式与执行确认策略限制。",
     promptSnippet:
-      "执行远程命令。先用 ssh_list_servers 查看已启用的服务器，再执行命令；只读模式下仅允许查看类命令。",
+      "在已启用的服务器上执行命令；只读模式下仅允许查看类命令。",
     parameters: Type.Object({
-      server: Type.String({ description: "SSH 连接名称，需与 ssh_list_servers 返回的名称一致", minLength: 1 }),
+      server: Type.String({ description: serverParam(), minLength: 1 }),
       command: Type.String({ description: "要执行的命令", minLength: 1 }),
     }),
     async execute(
@@ -114,8 +126,8 @@ export function registerTools(pi: ExtensionAPI) {
   pi.registerTool({
     name: "ssh_list_servers",
     label: "列出 SSH 服务器",
-    description: "列出已启用的 SSH 服务器连接，包含名称、地址、认证方式与说明。",
-    promptSnippet: "列出可用于执行的 SSH 服务器名称，再配合 ssh_exec 使用。",
+    description: "列出已启用的 SSH 服务器连接，包含名称、地址、认证方式与说明。服务器名已在系统提示中，通常不必调用。",
+    promptSnippet: "查看服务器的认证方式与完整信息；服务器名已在系统提示中，通常不必调用。",
     parameters: Type.Object({}),
     async execute() {
       const configs = sortedByName(loadConfigs());

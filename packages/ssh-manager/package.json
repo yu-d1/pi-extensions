@@ -1,10 +1,14 @@
 {
   "name": "@liziy/ssh-manager",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "AI 远程操作服务器扩展 —— 管理 SSH 连接并按需启用，AI 通过 ssh_exec 远程执行命令，受只读与确认策略控制",
   "keywords": [
     "pi-extension",
-    "pi-package"
+    "pi-package",
+    "ssh",
+    "remote",
+    "server",
+    "devops"
   ],
   "license": "MIT",
   "main": "index.ts",

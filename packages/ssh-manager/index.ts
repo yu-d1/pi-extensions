@@ -1,7 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-  CONFIRM_LABELS,
-  configFilePath,
   enabledConfigs,
   loadConfigs,
   loadPluginConfig,
@@ -31,6 +29,25 @@ function buildPolicyText(cfg: PluginConfig): string {
   ].join("\n");
 }
 
+/**
+ * 使用边界。
+ *
+ * 服务器列表一列出来，就等于告诉模型「这些随时可用」，它会主动连上去看。
+ * 这里把「什么时候才该连」写清楚，避免把本地能做的事、
+ * 或有专用插件能做的事，都绕道 ssh 去做。
+ */
+function buildUsageBoundary(): string {
+  return [
+    "[何时该用 ssh_exec]",
+    "只在用户明确指向某台服务器时才用：提到服务器名、IP、主机别名，或本轮之前的对话已确认在操作该服务器。",
+    "用户没有指向服务器时，不要主动连上去看。本地能做的一律本地做：",
+    "- 读代码、看配置文件、翻本地日志 → 本地文件工具",
+    "- 查数据库的表结构与数据 → 数据库工具，即使该数据库就跑在已启用的服务器上",
+    "- 只有需要服务器上的运行时状况（进程、端口、磁盘、容器、服务状态）时才用 ssh_exec",
+    "分不清用户指的是本地还是服务器时，先问一句，不要直接连。",
+  ].join("\n");
+}
+
 function buildServerList(): string {
   const configs = sortedByName(loadConfigs());
   const open = enabledConfigs(configs);
@@ -44,12 +61,14 @@ function buildServerList(): string {
     return "当前没有可用的 SSH 连接。请告知用户执行 /ssh enable 启用需要访问的连接。";
   }
 
-  return open
-    .map((c) => {
+  // 段首先说明这就是全部，避免模型以为列表在别处而去猜连接名
+  return [
+    `以下是当前全部可用服务器（共 ${open.length} 个），没有其它：`,
+    ...open.map((c) => {
       const desc = c.description ? ` - ${c.description}` : "";
       return `- ${c.name} → ${c.username}@${c.host}:${c.port}${desc}`;
-    })
-    .join("\n");
+    }),
+  ].join("\n");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -59,10 +78,12 @@ export default function (pi: ExtensionAPI) {
       "[SSH 工具执行策略]",
       buildPolicyText(cfg),
       "",
+      buildUsageBoundary(),
+      "",
       "[可用 SSH 服务器]",
       buildServerList(),
       "",
-      `server 参数必须使用上述连接名称之一。连接与设置保存在 ${configFilePath()}。`,
+      "server 参数必须使用上述连接名称之一。",
     ].join("\n");
   });
 
