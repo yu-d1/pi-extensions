@@ -1,6 +1,6 @@
 {
   "name": "@liziy/toolkit",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "自用精选插件合集 —— 统一通过 /toolkit 管理 Ponytail 极简模式、Todo 面板与提问对话框",
   "keywords": [
     "pi-extension",
