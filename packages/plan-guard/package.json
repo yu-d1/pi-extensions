@@ -1,14 +1,11 @@
 {
   "name": "@liziy/plan-guard",
-  "version": "2.1.2",
-  "description": "Tab 键切换计划/执行模式 + 内嵌 Todo 面板与提问对话框（/plan config 开关）",
+  "version": "3.0.0",
+  "description": "Tab 键切换计划/执行模式 —— 自动调整工具拦截、系统提示与模式专属模型偏好",
   "keywords": [
     "pi-extension",
     "pi-package",
-    "plan-mode",
-    "todo",
-    "ask-user-question",
-    "overlay"
+    "plan-mode"
   ],
   "license": "MIT",
   "main": "index.ts",
@@ -18,10 +15,7 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "repository": {
     "type": "git",
@@ -35,8 +29,6 @@
   "author": "liziy",
   "files": [
     "index.ts",
-    "ask-user-question/",
-    "todo/",
     "README.md"
   ]
 }
