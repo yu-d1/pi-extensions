@@ -50,13 +50,13 @@ Command Code 的官方授权页 `/studio/auth/cli` 在中文环境下会因 loca
 
 ### 思考等级
 
-`管理模型` → 选择供应商 → **刷新启用模型思考**，实测每个已启用模型真正支持哪些档位，写回配置后 `/settings` 只显示可用档位。
+`管理模型` → 选择供应商 → **刷新启用模型思考**，实测每个已启用模型真正支持哪些档位（支持 OpenAI 兼容格式及 Anthropic `adaptive` / `budget` 模式），写回配置后 `/settings` 只显示可用档位；探测过程中按 `Esc` 可取消后续模型。
 
-同一操作还会确定思考参数格式，格式不对时参数会被上游忽略，档位也就形同虚设。
+新启用模型、手动新增模型或将 Command Code 切为 Provider API 时，未探测过的模型会在后台静默完成校准。
 
-选 `minimal` 等于关闭思考：多数模型没有这一档，插件会把实测出的关闭值借位到这里。模型一档都探不通时配置保持原样。
+选 `minimal` 等于关闭思考（OpenAI 兼容格式）：插件会把实测出的关闭值借位到这里。模型一档都探不通时配置保持原样。
 
-改完重启 pi 生效。
+改完后已即时重新注册，切换模型或新建会话即可生效。
 
 ## 说明
 
@@ -67,6 +67,7 @@ Command Code 的官方授权页 `/studio/auth/cli` 在中文环境下会因 loca
 
 ## 版本历史
 
+- **0.6.0** — 兼容新一代 Claude 模型自适应思考（`adaptive` + `output_config.effort`）及合法档位映射；支持 Anthropic 协议实测探测、启用模型后台静默校准与 `Esc` 取消；修复通用 Claude `/v1` 路径、Command Code GO 发图与错误提示
 - **0.5.0** — 「刷新启用模型思考」改为直连实测：同时确定思考参数格式，只写支持的档位，可选 minimal 关闭思考
 - **0.4.0** — 移除内置 MiniMax Local 供应商（含旧配置迁移）；新增「刷新启用模型」，实测每个已启用模型支持的档位并写入配置，`/settings` 只显示可用档位
 - **0.3.0** — 内置供应商更名为 Command Code 并支持 Provider API 通道：登录时自动识别账号套餐（GO 走 `/alpha/generate`，GOAT/Pro/Max/Provider 走 `/provider/v1`），新增「套餐类型」手动切换；模型按服务端 `supported_endpoints` 自动选择 Chat Completions 或 Messages 接口
