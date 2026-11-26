@@ -164,14 +164,13 @@ function shortError(value: unknown): string {
 	return oneLine.length > 140 ? `${oneLine.slice(0, 140)}…` : oneLine;
 }
 
-/** 发一次请求并判定 */
-async function requestOnce(
-	target: ProbeTarget,
-	level: string,
-	params: Record<string, unknown> | null,
+/** 统一的 JSON POST 请求封装（超时控制、外部取消、错误提炼）。 */
+async function postProbeJson(
+	url: string,
+	headers: Record<string, string>,
+	body: Record<string, unknown>,
 	signal?: AbortSignal,
-): Promise<{ verdict: Verdict; note: string }> {
-	const url = `${target.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+): Promise<{ ok: true; json: any } | { ok: false; note: string }> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(new Error("探测超时")), PROBE_TIMEOUT_MS);
 	const onAbort = () => controller.abort(signal?.reason);
@@ -183,35 +182,50 @@ async function requestOnce(
 	try {
 		const resp = await fetch(url, {
 			method: "POST",
-			headers: { "Content-Type": "application/json", Authorization: `Bearer ${target.apiKey}` },
-			body: JSON.stringify({
-				model: target.modelId,
-				stream: false,
-				max_tokens: PROBE_MAX_TOKENS,
-				messages: [{ role: "user", content: PROBE_QUESTION }],
-				...params,
-			}),
+			headers,
+			body: JSON.stringify(body),
 			signal: controller.signal,
 		});
 		const text = await resp.text();
 		// 参数不被接受时，网关普遍用 400/422 明确拒绝
-		if (resp.status === 400 || resp.status === 422) return { verdict: "error", note: shortError(text) };
-		if (!resp.ok) return { verdict: "error", note: `HTTP ${resp.status} ${shortError(text)}` };
+		if (resp.status === 400 || resp.status === 422) return { ok: false, note: shortError(text) };
+		if (!resp.ok) return { ok: false, note: `HTTP ${resp.status} ${shortError(text)}` };
 
-		let json: any;
 		try {
-			json = JSON.parse(text);
+			return { ok: true, json: JSON.parse(text) };
 		} catch {
-			return { verdict: "error", note: "响应不是 JSON" };
+			return { ok: false, note: "响应不是 JSON" };
 		}
-		if (hasReasoningContent(json)) return { verdict: "ok", note: "出现思考内容" };
-		return { verdict: "no-think", note: "200 但无思考内容" };
 	} catch (error) {
-		return { verdict: "error", note: shortError(error) };
+		return { ok: false, note: shortError(error) };
 	} finally {
 		clearTimeout(timer);
 		signal?.removeEventListener("abort", onAbort);
 	}
+}
+
+/** 发一次请求并判定 */
+async function requestOnce(
+	target: ProbeTarget,
+	_level: string,
+	params: Record<string, unknown> | null,
+	signal?: AbortSignal,
+): Promise<{ verdict: Verdict; note: string }> {
+	const res = await postProbeJson(
+		`${target.baseUrl.replace(/\/+$/, "")}/chat/completions`,
+		{ "Content-Type": "application/json", Authorization: `Bearer ${target.apiKey}` },
+		{
+			model: target.modelId,
+			stream: false,
+			max_tokens: PROBE_MAX_TOKENS,
+			messages: [{ role: "user", content: PROBE_QUESTION }],
+			...params,
+		},
+		signal,
+	);
+	if (!res.ok) return { verdict: "error", note: res.note };
+	if (hasReasoningContent(res.json)) return { verdict: "ok", note: "出现思考内容" };
+	return { verdict: "no-think", note: "200 但无思考内容" };
 }
 
 /**
@@ -247,8 +261,9 @@ export async function probeThinkingLevels(
 	if (hit === undefined) return empty;
 
 	// ── 2. 逐档验证 ────────────────────────────────────────────
-	const levels: string[] = [];
+	const levels: string[] = [FORMAT_PROBE_LEVEL];
 	for (const level of PROBE_LEVELS) {
+		if (level === FORMAT_PROBE_LEVEL) continue;
 		if (signal?.aborted) break;
 		const params = hit.build(level);
 		const r = await requestOnce(target, level, params, signal);
@@ -326,20 +341,167 @@ export function buildThinkingLevelMap(
 	return map;
 }
 
-/**
- * 该格式下「关闭思考」对应的 effort 值。
- *
- * 实际值由探测得出（deepseek 认 "off"，mimo 认 "none"）；这里只在没有探测结果时
- * 按格式给一个默认值。
- */
-export function closeValueOf(format: string): string | undefined {
-	switch (format) {
-		case "deepseek":
-			return "off";
-		case "openrouter":
-		case "ant-ling":
-			return "none";
-		default:
-			return undefined;
+// =============================================================================
+// Anthropic Messages 协议探测（adaptive + budget）
+// =============================================================================
+
+export interface AnthropicProbeTarget {
+	/** 接口前缀，如 https://api.commandcode.ai/provider/v1 或 https://api.anthropic.com/v1 */
+	baseUrl: string;
+	apiKey: string;
+	modelId: string;
+	/** 为 true 时同时携带 Authorization: Bearer（兼容 Command Code Provider API 等网关） */
+	sendBearer?: boolean;
+}
+
+export interface AnthropicProbeResult {
+	/** 探测命中的思考协议：adaptive 或 budget；未探测到则 undefined */
+	mode?: "adaptive" | "budget";
+	/** 真正生效的档位（不含 off） */
+	levels: string[];
+	/** thinking: { type: "disabled" } 是否可关闭思考 */
+	offClosable: boolean;
+	trace: LevelProbe[];
+}
+
+const ADAPTIVE_EXTRA_LEVELS = ["low", "high", "xhigh", "max"] as const;
+
+function hasAnthropicThinking(json: any): boolean {
+	return (
+		Array.isArray(json?.content) &&
+		json.content.some((b: any) => b?.type === "thinking" || b?.type === "redacted_thinking")
+	);
+}
+
+async function requestAnthropicOnce(
+	target: AnthropicProbeTarget,
+	payload: Record<string, unknown>,
+	signal?: AbortSignal,
+): Promise<{ verdict: Verdict; note: string }> {
+	const base = target.baseUrl.replace(/\/+$/, "");
+	const url = base.endsWith("/messages") ? base : `${base}/messages`;
+	const headers: Record<string, string> = {
+		"Content-Type": "application/json",
+		"anthropic-version": "2023-06-01",
+	};
+	if (target.apiKey.includes("sk-ant-oat")) {
+		headers.Authorization = `Bearer ${target.apiKey}`;
+	} else {
+		headers["x-api-key"] = target.apiKey;
+		if (target.sendBearer === true) headers.Authorization = `Bearer ${target.apiKey}`;
 	}
+
+	const res = await postProbeJson(
+		url,
+		headers,
+		{
+			model: target.modelId,
+			messages: [{ role: "user", content: PROBE_QUESTION }],
+			...payload,
+		},
+		signal,
+	);
+	if (!res.ok) return { verdict: "error", note: res.note };
+	if (hasAnthropicThinking(res.json)) return { verdict: "ok", note: "出现思考内容" };
+	return { verdict: "no-think", note: "200 但无思考内容" };
+}
+
+/** 探测 Anthropic Messages 协议模型支持 adaptive 还是 budget 思考模式及可用档位。 */
+export async function probeAnthropicThinkingLevels(
+	target: AnthropicProbeTarget,
+	signal?: AbortSignal,
+	onProgress?: (note: string) => void,
+): Promise<AnthropicProbeResult> {
+	const trace: LevelProbe[] = [];
+	const empty: AnthropicProbeResult = { levels: [], offClosable: false, trace };
+
+	let mode: "adaptive" | "budget" | undefined;
+	const levels: string[] = [];
+
+	// 1. 先试 adaptive + medium
+	if (signal?.aborted) return empty;
+	const adaptiveProbe = await requestAnthropicOnce(
+		target,
+		{ max_tokens: 1024, thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: FORMAT_PROBE_LEVEL } },
+		signal,
+	);
+	trace.push({ level: FORMAT_PROBE_LEVEL, format: "anthropic-adaptive", verdict: adaptiveProbe.verdict, note: adaptiveProbe.note });
+	onProgress?.(`adaptive ${adaptiveProbe.verdict === "ok" ? "✓" : "✗"}`);
+
+	if (adaptiveProbe.verdict === "ok") {
+		mode = "adaptive";
+		levels.push(FORMAT_PROBE_LEVEL);
+		for (const level of ADAPTIVE_EXTRA_LEVELS) {
+			if (signal?.aborted) break;
+			const r = await requestAnthropicOnce(
+				target,
+				{ max_tokens: 1024, thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: level } },
+				signal,
+			);
+			trace.push({ level, format: "anthropic-adaptive", verdict: r.verdict, note: r.note });
+			onProgress?.(`${level} ${r.verdict === "ok" ? "✓" : "✗"}`);
+			if (r.verdict === "ok") levels.push(level);
+		}
+	} else {
+		// 2. adaptive 不通，再试旧代 budget 模式
+		if (signal?.aborted) return empty;
+		const budgetProbe = await requestAnthropicOnce(
+			target,
+			{ max_tokens: 2048, thinking: { type: "enabled", budget_tokens: 1024 } },
+			signal,
+		);
+		trace.push({ level: "enabled", format: "anthropic-budget", verdict: budgetProbe.verdict, note: budgetProbe.note });
+		onProgress?.(`budget ${budgetProbe.verdict === "ok" ? "✓" : "✗"}`);
+		if (budgetProbe.verdict !== "ok") return empty;
+		mode = "budget";
+		levels.push("minimal", "low", "medium", "high");
+	}
+
+	// 3. 验证 disabled 是否可关闭思考
+	let offClosable = false;
+	if (!signal?.aborted) {
+		const offProbe = await requestAnthropicOnce(
+			target,
+			{ max_tokens: PROBE_MAX_TOKENS, thinking: { type: "disabled" } },
+			signal,
+		);
+		offClosable = offProbe.verdict === "no-think";
+		trace.push({
+			level: "off",
+			format: `anthropic-${mode}`,
+			verdict: offProbe.verdict,
+			note: offClosable ? "思考已关闭 ✓" : offProbe.note,
+		});
+		onProgress?.(`off ${offClosable ? "✓ 可关闭" : "✗ 关不掉"}`);
+	}
+
+	return {
+		mode,
+		levels: levels.sort(byLevelOrder),
+		offClosable,
+		trace,
+	};
+}
+
+/** 把 Anthropic 探测结果转为安全的 thinkingLevelMap。 */
+export function buildAnthropicThinkingLevelMap(
+	result: AnthropicProbeResult,
+): Record<string, string | null> | undefined {
+	if (result.mode === "adaptive") {
+		const map: Record<string, string | null> = {
+			...(result.offClosable ? {} : { off: null }),
+			minimal: null,
+		};
+		for (const level of ["low", "medium", "high"] as const) {
+			map[level] = result.levels.includes(level) ? level : null;
+		}
+		for (const level of ["xhigh", "max"] as const) {
+			if (result.levels.includes(level)) map[level] = level;
+		}
+		return map;
+	}
+	if (result.mode === "budget") {
+		return result.offClosable ? undefined : { off: null };
+	}
+	return undefined;
 }

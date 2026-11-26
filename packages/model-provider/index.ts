@@ -24,8 +24,24 @@ import {
 	type CcGoModelConfig,
 	type CommandCodeGoConfig,
 } from "./commandcode-go";
-import type { CcgoPlanMode } from "./commandcode-api";
-import { buildThinkingLevelMap, probeThinkingLevels, THINK_FORMATS } from "./thinking-probe";
+import {
+	applyAnthropicCompat,
+	extractCredentialKey,
+	formatErrorMessage,
+	formatUpstreamError,
+	resolveAnthropicThinkingProfile,
+	resolveEndpoint,
+	type CcgoPlanMode,
+} from "./commandcode-api";
+import {
+	buildAnthropicThinkingLevelMap,
+	buildThinkingLevelMap,
+	probeAnthropicThinkingLevels,
+	probeThinkingLevels,
+	THINK_FORMATS,
+	type AnthropicProbeResult,
+	type ModelProbeResult,
+} from "./thinking-probe";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -93,6 +109,10 @@ export interface StoredModel {
 	thinkingLevelMap?: Record<string, string | null>;
 	/** 思考参数格式（pi-ai 的 compat.thinkingFormat），由“刷新启用模型思考”实测得出。 */
 	thinkingFormat?: string;
+	/** 新一代 Claude 的自适应思考标记（pi-ai 的 compat.forceAdaptiveThinking）。 */
+	forceAdaptiveThinking?: boolean;
+	/** 是否已完成过思考探测（实测校准过格式与档位）。 */
+	thinkingProbed?: boolean;
 	/** Command Code 模型目录声明的应答端点，用于 API 通道选路。 */
 	supportedEndpoints?: string[];
 	/** 勾选启用：true/undefined = 启用并显示在 /model；false = 不显示（配置保留）。 */
@@ -159,6 +179,7 @@ setCommandCodeGoHost({
 		entry.commandcodeGo.planMode = mode;
 		// 必须同步注入值，否则 streamSimple 读到的还是旧 planMode
 		setCommandCodeGoConfig(entry.commandcodeGo);
+		reRegisterEntry(entry);
 		await saveStore();
 	},
 });
@@ -182,6 +203,8 @@ function normalizeStoredModels(raw: unknown): StoredModel[] {
 			...(m.cost ? { cost: m.cost } : {}),
 			...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
 			...(typeof m.thinkingFormat === "string" && m.thinkingFormat ? { thinkingFormat: m.thinkingFormat } : {}),
+			...(typeof m.forceAdaptiveThinking === "boolean" ? { forceAdaptiveThinking: m.forceAdaptiveThinking } : {}),
+			...(typeof m.thinkingProbed === "boolean" ? { thinkingProbed: m.thinkingProbed } : {}),
 			...(Array.isArray(m.supportedEndpoints) ? { supportedEndpoints: m.supportedEndpoints.map(String) } : {}),
 			...(typeof m.enabled === "boolean" ? { enabled: m.enabled } : {}),
 		}));
@@ -293,9 +316,20 @@ function buildModelsHeaders(apiType: string, apiKey?: string): Record<string, st
 	return headers;
 }
 
+/** Anthropic SDK 会自动追加 /v1/messages，注册给 SDK 的 baseUrl 需去掉末尾 /v1。 */
+function toAnthropicSdkBaseUrl(baseUrl: string): string {
+	return baseUrl.trim().replace(/\/+$/, "").replace(/\/v1$/i, "");
+}
+
+/** 直连 Anthropic /models 或 /messages 时确保带有版本路径前缀（默认补 /v1）。 */
+function toAnthropicApiV1Url(baseUrl: string): string {
+	const clean = baseUrl.trim().replace(/\/+$/, "");
+	return /\/v\d+$/i.test(clean) ? clean : `${clean}/v1`;
+}
+
 /** 保存新增或编辑的供应商前，确认 API 前缀和 /models 接口可访问。 */
 async function checkProviderConnectivity(apiType: string, baseUrl: string, apiKey?: string): Promise<ConnectivityResult> {
-	const base = baseUrl.trim().replace(/\/+$/, "");
+	const base = apiType === "anthropic-messages" ? toAnthropicApiV1Url(baseUrl) : baseUrl.trim().replace(/\/+$/, "");
 	let endpoint: URL;
 	try {
 		endpoint = new URL(`${base}/models`);
@@ -318,10 +352,11 @@ async function checkProviderConnectivity(apiType: string, baseUrl: string, apiKe
 			return { ok: true, status: res.status, modelCount: 0, authRequired: true };
 		}
 		if (!res.ok) {
+			const detail = formatUpstreamError(res.status, await res.text().catch(() => ""));
 			return {
 				ok: false,
 				reason: "http",
-				message: `请求 /models 失败（HTTP ${res.status}）。请检查 API 前缀和请求格式。`,
+				message: `请求 /models 失败（${detail}）。请检查 API 前缀和请求格式。`,
 			};
 		}
 		if (res.status === 204) return { ok: true, status: res.status, modelCount: 0 };
@@ -339,7 +374,7 @@ async function checkProviderConnectivity(apiType: string, baseUrl: string, apiKe
 		}
 		return { ok: true, status: res.status, modelCount: list.length };
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
+		const message = formatErrorMessage(error) || "网络连接失败";
 		return { ok: false, reason: "network", message: `无法访问 /models：${message}` };
 	}
 }
@@ -454,7 +489,7 @@ const FULL_THINKING_LEVEL_MAP: Record<string, string> = {
  * 服务端能获取到能力声明就使用声明（明确不支持思考 → 只有 off，不补全）；
  * 获取不到时补全全部等级（含 xhigh/max），使 /settings 中可配置全部档位。
  */
-function inferModelThinking(raw: any): { reasoning: boolean; thinkingLevelMap?: Record<string, string> } {
+function inferModelThinking(raw: any, apiType?: string): { reasoning: boolean; thinkingLevelMap?: Record<string, string | null> } {
 	const values = [
 		raw?.reasoning,
 		raw?.supports_reasoning,
@@ -465,6 +500,13 @@ function inferModelThinking(raw: any): { reasoning: boolean; thinkingLevelMap?: 
 	];
 	const declared = values.find((value) => typeof value === "boolean");
 	if (declared === false) return { reasoning: false };
+	if (apiType === "anthropic-messages" && typeof raw?.id === "string") {
+		const profile = resolveAnthropicThinkingProfile(raw.id);
+		return {
+			reasoning: true,
+			...(profile.thinkingLevelMap ? { thinkingLevelMap: profile.thinkingLevelMap } : {}),
+		};
+	}
 	return { reasoning: true, thinkingLevelMap: { ...FULL_THINKING_LEVEL_MAP } };
 }
 
@@ -475,7 +517,7 @@ function extractModels(data: any, api: string): StoredModel[] {
 	for (const m of arr) {
 		if (m === undefined || m === null) continue;
 		if (typeof m === "string") {
-			const thinking = inferModelThinking({ id: m });
+			const thinking = inferModelThinking({ id: m }, api);
 			out.push({
 				id: m,
 				reasoning: thinking.reasoning,
@@ -494,7 +536,7 @@ function extractModels(data: any, api: string): StoredModel[] {
 			.find((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
 		const maxTokens = [m?.maxTokens, m?.max_tokens, m?.max_output_tokens, m?.limit?.output]
 			.find((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
-		const thinking = inferModelThinking({ ...m, id });
+		const thinking = inferModelThinking({ ...m, id }, api);
 		out.push({
 			id,
 			name: typeof display === "string" ? display : id,
@@ -509,23 +551,12 @@ function extractModels(data: any, api: string): StoredModel[] {
 	return out;
 }
 
-function extractCredentialKey(c: any): string | undefined {
-	if (!c) return undefined;
-	if (typeof c === "string") return c;
-	if (typeof c === "object") {
-		for (const k of ["apiKey", "access", "key", "token", "value", "api_key"]) {
-			if (typeof c?.[k] === "string" && c[k]) return c[k];
-		}
-	}
-	return undefined;
-}
-
 /**
  * common 供应商只保存 API 前缀，例如 https://api.openai.com/v1。
  * 三种格式的模型目录都按前缀拼接 /models；对话请求仍完全由 pi 官方 api 实现。
  */
 async function fetchModelsByApi(api: string, baseUrl: string, apiKey?: string): Promise<StoredModel[]> {
-	const base = baseUrl.trim().replace(/\/+$/, "");
+	const base = api === "anthropic-messages" ? toAnthropicApiV1Url(baseUrl) : baseUrl.trim().replace(/\/+$/, "");
 	const headers: Record<string, string> = {};
 	if (api === "anthropic-messages") {
 		headers["anthropic-version"] = "2023-06-01";
@@ -564,7 +595,7 @@ function inferThinkingFormat(modelId: string): string | undefined {
 	return undefined;
 }
 
-function normalizeModel(m: StoredModel): any {
+function normalizeModel(m: StoredModel, apiType?: string): any {
 	// 实测写入的优先，没测过才按 id 前缀兜个默认值
 	const thinkingFormat = m.thinkingFormat ?? inferThinkingFormat(m.id);
 	const base: any = {
@@ -585,6 +616,9 @@ function normalizeModel(m: StoredModel): any {
 		},
 	};
 	if (m.thinkingLevelMap) base.thinkingLevelMap = m.thinkingLevelMap;
+	if (apiType === "anthropic-messages") {
+		Object.assign(base, applyAnthropicCompat(base, m.forceAdaptiveThinking));
+	}
 	// API 通道按此字段选 /messages 还是 /chat/completions；联络式模型自带，其它忽略
 	if (m.supportedEndpoints) base.supportedEndpoints = m.supportedEndpoints;
 	return base;
@@ -607,10 +641,16 @@ function sortModels(models: StoredModel[]): StoredModel[] {
 
 function mergeModels(existing: StoredModel[], fetched: StoredModel[]): StoredModel[] {
 	// 新拉取的模型一律默认未勾选（不显示在 /model），需在“启用模型”中手动挑选；
-	// 已存在的模型保留用户的勾选与配置。
+	// 已存在的模型保留用户的勾选与配置，同时刷新服务端元信息（如 supportedEndpoints）。
 	const merged = fetched.map((f) => {
 		const old = existing.find((e) => e.id === f.id);
-		return old ? { ...f, ...old } : { ...f, enabled: false };
+		if (!old) return { ...f, enabled: false };
+		return {
+			...f,
+			...old,
+			...(f.supportedEndpoints?.length ? { supportedEndpoints: f.supportedEndpoints } : {}),
+			...(f.name && (!old.name || old.name === old.id) ? { name: f.name } : {}),
+		};
 	});
 	for (const e of existing) {
 		if (!fetched.some((f) => f.id === e.id)) {
@@ -623,23 +663,23 @@ function mergeModels(existing: StoredModel[], fetched: StoredModel[]): StoredMod
 function registerCommon(pi: ExtensionAPI, entry: CommonEntry): void {
 	const cfg: any = {
 		name: entry.name,
-		baseUrl: entry.baseUrl,
+		baseUrl: entry.api === "anthropic-messages" ? toAnthropicSdkBaseUrl(entry.baseUrl) : entry.baseUrl,
 		api: entry.api,
 		// 只注册勾选启用的模型；未勾选的保留在配置中但不显示在 /model。
-		models: entry.models.filter(isModelEnabled).map(normalizeModel),
+		models: entry.models.filter(isModelEnabled).map((m) => normalizeModel(m, entry.api)),
 		// 仅允许登录后的有网络刷新访问 /models；注册、注销、删除模型等本地变更
 		// 会触发 pi 的无网络同步，此时必须直接保留当前列表。
 		// 未勾选启用的模型不暴露给 pi，因此不会出现在 /model 选择器中。
 		refreshModels: async (context: any) => {
 			if (context?.allowNetwork !== true || context?.signal?.aborted) {
-				return entry.models.filter(isModelEnabled).map(normalizeModel);
+				return entry.models.filter(isModelEnabled).map((m) => normalizeModel(m, entry.api));
 			}
 			const key = extractCredentialKey(context?.credential);
 			const fetched = await fetchModelsByApi(entry.api, entry.baseUrl, key);
 			const merged = mergeModels(entry.models, fetched);
 			entry.models = merged;
 			await saveStore();
-			return merged.filter(isModelEnabled).map(normalizeModel);
+			return merged.filter(isModelEnabled).map((m) => normalizeModel(m, entry.api));
 		},
 	};
 	pi.registerProvider(entry.name, cfg);
@@ -674,11 +714,19 @@ function registerCommandCodeGo(pi: ExtensionAPI): void {
 	if (!entry || entry.name !== "commandcodego") return;
 	const cfg = entry.commandcodeGo;
 	setCommandCodeGoConfig(cfg);
-	const models: CcGoModelConfig[] = entry.models.filter(isModelEnabled).map((m) => normalizeModel(m) as unknown as CcGoModelConfig);
+	const buildEnabledModels = (): CcGoModelConfig[] =>
+		entry.models
+			.filter(isModelEnabled)
+			.map((m) =>
+				normalizeModel(
+					m,
+					cfg.planMode === "api" && resolveEndpoint(m as any) === "anthropic-messages" ? "anthropic-messages" : undefined,
+				) as unknown as CcGoModelConfig,
+			);
 	pi.unregisterProvider(CCGO_PROVIDER_ID);
 	pi.registerProvider(CCGO_PROVIDER_ID, buildCommandCodeGoConfig({
 		config: cfg,
-		models,
+		models: buildEnabledModels(),
 		persist: async (fetched) => {
 			// 远端目录写回本地配置，供「启用模型」勾选；
 			// supportedEndpoints 必须一并落盘：API 通道靠它判断该模型走 /messages 还是 /chat/completions。
@@ -698,6 +746,7 @@ function registerCommandCodeGo(pi: ExtensionAPI): void {
 			})));
 			entry.models = sortModels(merged);
 			await saveStore();
+			return buildEnabledModels();
 		},
 	}) as any);
 }
@@ -890,7 +939,7 @@ async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void
 	try {
 		let key: string | undefined;
 		try {
-			key = await (ctx.modelRegistry as any)?.getApiKeyForProvider(entry.name);
+			key = extractCredentialKey(await (ctx.modelRegistry as any)?.getApiKeyForProvider(entry.name));
 		} catch {
 			key = undefined;
 		}
@@ -929,10 +978,156 @@ async function refreshCommonModels(ctx: any, entry: ProviderEntry): Promise<void
 		}
 		ctx.ui.notify(message, "info");
 	} catch (e) {
-		ctx.ui.notify(`刷新失败：${e instanceof Error ? e.message : String(e)}\n可在“新增模型”中手动添加。`, "error");
+		ctx.ui.notify(`刷新失败：${formatErrorMessage(e) || "未知错误"}\n可在“新增模型”中手动添加。`, "error");
 	} finally {
 		ctx.ui.setStatus("model-provider", undefined);
 	}
+}
+
+type ProbeOutcome =
+	| { kind: "anthropic"; result: AnthropicProbeResult }
+	| { kind: "openai"; result: ModelProbeResult }
+	| { kind: "none" };
+
+const inFlightProbeKeys = new Set<string>();
+const sessionAttemptedProbeKeys = new Set<string>();
+const silentProbeControllers = new Map<string, Set<AbortController>>();
+
+function probeKey(entryName: string, modelId: string): string {
+	return `${entryName}\0${modelId}`;
+}
+
+function needsThinkingProbe(entryName: string, model: StoredModel): boolean {
+	if (!isModelEnabled(model)) return false;
+	if (model.thinkingProbed === true || model.thinkingFormat || typeof model.forceAdaptiveThinking === "boolean") {
+		return false;
+	}
+	const key = probeKey(entryName, model.id);
+	return !inFlightProbeKeys.has(key) && !sessionAttemptedProbeKeys.has(key);
+}
+
+async function probeSingleModel(
+	connection: { baseUrl: string; protocol: ProbeProtocol },
+	apiKey: string,
+	model: StoredModel,
+	signal: AbortSignal,
+	onNote?: (note: string) => void,
+): Promise<ProbeOutcome> {
+	const isAnthropic =
+		connection.protocol === "anthropic-messages" ||
+		(connection.protocol === "commandcode-api" && resolveEndpoint(model as any) === "anthropic-messages");
+	if (isAnthropic) {
+		const result = await probeAnthropicThinkingLevels(
+			{
+				baseUrl: connection.baseUrl,
+				apiKey,
+				modelId: model.id,
+				sendBearer: connection.protocol === "commandcode-api",
+			},
+			signal,
+			onNote,
+		);
+		return result.mode !== undefined ? { kind: "anthropic", result } : { kind: "none" };
+	}
+	const result = await probeThinkingLevels(
+		{ baseUrl: connection.baseUrl, apiKey, modelId: model.id, formats: THINK_FORMATS },
+		signal,
+		onNote,
+	);
+	return result.thinkingFormat !== undefined ? { kind: "openai", result } : { kind: "none" };
+}
+
+function applyProbeOutcome(entry: ProviderEntry, modelId: string, outcome: ProbeOutcome): string | undefined {
+	if (outcome.kind === "none") return undefined;
+	// 每次从最新列表定位对象，避免异步期间用户操作列表导致写入旧引用
+	const target = entry.models.find((m) => m.id === modelId);
+	if (!target || !isModelEnabled(target)) return undefined;
+
+	target.reasoning = true;
+	target.thinkingProbed = true;
+	if (outcome.kind === "anthropic") {
+		const { result } = outcome;
+		target.forceAdaptiveThinking = result.mode === "adaptive";
+		delete target.thinkingFormat;
+		const levelMap = buildAnthropicThinkingLevelMap(result);
+		if (levelMap) target.thinkingLevelMap = levelMap;
+		else delete target.thinkingLevelMap;
+		const summary = result.levels.length > 0 ? result.levels.join("/") : "无";
+		return `${target.id}：Anthropic ${result.mode}，档位 ${summary}${result.offClosable ? "，可关闭" : "，关不掉"}`;
+	}
+	const { result } = outcome;
+	target.thinkingFormat = result.thinkingFormat;
+	delete target.forceAdaptiveThinking;
+	// 关闭生效时把实测出的关闭值挂到 minimal，给用户一个真正能关掉的选项
+	target.thinkingLevelMap = buildThinkingLevelMap(result.levels, result.offClosable ? result.closeValue : undefined);
+	const summary = result.levels.length > 0 ? result.levels.join("/") : "无";
+	return `${target.id}：${result.thinkingFormat} 格式，档位 ${summary}${result.offClosable ? `，可关闭（${result.closeValue ?? "开关字段"}）` : "，关不掉"}`;
+}
+
+/**
+ * 对已启用但从未探测过思考参数的模型，在后台静默执行思考探测与校准。
+ *
+ * 不阻塞当前操作且静默处理无密钥/不支持直连/探测失败的情况，防止未校准模型在后续对话中报错。
+ */
+function scheduleSilentThinkingProbe(ctx: any, entry: ProviderEntry, candidateIds?: string[]): void {
+	const connection = resolveProbeConnection(entry);
+	if (connection === undefined) return;
+	const idSet = candidateIds ? new Set(candidateIds) : undefined;
+	const initialTargets = entry.models.filter(
+		(m) => (!idSet || idSet.has(m.id)) && needsThinkingProbe(entry.name, m),
+	);
+	if (initialTargets.length === 0) return;
+
+	const keys = initialTargets.map((m) => probeKey(entry.name, m.id));
+	for (const k of keys) {
+		inFlightProbeKeys.add(k);
+		sessionAttemptedProbeKeys.add(k);
+	}
+
+	const abort = new AbortController();
+	let controllers = silentProbeControllers.get(entry.name);
+	if (!controllers) {
+		controllers = new Set();
+		silentProbeControllers.set(entry.name, controllers);
+	}
+	controllers.add(abort);
+
+	void (async () => {
+		let updated = 0;
+		try {
+			const apiKey = await getProviderApiKey(ctx, [entry.name]);
+			if (!apiKey || abort.signal.aborted) return;
+
+			for (let i = 0; i < initialTargets.length; i++) {
+				if (abort.signal.aborted) break;
+				const modelId = initialTargets[i].id;
+				const model = entry.models.find((m) => m.id === modelId);
+				if (!model || !isModelEnabled(model)) continue;
+
+				ctx.ui.setStatus("model-provider", `后台校准思考 ${i + 1}/${initialTargets.length}：${model.id}`);
+				const outcome = await probeSingleModel(connection, apiKey, model, abort.signal);
+				if (abort.signal.aborted && outcome.kind === "none") break;
+				if (applyProbeOutcome(entry, modelId, outcome)) {
+					updated += 1;
+					reRegisterEntry(entry);
+					await saveStore();
+				}
+			}
+		} catch {
+			// 后台静默校准失败时不打扰用户
+		} finally {
+			for (const k of keys) inFlightProbeKeys.delete(k);
+			controllers?.delete(abort);
+			if (controllers && controllers.size === 0) silentProbeControllers.delete(entry.name);
+			ctx.ui.setStatus("model-provider", undefined);
+			if (updated > 0) {
+				ctx.ui.notify(
+					`后台已静默校准 ${entry.name} ${updated} 个模型的思考等级（切换模型或新会话生效）。`,
+					"info",
+				);
+			}
+		}
+	})();
 }
 
 /**
@@ -962,79 +1157,137 @@ async function refreshThinkingLevels(ctx: any, entry: ProviderEntry): Promise<vo
 		return;
 	}
 
+	// 手动触发时先中止该供应商正在进行的后台静默任务，并允许重新探测
+	for (const c of silentProbeControllers.get(entry.name) ?? []) c.abort();
+	for (const m of targets) sessionAttemptedProbeKeys.delete(probeKey(entry.name, m.id));
+
 	const abort = new AbortController();
 	let index = 0;
 	let updated = 0;
 	const unchanged: string[] = [];
 	const notes: string[] = [];
 
-	try {
-		for (const model of targets) {
-			if (abort.signal.aborted) break;
-			index += 1;
-			ctx.ui.setStatus("model-provider", `正在探测 ${index}/${targets.length}：${model.id}`);
+	const runProbe = async (onStatus: (text: string) => void): Promise<void> => {
+		try {
+			for (const model of targets) {
+				if (abort.signal.aborted) break;
+				index += 1;
+				const prefix = `正在探测 ${index}/${targets.length}：${model.id}`;
+				onStatus(prefix);
 
-			const result = await probeThinkingLevels(
-				{ baseUrl: connection.baseUrl, apiKey, modelId: model.id, formats: THINK_FORMATS },
-				abort.signal,
-				(note) => {
-					ctx.ui.setStatus("model-provider", `正在探测 ${index}/${targets.length}：${model.id} · ${note}`);
-				},
-			);
-
-			if (result.thinkingFormat === undefined) {
-				// 一种格式都不通：可能是模型不支持思考，也可能是密钥/网络问题，
-				// 无法区分时保持原配置不动，避免误杀
-				unchanged.push(model.id);
-				continue;
+				const key = probeKey(entry.name, model.id);
+				inFlightProbeKeys.add(key);
+				try {
+					const outcome = await probeSingleModel(
+						connection,
+						apiKey,
+						model,
+						abort.signal,
+						(note) => onStatus(`${prefix} · ${note}`),
+					);
+					if (abort.signal.aborted && outcome.kind === "none") break;
+					const note = applyProbeOutcome(entry, model.id, outcome);
+					if (note) {
+						updated += 1;
+						notes.push(note);
+					} else {
+						unchanged.push(model.id);
+					}
+				} finally {
+					inFlightProbeKeys.delete(key);
+				}
 			}
 
-			model.reasoning = true;
-			model.thinkingFormat = result.thinkingFormat;
-			// 关闭生效时把实测出的关闭值挂到 minimal，给用户一个真正能关掉的选项
-			model.thinkingLevelMap = buildThinkingLevelMap(result.levels, result.offClosable ? result.closeValue : undefined);
-			updated += 1;
-
-			const summary = result.levels.length > 0 ? result.levels.join("/") : "无";
-			notes.push(
-				`${model.id}：${result.thinkingFormat} 格式，档位 ${summary}${result.offClosable ? `，可关闭（${result.closeValue ?? "开关字段"}）` : "，关不掉"}`,
-			);
+			if (updated > 0) {
+				reRegisterEntry(entry);
+				await saveStore();
+			}
+		} catch (e) {
+			notes.push(formatErrorMessage(e) || "探测过程发生未知错误");
 		}
+	};
 
-		if (updated > 0) {
-			reRegisterEntry(entry);
-			await saveStore();
+	if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
+		await ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: (value: null) => void) => {
+			const comp = new ProbeProgressComponent(tui, theme, `思考探测：${entry.name}`, () => abort.abort());
+			Promise.resolve()
+				.then(() => runProbe((text) => comp.setStatus(text)))
+				.finally(() => done(null));
+			return comp;
+		});
+	} else {
+		try {
+			await runProbe((text) => ctx.ui.setStatus("model-provider", text));
+		} finally {
+			ctx.ui.setStatus("model-provider", undefined);
 		}
-	} catch (e) {
-		notes.push(e instanceof Error ? e.message : String(e));
-	} finally {
-		ctx.ui.setStatus("model-provider", undefined);
 	}
 
-	const lines = [`已更新 ${updated} / ${targets.length} 个模型的思考等级。`];
+	const header = abort.signal.aborted
+		? `已取消后续探测，已保存 ${updated} / ${targets.length} 个模型的结果。`
+		: `已更新 ${updated} / ${targets.length} 个模型的思考等级。`;
+	const lines = [header];
 	if (notes.length > 0) lines.push("", ...notes);
 	if (unchanged.length > 0) lines.push("", `没探到思考档位（配置保持原样）：${unchanged.join("、")}`);
-	if (updated > 0) lines.push("", "改写配置后需重启 pi 生效。");
+	if (updated > 0) lines.push("", "已重新注册生效（当前会话切换模型或新会话即可使用）。");
 	ctx.ui.notify(lines.join("\n"), updated > 0 ? "info" : "warning");
 }
 
+type ProbeProtocol = "openai-completions" | "anthropic-messages" | "commandcode-api";
+
 /**
- * 解析直连探测用的端点前缀。
+ * 解析直连探测用的端点前缀与协议。
  *
- * 只有走标准 chat/completions 的供应商能直连；私有协议（commandcode 的 GO 通道）
- * 与 Anthropic 协议一律返回 undefined，保持原配置不动。
+ * 支持标准 chat/completions、Anthropic Messages 以及 Command Code Provider API；
+ * 私有协议（commandcode 的 GO 通道）与 Responses API 返回 undefined，保持原配置不动。
  */
-function resolveProbeConnection(entry: ProviderEntry): { baseUrl: string } | undefined {
+function resolveProbeConnection(entry: ProviderEntry): { baseUrl: string; protocol: ProbeProtocol } | undefined {
 	if (entry.kind === "builtin") {
-		// GO 套餐走 /alpha/generate 私有 NDJSON，不是 chat/completions，跳过
+		// GO 套餐走 /alpha/generate 私有 NDJSON，不支持分协议直连探测，跳过
 		if (entry.commandcodeGo.planMode !== "api") return undefined;
 		const base = (entry.commandcodeGo.baseUrl || CCGO_BASE_URL).replace(/\/+$/, "");
-		return { baseUrl: `${base}/provider/v1` };
+		return { baseUrl: `${base}/provider/v1`, protocol: "commandcode-api" };
 	}
-	// Claude Messages 协议参数结构不同，暂不直连
-	if (entry.api !== "openai-completions") return undefined;
+	if (entry.api !== "openai-completions" && entry.api !== "anthropic-messages") return undefined;
 	const base = (entry.baseUrl || "").trim().replace(/\/+$/, "");
-	return base ? { baseUrl: base } : undefined;
+	if (!base) return undefined;
+	return {
+		baseUrl: entry.api === "anthropic-messages" ? toAnthropicApiV1Url(base) : base,
+		protocol: entry.api,
+	};
+}
+
+class ProbeProgressComponent extends Container {
+	private readonly statusText: Text;
+	private readonly tui: any;
+	private readonly onCancel: () => void;
+
+	constructor(tui: any, theme: any, title: string, onCancel: () => void) {
+		super();
+		this.tui = tui;
+		this.onCancel = onCancel;
+		const border = theme.fg("border", "─".repeat(56));
+		this.addChild(new Text(border, 0, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("accent", theme.bold(title)), 0, 0));
+		this.statusText = new Text(theme.fg("muted", "  准备中..."), 0, 0);
+		this.addChild(this.statusText);
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("dim", "  esc / ctrl+c 取消后续探测"), 0, 0));
+		this.addChild(new Text(border, 0, 0));
+	}
+
+	setStatus(text: string): void {
+		this.statusText.setText(`  ${text}`);
+		this.tui?.requestRender?.();
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+			this.onCancel();
+			this.setStatus("正在取消...");
+		}
+	}
 }
 
 async function addModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
@@ -1049,27 +1302,34 @@ async function addModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 	if (!inputChoice || inputChoice === "取消") return;
 	const input = inputChoice.startsWith("文本") ? ["text", "image"] as ("text" | "image")[] : ["text"] as ("text" | "image")[];
 	let added = 0;
+	const addedIds: string[] = [];
 	for (const id of list) {
 		const old = entry.models.find((model) => model.id === id);
 		if (old) {
 			old.input = input;
 		} else {
-			// 服务端未声明能力时自动补全全部思考等级（含 xhigh/max），使 /settings 可配置全部档位。
-			const thinking = inferModelThinking({ id });
+			// 内置 commandcodego 的档位映射按套餐与端点在注册时决定；通用供应商按其 api 推断
+			const thinking: { reasoning: boolean; thinkingLevelMap?: Record<string, string | null> } =
+				entry.kind === "builtin"
+					? { reasoning: true }
+					: inferModelThinking({ id }, entry.api);
 			entry.models.push({
 				id,
-				...(thinking.reasoning ? { reasoning: true, thinkingLevelMap: thinking.thinkingLevelMap } : {}),
+				...(thinking.reasoning ? { reasoning: true } : {}),
+				...(thinking.thinkingLevelMap ? { thinkingLevelMap: thinking.thinkingLevelMap } : {}),
 				input,
 				contextWindow: DEFAULT_CONTEXT_WINDOW,
 				// 新增即勾选启用，省去再去「启用模型」里手动找一遍
 				enabled: true,
 			});
 			added++;
+			addedIds.push(id);
 		}
 	}
 	entry.models = sortModels(entry.models);
 	reRegisterEntry(entry);
 	await saveStore();
+	if (addedIds.length > 0) scheduleSilentThinkingProbe(ctx, entry, addedIds);
 	const summary = added > 0 ? `新增 ${added} 个，已自动勾选启用` : "均已存在，仅更新了输入能力";
 	ctx.ui.notify(`已处理 ${list.length} 个模型：${summary}。`, "info");
 }
@@ -1148,6 +1408,7 @@ async function editPlanModeFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 	setCommandCodeGoConfig(entry.commandcodeGo);
 	reRegisterEntry(entry);
 	await saveStore();
+	if (mode === "api") scheduleSilentThinkingProbe(ctx, entry);
 	ctx.ui.notify(
 		mode === "api"
 			? "已切换为 Provider API 通道：请求走 /provider/v1/chat/completions（Claude 走 /provider/v1/messages）。"
@@ -1359,7 +1620,7 @@ class ModelToggleSelectorComponent extends Container {
 			})
 			.catch((e) => {
 				this.saving = false;
-				this.saveNote = `保存失败：${e instanceof Error ? e.message : String(e)}`;
+				this.saveNote = `保存失败：${formatErrorMessage(e)}`;
 				this.refresh();
 				this.tui?.requestRender?.();
 			});
@@ -1543,6 +1804,7 @@ async function toggleModelsFlow(ctx: any, entry: ProviderEntry): Promise<void> {
 		entry.models = sortModels(entry.models.map((m) => ({ ...m, enabled: ids.has(m.id) })));
 		reRegisterEntry(entry);
 		await saveStore();
+		scheduleSilentThinkingProbe(ctx, entry, [...ids]);
 	};
 	if (ctx.mode === "tui" && typeof ctx.ui?.custom === "function") {
 		await ctx.ui.custom(

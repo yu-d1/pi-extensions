@@ -16,7 +16,17 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { detectPlanMode, streamViaProviderApi, type CcgoPlanMode } from "./commandcode-api";
+import {
+	applyAnthropicCompat,
+	detectPlanMode,
+	extractCredentialKey,
+	findErrorHint,
+	formatErrorMessage,
+	formatUpstreamError,
+	resolveEndpoint,
+	streamViaProviderApi,
+	type CcgoPlanMode,
+} from "./commandcode-api";
 
 /**
  * Command Code 内置供应商。
@@ -164,9 +174,25 @@ function imagesOf(content: unknown): Record<string, string>[] {
 		.filter(isImagePart)
 		.map((b: any) => {
 			const src = b?.source ?? {};
-			const url = typeof src.url === "string" ? src.url : typeof b?.image === "string" ? b.image : "";
-			const mediaType = typeof src.mediaType === "string" ? src.mediaType : "image/png";
-			return { type: "image", mediaType, data: url };
+			const data =
+				typeof b?.data === "string"
+					? b.data
+					: typeof src.data === "string"
+						? src.data
+						: typeof src.url === "string"
+							? src.url
+							: typeof b?.image === "string"
+								? b.image
+								: "";
+			const mediaType =
+				typeof b?.mimeType === "string"
+					? b.mimeType
+					: typeof src.mediaType === "string"
+						? src.mediaType
+						: typeof src.mime_type === "string"
+							? src.mime_type
+							: "image/png";
+			return { type: "image", mediaType, data };
 		})
 		.filter((x) => x.data);
 }
@@ -343,13 +369,25 @@ function resolveTranscript(context: Context): ResolvedTranscript {
 }
 
 // ── threadId ──────────────────────────────────────────────────────────
-// 上游要求合法 UUID；同一会话内复用可保持服务端侧多轮上下文。
-let sessionThreadId: string | undefined;
+// 上游要求合法 UUID；同一会话内复用可保持服务端侧多轮上下文，不同会话隔离。
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_SESSION_THREADS = 128;
+const sessionThreadMap = new Map<string, string>();
+
 function resolveThreadId(options?: SimpleStreamOptions): string {
 	const sid = (options as any)?.sessionId;
-	if (typeof sid === "string" && sid.trim()) return sid.trim();
-	if (!sessionThreadId) sessionThreadId = randomUUID();
-	return sessionThreadId;
+	if (typeof sid !== "string" || !sid.trim()) return randomUUID();
+	const clean = sid.trim();
+	if (UUID_RE.test(clean)) return clean;
+	const existing = sessionThreadMap.get(clean);
+	if (existing) return existing;
+	const id = randomUUID();
+	if (sessionThreadMap.size >= MAX_SESSION_THREADS) {
+		const oldest = sessionThreadMap.keys().next().value;
+		if (oldest !== undefined) sessionThreadMap.delete(oldest);
+	}
+	sessionThreadMap.set(clean, id);
+	return id;
 }
 
 // ── 登录 ──────────────────────────────────────────────────────────────
@@ -436,7 +474,7 @@ async function applyDetectedPlanMode(apiKey: string, apiBase: string, callbacks:
 		mode = await detectPlanMode(apiKey, apiBase);
 	} catch (e) {
 		// 密钥无效之类的硬错误不应阻断登录流程（validateApiKey 已把过关）
-		callbacks.onProgress?.(`套餐类型判定失败：${e instanceof Error ? e.message : String(e)}`);
+		callbacks.onProgress?.(`套餐类型判定失败：${formatErrorMessage(e)}`);
 		return;
 	}
 	if (!mode) {
@@ -451,7 +489,7 @@ async function applyDetectedPlanMode(apiKey: string, apiBase: string, callbacks:
 				: "已识别套餐：GO 套餐，将走 /alpha/generate 通道",
 		);
 	} catch (e) {
-		callbacks.onProgress?.(`套餐类型保存失败：${e instanceof Error ? e.message : String(e)}`);
+		callbacks.onProgress?.(`套餐类型保存失败：${formatErrorMessage(e)}`);
 	}
 }
 
@@ -462,7 +500,7 @@ export async function validateApiKey(apiKey: string, apiBase: string): Promise<v
 			headers: { Authorization: `Bearer ${apiKey}` },
 		});
 	} catch (e) {
-		throw new Error(`无法校验 Command Code 密钥：${e instanceof Error ? e.message : String(e)}`);
+		throw new Error(`无法校验 Command Code 密钥：${formatErrorMessage(e)}`);
 	}
 	if (res.status === 401) throw new Error("Command Code 密钥无效");
 	if (!res.ok) throw new Error(`无法校验 Command Code 密钥（HTTP ${res.status}）`);
@@ -637,7 +675,7 @@ async function loginViaBrowser(callbacks: CcGoCallbacks, apiBase: string): Promi
 	} catch (e) {
 		throw new Error(
 			`无法启动本地回调服务（端口 ${DEFAULT_PORT}-${DEFAULT_PORT + DEFAULT_PORT_RANGE} 均被占用）：${
-				e instanceof Error ? e.message : String(e)
+				formatErrorMessage(e)
 			}`,
 		);
 	}
@@ -856,12 +894,13 @@ function streamViaAlphaGenerate(
 
 			if (!res.ok) {
 				const text = await res.text().catch(() => "");
+				const detail = formatUpstreamError(res.status, text);
 				if (res.status === 403 || res.status === 401) {
 					throw new Error(
-						`Command Code 拒绝了该请求（HTTP ${res.status}）。请确认已通过 /login 登录 GO 套餐账号。${text.slice(0, 200)}`,
+						`Command Code 拒绝了该请求（${detail}）。请确认已通过 /login 登录且当前套餐有对应通道权限。`,
 					);
 				}
-				throw new Error(`Command Code 请求失败：HTTP ${res.status} ${text.slice(0, 300)}`);
+				throw new Error(`Command Code 请求失败（${detail}）`);
 			}
 			if (!res.body) throw new Error("Command Code 返回了空响应体");
 
@@ -1038,7 +1077,9 @@ function streamViaAlphaGenerate(
 						break;
 					}
 					case "error": {
-						throw new Error(String((ev as any).message ?? (ev as any).error ?? "Command Code 返回错误事件"));
+						const detail = formatErrorMessage((ev as any).error ?? (ev as any).message ?? ev) || "Command Code 返回错误事件";
+						const hint = findErrorHint(detail);
+						throw new Error(hint ? `${detail}（${hint}）` : detail);
 					}
 				}
 			};
@@ -1107,7 +1148,7 @@ function streamViaAlphaGenerate(
 			stream.push({ type: "done", reason: doneReason, message: output } as any);
 			stream.end();
 		} catch (e) {
-			const message = e instanceof Error ? e.message : String(e);
+			const message = formatErrorMessage(e) || "Command Code 请求发生未知错误";
 			const aborted = options?.signal?.aborted === true;
 			const timedOut = !aborted && ac.signal.aborted;
 			// 用户主动中断应报 aborted（pi 按此显示「Operation aborted」而非红色报错），
@@ -1165,6 +1206,7 @@ export interface CcGoModelConfig {
 	maxTokens?: number;
 	reasoning?: boolean;
 	thinkingLevelMap?: Record<string, string | null>;
+	compat?: Record<string, unknown>;
 	/** 模型目录声明该模型应答的端点，用于 API 通道选路（例：[\"/messages\"]）。 */
 	supportedEndpoints?: string[];
 }
@@ -1178,11 +1220,27 @@ export interface CcGoModelConfig {
 export function buildCommandCodeGoConfig(params: {
 	config: CommandCodeGoConfig;
 	models: CcGoModelConfig[];
-	/** refreshModels 拿到远端目录后回调，用于写回本地配置。 */
-	persist?: (models: unknown[]) => Promise<void>;
+	/** refreshModels 拿到远端目录后回调，用于写回本地配置并返回最新的已启用模型列表。 */
+	persist?: (models: unknown[]) => Promise<CcGoModelConfig[] | void>;
 }): Record<string, unknown> {
 	const cfg = params.config;
 	const base = (cfg.baseUrl || CCGO_BASE_URL).replace(/\/+$/, "");
+	const decorateModels = (list: CcGoModelConfig[]) =>
+		list.map((m) => {
+			if (cfg.planMode === "api" && resolveEndpoint(m as any) === "anthropic-messages") {
+				return {
+					...m,
+					reasoning: true,
+					...applyAnthropicCompat(m),
+				};
+			}
+			return {
+				...m,
+				reasoning: true,
+				thinkingLevelMap: m.thinkingLevelMap ?? { ...CCGO_THINKING_LEVEL_MAP },
+			};
+		});
+	let currentModels = decorateModels(params.models);
 	return {
 		name: CCGO_LABEL,
 		api: CCGO_PROVIDER_ID,
@@ -1190,24 +1248,21 @@ export function buildCommandCodeGoConfig(params: {
 		authHeader: true,
 		// /provider/v1/models 不返回能力位，统一按支持推理处理，否则 TUI 不会渲染思考块
 		// （normalizeModel 已把 reasoning 填成 false，?? 不会生效，所以这里必须无条件置 true）
-		models: params.models.map((m) => ({
-			...m,
-			reasoning: true,
-			thinkingLevelMap: m.thinkingLevelMap ?? { ...CCGO_THINKING_LEVEL_MAP },
-		})),
+		models: currentModels,
 		streamSimple: streamCommandCodeGo,
 		refreshModels: async (context: any) => {
-			// 本地变更触发的无网络刷新：原样返回，不访问远端
-			if (context?.allowNetwork !== true || context?.signal?.aborted) return params.models;
+			// 本地变更触发的无网络刷新：返回当前已装饰模型，避免丢失 reasoning 与 compat
+			if (context?.allowNetwork !== true || context?.signal?.aborted) return currentModels;
 			const key = extractCredentialKey(context?.credential);
 			try {
 				const fetched = await fetchCommandCodeGoModels(key, base, context.signal);
-				if (fetched.length === 0) return params.models;
-				await params.persist?.(fetched);
-				return params.models;
+				if (fetched.length === 0) return currentModels;
+				const next = await params.persist?.(fetched);
+				if (Array.isArray(next)) currentModels = decorateModels(next);
+				return currentModels;
 			} catch {
 				// 拉取失败保留当前列表，不清空
-				return params.models;
+				return currentModels;
 			}
 		},
 		oauth: {
@@ -1218,18 +1273,6 @@ export function buildCommandCodeGoConfig(params: {
 			getApiKey: (credentials: CcGoCredentials) => getApiKey(credentials),
 		},
 	};
-}
-
-/** 从 pi 的凭据对象里取出 API key（与 index.ts 的同名逻辑保持一致）。 */
-function extractCredentialKey(credential: unknown): string | undefined {
-	if (typeof credential === "string") return credential.trim() || undefined;
-	if (!credential || typeof credential !== "object") return undefined;
-	const c = credential as Record<string, unknown>;
-	for (const k of ["apiKey", "key", "access", "token"]) {
-		const v = c[k];
-		if (typeof v === "string" && v.trim()) return v.trim();
-	}
-	return undefined;
 }
 
 // ── 宿主配置注入（由 index.ts 在注册时调用）───────────────────────────
